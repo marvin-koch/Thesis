@@ -37,7 +37,7 @@ class VoxelParams:
     st_decay_gamma: float = 0.0       # 0.0 -> ST clears every epoch
 
     # ---------- NEW: Epoch-based LT promotion ----------
-    promote_epochs: int = 50         # promote to LT if seen occupied in >= N distinct epochs
+    promote_epochs: int = 5         # promote to LT if seen occupied in >= N distinct epochs
     lt_min_view_sectors: int = 1      # require >= M distinct yaw sectors across epochs (1 disables)
     lt_promotion_mode: str = "once"   # "once" -> set to target; "accumulate" -> add each qualifying epoch
     lt_promote_value: float = 0.8     # target LT level for "once" mode
@@ -48,7 +48,7 @@ class VoxelParams:
 
     # ---------- NEW: LT demotion (epoch-based) ----------
     lt_demote_enable: bool = True       # turn LT demotion on/off
-    lt_demote_k_neg: int = 50            # need ≥ this many consecutive free hits
+    lt_demote_k_neg: int = 10            # need ≥ this many consecutive free hits
     lt_demote_min_no_occ_epochs: int = 3# and ≥ this many epochs since last occupancy
     lt_demote_step: float = 0.5         # subtract from LT per qualifying epoch
     lt_demote_floor: float = 0.0        # clamp lower bound for LT during demotion

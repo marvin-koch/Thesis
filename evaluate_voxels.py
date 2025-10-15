@@ -662,12 +662,12 @@ def evaluate_voxel_dirs(gt_dir, pred_dir, tau=0.2, save_csv=None):
         # Apply alignment and score
         P_pr_aligned = apply_sim3_to_points(ds_pr, sim3)
     
-        sim3, figs = viz_points_with_umeyama(ds_gt, P_pr_aligned, estimate_sim3=False,
-                                    inlier_radius=2, trim_frac=0.2,
-                                    title_prefix=f"{gt_npy.stem} - ")
+        # sim3, figs = viz_points_with_umeyama(ds_gt, P_pr_aligned, estimate_sim3=False,
+        #                             inlier_radius=2, trim_frac=0.2,
+        #                             title_prefix=f"{gt_npy.stem} - ")
         
-        from matplotlib import pyplot as plt
-        plt.show()
+        # from matplotlib import pyplot as plt
+        # plt.show()
         
         
         
@@ -754,5 +754,5 @@ def evaluate_voxel_dirs(gt_dir, pred_dir, tau=0.2, save_csv=None):
 if __name__ == "__main__":
     # change these to your folders
     GT_DIR = "bedroom_habitat"
-    PR_DIR = "bedroom_habitat_dust3r_fast"
+    PR_DIR = "bedroom_habitat_dust3r_fast_2"
     evaluate_voxel_dirs(GT_DIR, PR_DIR, tau=0.1, save_csv=None)

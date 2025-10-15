@@ -202,7 +202,6 @@ def pack_edges(edge_list, device):
     return {"view1": view1, "view2": view2, "pred1": pred1, "pred2": pred2}
 
 
-import numpy as np
 
 def robust_scores(edge_scores, squash=False):
     # edge_scores: dict[(i,j)] -> float
@@ -363,26 +362,214 @@ def get_reconstructed_scene(
     pairs_to_run = []        # the subset we actually send to inference()
     edge_lut = []            # back-map from compact run-list index -> edge index in 'pairs'
 
-    print("Changed", changed_gids)
-    max_count = 4
-    for e, (vi, vj) in enumerate(pairs):
-        i = vi["idx"]; j = vj["idx"]
+
+    import scipy.sparse as sp
+    from scipy.sparse.csgraph import minimum_spanning_tree
+    def canonical(u, v):
+            return (u, v) if u <= v else (v, u)
+
+    def build_mst_from_edge_scores(edge_scores):
+        """
+        edge_scores: dict[(i,j)] -> float   (higher = better)
+                    may contain (i,j) and/or (j,i)
+        Returns: list of undirected edges in the MST as (i,j) with i<j
+        """
+        # 1) collect nodes
+        nodes = set()
+        for (i, j) in edge_scores.keys():
+            nodes.add(i); nodes.add(j)
+        n = max(nodes) + 1
+
+        # 2) make undirected weights: take the best score per undirected edge
+        und = {}
+        for (i,j), s in edge_scores.items():
+            ij = canonical(i,j)
+            und[ij] = max(und.get(ij, -np.inf), s)
+
+        # 3) build sparse matrix of "costs" = -score (so MST == maximum spanning tree on scores)
+        X = sp.dok_array((n, n), dtype=np.float32)
+        for (i,j), s in und.items():
+            if i == j: continue
+            c = -float(s)
+            X[i, j] = c
+            X[j, i] = c
+
+        # 4) MST (on costs)
+        T = minimum_spanning_tree(X).tocoo()
+
+        # 5) extract edges
+        mst_edges = [(int(i), int(j)) if i < j else (int(j), int(i))
+                    for i, j in zip(T.row, T.col)]
+        mst_edges = sorted(set(mst_edges))
+        return mst_edges
+
+    if itr == 1:
         
-        gi = local2gid[i]; gj = local2gid[j]
-        need_fresh = (gi in changed_gids and gi != 0) or (gj in changed_gids and gj != 0)
-        i_j = i_j_ij((int(gi), int(gj)))[1]
-        is_good = (GA_CACHE["edge_scores"][i_j] >= tau) or (GA_CACHE["edge_update_counter"][i_j] >= max_count)
+        mst_edges = build_mst_from_edge_scores(GA_CACHE["edge_scores"])
         
-        if is_good:
-            GA_CACHE["edge_update_counter"][i_j] += 1
+        GA_CACHE["mst_edges"] = mst_edges
+
+        from collections import defaultdict, deque
+
+        # Build per-image lists of incident edges, split into MST vs non-MST.
+        incident_mst   = defaultdict(list)   # i -> list of (i,j) in MST
+        incident_extra = defaultdict(list)   # i -> list of (i,j) not in MST
+
+        for (vi, vj) in pairs:
+            i = vi["idx"]; j = vj["idx"]
+
+            if (i, j) in mst_edges or (j, i) in mst_edges:
+                incident_mst[i].append((i, j))
+                incident_mst[j].append((j, i))
+            else:
+                incident_extra[i].append((i, j))
+                incident_extra[j].append((j, i))
+
+        # Order each list by a stable priority (e.g., cached score descending)
+        def sort_by_score(lst):
+            return sorted(lst, key=lambda e: GA_CACHE["edge_scores"][i_j_ij(e)[1]], reverse=True)
+
+        GA_CACHE["incident_mst"]   = {i: deque(sort_by_score(v)) for i, v in incident_mst.items()}
+        GA_CACHE["incident_extra"] = {i: deque(sort_by_score(v)) for i, v in incident_extra.items()}
+        
+        
+        
+    # Round-robin pointers are implicit via deque rotation.
+    def _good_edge(e, tau):
+        k = i_j_ij(e)[1]
+        return GA_CACHE["edge_scores"][k] >= tau  # (no age)
+    
+    def _pick_from_list(lst, ptr, tau):
+        n = len(lst)
+        for ofs in range(n):
+            e = lst[(ptr + ofs) % n]
+            if _good_edge(e, tau):
+                # advance pointer to the element AFTER the one we used
+                return e, (ptr + ofs + 1) % n
+        return None, ptr  # nothing passes the threshold
+
+    def pick_for_image_mst(i, tau_mst, tau_extra):
+        # 1) try MST
+        lst = GA_CACHE["incident_mst"].get(i)
+        return lst
+        # if lst:
+        #     ptr = 0
+        #     e, ptr_new = _pick_from_list(lst, ptr, tau_mst)
+        #     if e is not None:
+        #         return e
+        
+    def pick_one_for_image_extra(i, tau_mst, tau_extra):
+
+        # 2) fallback to non-MST
+        lst = GA_CACHE["incident_extra"].get(i)
+        if lst:
+            ptr = 0
+            e, ptr_new = _pick_from_list(lst, ptr, tau_extra)
+            if e is not None:
+                return e
+        return None
+
+    def schedule_pairs(changed_gids, local2gid, pairs, budget,
+                    tau_mst=0.0, tau_extra=0.5, max_count=4, refresh_one_stale_mst=True):
+        """
+        returns: pairs_to_run, run_mask (aligned with `pairs`), edge_lut (indices into `pairs`)
+        """
+        # which local image indices changed?
+        changed_local = {i for i, gid in local2gid.items() if gid in changed_gids}
+
+        run_set = set()     # edges as (i,j) with this direction
+        edge_lut = []       # indices into `pairs` list for what we run
+
+        # ≤1 edge per changed image
+        for i in changed_local:
+            if len(run_set) >= budget: break
+            
+            e = pick_for_image_mst(i, tau_mst, tau_extra)
+            if e is None: 
+                continue
+            run_set.update(e)
+            
+            e = pick_one_for_image_extra(i, tau_mst, tau_extra)
+            run_set.add(e)
+
+
+        # # Optional: refresh the single stalest MST edge globally (drift control)
+        # if refresh_one_stale_mst and len(run_set) < budget:
+        #     mst_set = set(canonical(i,j) for i,j in GA_CACHE["mst_edges"])
+        #     # pick the MST edge with largest counter
+        #     def age_of(e_can):
+        #         k = i_j_ij(e_can)[1]
+        #         return GA_CACHE["edge_update_counter"][k]
+        #     stale = None
+        #     if mst_set:
+        #         stale = max(mst_set, key=age_of)
+        #     if stale is not None:
+        #         # choose a direction that matches `pairs` if possible; default to (i,j)
+        #         run_set.add(stale)
+
+        # reset counters for edges we run; increment otherwise
+        run_keys = set()
+        for e in run_set:
+            k = i_j_ij(e)[1]
+            run_keys.add(k)
+            GA_CACHE["edge_update_counter"][k] = 0
+
+        for (i,j_k), age in list(GA_CACHE["edge_update_counter"].items()):
+            if (i,j_k) not in GA_CACHE["edge_update_counter"]:
+                continue
+        for k in GA_CACHE["edge_update_counter"]:
+            if k not in run_keys:
+                GA_CACHE["edge_update_counter"][k] += 1
+
+        # Build outputs aligned with `pairs`
+        pairs_to_run = []
+        run_mask = []
+        for idx, (vi, vj) in enumerate(pairs):
+            i, j = vi["idx"], vj["idx"]
+            # if direction (i,j) not in run_set, accept (j,i) too
+            want = (i, j) in run_set or (j, i) in run_set
+            run_mask.append(want)
+            if want:
+                pairs_to_run.append((vi, vj))
+                edge_lut.append(idx)
+
+        return pairs_to_run, run_mask, edge_lut
+
+    B = max(1,  5 *len(imgs))  # hard cap
+    pairs_to_run, run_mask, edge_lut = schedule_pairs(
+        changed_gids=changed_gids,
+        local2gid=local2gid,
+        pairs=pairs,          # full pair list (vi, vj)
+        budget=B,
+        tau_mst=0.0,          # be lenient on MST edges
+        tau_extra=0.5,        # stricter on non-MST
+        max_count=4,
+        refresh_one_stale_mst=True
+    )
+    
+    print("running pairs")
+    for (vi, vj) in pairs_to_run:
+        print(vi["idx"], vj["idx"])
+
+    # max_count = 4
+    # for e, (vi, vj) in enumerate(pairs):
+    #     i = vi["idx"]; j = vj["idx"]
+        
+    #     gi = local2gid[i]; gj = local2gid[j]
+    #     need_fresh = (gi in changed_gids and gi != 0) or (gj in changed_gids and gj != 0)
+    #     i_j = i_j_ij((int(gi), int(gj)))[1]
+    #     is_good = (GA_CACHE["edge_scores"][i_j] >= tau) or (GA_CACHE["edge_update_counter"][i_j] >= max_count)
+        
+    #     if is_good:
+    #         GA_CACHE["edge_update_counter"][i_j] += 1
             
         
-        run_mask.append(need_fresh and is_good)
+    #     run_mask.append(need_fresh and is_good)
 
-        if need_fresh and is_good:
-            pairs_to_run.append((vi, vj))
-            GA_CACHE["edge_update_counter"][i_j] = 0
-            edge_lut.append(e)
+    #     if need_fresh and is_good:
+    #         pairs_to_run.append((vi, vj))
+    #         GA_CACHE["edge_update_counter"][i_j] = 0
+    #         edge_lut.append(e)
 
     # Run the network ONLY for needed edges
     if len(pairs_to_run):
@@ -462,9 +649,7 @@ def get_reconstructed_scene(
                 di_np = depth0_all[gi]
                 di_t  = torch.as_tensor(di_np)
                 scene._set_depthmap(i, di_t, force=True)
-            
-
-
+        
 
         
         # 4) freeze intrinsics during subset refine to avoid scale/pp drift
@@ -570,14 +755,14 @@ def get_reconstructed_scene(
 
     # Write back ALIGNED cameras (+ keep cached depths as-is, or replace if you wish)
     
-    # for i, dct in enumerate(imgs):
-    #     GA_CACHE["Twc"][dct["gid"]] = Twc_sub[i]
-    #     GA_CACHE["K"][dct["gid"]]   = K_sub[i]
+    for i, dct in enumerate(imgs):
+        # GA_CACHE["Twc"][dct["gid"]] = Twc_sub[i]
+        # GA_CACHE["K"][dct["gid"]]   = K_sub[i]
     
     
         # Optional: refresh cached depth with the refined one
-        # refined_depth_i = scene.get_depthmaps()[i].detach().cpu().numpy()
-        # GA_CACHE["depth"][dct["gid"]] = refined_depth_i
+        refined_depth_i = scene.get_depthmaps()[i].detach().cpu().numpy()
+        GA_CACHE["depth"][dct["gid"]] = refined_depth_i
 
     
 
@@ -635,13 +820,13 @@ vox = TorchSparseVoxelGrid(
     device=device, dtype=torch.float32
 )
 
-save_root = "bedroom_habitat_dust3r_fast/"
+save_root = "kitchen_habitat_dust3r_fast/"
 # target_dir = "/Users/marvin/Documents/Thesis/vggt/examples/fishbowl1/"
 # sub_dirs = ["images","images", "images1", "images2", "images3"]
 # sub_dirs = ["00000000", "00000050","00000100", "00000150", "00000200", "00000250"]
 # sub_dirs = ["00000000", "00000300",  "00000350", "00000400"]
 
-target_dir = "/Users/marvin/Documents/Thesis/repo/dataset_generation/habitat/frames_bedroom/"  # folder that contains intrinsics.json and time_XXXXX/
+target_dir = "/Users/marvin/Documents/Thesis/repo/dataset_generation/habitat/frames_kitchen/"  # folder that contains intrinsics.json and time_XXXXX/
 
 sub_dirs = sorted([d for d in os.listdir(target_dir) 
             if os.path.isdir(os.path.join(target_dir, d))])
@@ -848,9 +1033,9 @@ for i, images in enumerate(sub_dirs):
 
         start = time.time()
 
-        stacked_predictions = []
-        for input_frames in [imgs]:
-            stacked_predictions.append(get_reconstructed_scene(i, ".", input_frames, model, device, False, 512, target_dir + images, "linear", 100, 1, True, False, True, False, 0.05, "oneref", 1, 0, changed_gids=changed_idx))
+        # stacked_predictions = []
+        # for input_frames in [imgs]:
+        predictions = get_reconstructed_scene(i, ".", imgs, model, device, False, 512, target_dir + images, "linear", 100, 1, True, False, True, False, 0.05, "oneref", 1, 0, changed_gids=changed_idx)
         
         # predictions = run_model(model, vggt_input, attn_mask=adj)
 
@@ -859,107 +1044,106 @@ for i, images in enumerate(sub_dirs):
         length = end - start
 
         print("Running inference took", length, "seconds!")
-   
-
-    for j, predictions in enumerate(reversed(stacked_predictions)):
-        # Keep tensors; only extract what we need later.
-        # If you truly need NumPy later, convert specific keys then.
-        needed = {
-            "images","extrinsic", POINTS, CONF
-        }
-        for k in list(predictions.keys()):
-            if k not in needed:
-                del predictions[k]  # drop unneeded heavy stuff early
 
 
-        # print("Align Point Cloud")
+    # Keep tensors; only extract what we need later.
+    # If you truly need NumPy later, convert specific keys then.
+    needed = {
+        "images","extrinsic", POINTS, CONF
+    }
+    for k in list(predictions.keys()):
+        if k not in needed:
+            del predictions[k]  # drop unneeded heavy stuff early
 
-        start = time.time()
+
+    # print("Align Point Cloud")
+
+    start = time.time()
+    
+    
+    
+    
+    WPTS_m = rotate_points(predictions[POINTS], R_w2m, t_w2m)
+
+    # if VIZ:
+    #     visualize_vggt_pointcloud(predictions, key=POINTS, conf_key=CONF, threshold=threshold)
+
+    Rmw, tmw, info = align_pointcloud(WPTS_m, inlier_dist=voxel_size*0.75)
+    WPTS_m = rotate_points(WPTS_m, Rmw, tmw)
+    predictions[POINTS] = WPTS_m
+
+    if VIZ:
+        visualize_vggt_pointcloud(predictions, key=POINTS, conf_key=CONF, threshold=threshold)
+
+    # print("Building Voxels and BEV")
+
+    camera_R = R_w2m @ Rmw
+    camera_t = t_w2m + tmw
+    frames_map, cam_centers_map, conf_map, (S,H,W) = build_frames_and_centers_vectorized(
+        predictions,
+        POINTS=POINTS,
+        CONF=CONF,
+        threshold=threshold,
+        Rmw=camera_R, tmw=camera_t,
+        z_clip_map=z_clip_map,   # or None
+    )   
+    end = time.time()
+    length = end - start
+
+    print("Aligning and building frames/camera centers took", length, "seconds!")
+
+    start = time.time()
+
+    align_to_voxel = False #(i > 0)
+    
+    # if i == 0:
+    #     vox.begin_bootstrap()
+
+    vox, bev, meta = build_maps_from_points_and_centers_torch(
+        frames_map,
+        cam_centers_map,
+        conf_map,
+        vox,
+        align_to_voxel=align_to_voxel,
+        voxel_size=voxel_size,           # 10 cm
+        bev_window_m=(5.0, 5.0), # local 20x20 m
+        bev_origin_xy=(-2.0, -2.0),
+        z_clip_vox=(-np.inf, np.inf),
+        z_band_bev=(-0.02, 0.5),
+        max_range_m=None,
+        carve_free=True,
+        samples_per_voxel=0.7,#1,
+        ray_stride=6,#2,
+        max_free_rays=10000,
+    )
+
+    # if i == 0:
+    #     vox.end_bootstrap()   # promotes current occupied to LT and clears ST
+    #     vox.lock_long_term()  # optional: forbids any future LT change
         
-        
-      
-        
-        WPTS_m = rotate_points(predictions[POINTS], R_w2m, t_w2m)
+    end = time.time()
+    length = end - start
 
-        # if VIZ:
-        #     visualize_vggt_pointcloud(predictions, key=POINTS, conf_key=CONF, threshold=threshold)
+    print("Building Voxel and BEV took", length, "seconds!")
 
-        Rmw, tmw, info = align_pointcloud(WPTS_m, inlier_dist=voxel_size*0.75)
-        WPTS_m = rotate_points(WPTS_m, Rmw, tmw)
-        predictions[POINTS] = WPTS_m
+    # print("BEV:", bev.shape, meta)    
 
-        if VIZ:
-            visualize_vggt_pointcloud(predictions, key=POINTS, conf_key=CONF, threshold=threshold)
+    num_cells = vox.keys.numel() if hasattr(vox, "keys") else len(vox.logodds)
+    num_occ = int((vox.vals > vox.p.occ_thresh).sum().item()) if hasattr(vox, "vals") else \
+            sum(1 for L in vox.logodds.values() if L > vox.p.occ_thresh)
 
-        # print("Building Voxels and BEV")
+    # print("Voxels (stored cells):", num_cells)
+    # print("Voxels (occupied):", num_occ)
 
-        camera_R = R_w2m @ Rmw
-        camera_t = t_w2m + tmw
-        frames_map, cam_centers_map, conf_map, (S,H,W) = build_frames_and_centers_vectorized(
-            predictions,
-            POINTS=POINTS,
-            CONF=CONF,
-            threshold=threshold,
-            Rmw=camera_R, tmw=camera_t,
-            z_clip_map=z_clip_map,   # or None
-        )   
-        end = time.time()
-        length = end - start
+    # On-screen plots
+    if VIZ:
+        visualize_bev(bev, meta)
+        # visualize_voxels(vox, z_band=(-0.5, 3), max_dim=200)
+        visualize_points_and_voxels_open3d(frames_map, vox,cam_centers_map,max_points=150_000, max_voxels=25_000)
 
-        print("Aligning and building frames/camera centers took", length, "seconds!")
-
-        start = time.time()
-
-        align_to_voxel = False #(i > 0)
-        
-        # if i == 0:
-        #     vox.begin_bootstrap()
-
-        vox, bev, meta = build_maps_from_points_and_centers_torch(
-            frames_map,
-            cam_centers_map,
-            conf_map,
-            vox,
-            align_to_voxel=align_to_voxel,
-            voxel_size=voxel_size,           # 10 cm
-            bev_window_m=(5.0, 5.0), # local 20x20 m
-            bev_origin_xy=(-2.0, -2.0),
-            z_clip_vox=(-np.inf, np.inf),
-            z_band_bev=(-0.02, 0.5),
-            max_range_m=None,
-            carve_free=True,
-            samples_per_voxel=0.7,#1,
-            ray_stride=6,#2,
-            max_free_rays=10000,
-        )
-
-        # if i == 0:
-        #     vox.end_bootstrap()   # promotes current occupied to LT and clears ST
-        #     vox.lock_long_term()  # optional: forbids any future LT change
-            
-        end = time.time()
-        length = end - start
-
-        print("Building Voxel and BEV took", length, "seconds!")
-
-        # print("BEV:", bev.shape, meta)    
-
-        num_cells = vox.keys.numel() if hasattr(vox, "keys") else len(vox.logodds)
-        num_occ = int((vox.vals > vox.p.occ_thresh).sum().item()) if hasattr(vox, "vals") else \
-                sum(1 for L in vox.logodds.values() if L > vox.p.occ_thresh)
-
-        # print("Voxels (stored cells):", num_cells)
-        # print("Voxels (occupied):", num_occ)
-
-        # On-screen plots
-        if VIZ:
-            visualize_bev(bev, meta)
-            # visualize_voxels(vox, z_band=(-0.5, 3), max_dim=200)
-            visualize_points_and_voxels_open3d(frames_map, vox,cam_centers_map,max_points=150_000, max_voxels=25_000)
-
-        # Files
-        # save_bev_png(bev, meta, f"bev_{i}_{j}.png")
-        # export_occupied_voxels_as_ply(vox, "voxels.ply")
+    # Files
+    # save_bev_png(bev, meta, f"bev_{i}_{j}.png")
+    # export_occupied_voxels_as_ply(vox, "voxels.ply")
         
 
     save_bev(bev, meta, save_root + f"bev_{i}.png", save_root + f"bev_{i}_np.npy", save_root + f"bev_{i}_meta.json")

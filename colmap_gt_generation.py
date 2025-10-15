@@ -13,15 +13,39 @@ def _camera_model_name(cam) -> str:
     return str(m).upper()
 
 def _K_from_camera(cam) -> np.ndarray:
-    name = _camera_model_name(cam)
+    name = _camera_model_name(cam)  # returns upper-case string
+    # params order follows COLMAP conventions
+    # docs: https://colmap.github.io/format.html#camera-models
     p = np.asarray(cam.params, dtype=np.float32)
-    if name in ("SIMPLE_PINHOLE", "SIMPLE_RADIAL", "RADIAL"):
-        fx = fy = p[0]; cx = p[1]; cy = p[2]
-    elif name in ("PINHOLE", "OPENCV", "FULL_OPENCV", "OPENCV_FISHEYE"):
+
+    if name in (
+        "SIMPLE_PINHOLE",
+        "SIMPLE_RADIAL",
+        "RADIAL",
+        "SIMPLE_RADIAL_FISHEYE",
+        "RADIAL_FISHEYE",
+    ):
+        # p = [f, cx, cy, ...]
+        f, cx, cy = p[0], p[1], p[2]
+        fx = fy = f
+
+    elif name in (
+        "PINHOLE",
+        "OPENCV",
+        "FULL_OPENCV",
+        "OPENCV_FISHEYE",
+        "FOV",  # p = [fx, fy, cx, cy, omega]
+    ):
+        # p = [fx, fy, cx, cy, ...]
         fx, fy, cx, cy = p[0], p[1], p[2], p[3]
+
     else:
         raise ValueError(f"Unsupported COLMAP camera model: {name}")
-    return np.array([[fx, 0, cx],[0, fy, cy],[0, 0, 1]], dtype=np.float32)
+
+    return np.array([[fx, 0.0, cx],
+                     [0.0, fy, cy],
+                     [0.0, 0.0, 1.0]], dtype=np.float32)
+
 
 def _qvec_to_R(q):
     # q = [qw,qx,qy,qz] → R (world→cam)
@@ -488,7 +512,7 @@ def ensure_sparse_model(seq_dir: str, overwrite: bool = False, overlap: int = 5,
 
         # features, matches_path = match_dense.main(dense_conf, pairs_path, images, export_dir=out_root)#, features_ref=features_path)
 
-        # sfm_dir = (out_root / f"sfm_{feature_conf}+{matcher_conf}")
+        sfm_dir = (out_root / f"sfm_{feature_conf}+{matcher_conf}")
         
         # from hloc.triangulation import (
         #     OutputCapture,
@@ -528,16 +552,16 @@ def ensure_sparse_model(seq_dir: str, overwrite: bool = False, overlap: int = 5,
         sfm_dir.mkdir(exist_ok=True, parents=True)
 
         # # mirror your mapper options
-        # mapper_opts = {
-        #     "min_num_matches": 5,
-        #     "init_min_num_inliers": 6,
-        #     "abs_pose_min_num_inliers": 6,
-        #     "ba_refine_focal_length": True,
-        #     "ba_refine_principal_point": True,
-        #     "ba_refine_extra_params": True,
-        #     "multiple_models": False,
-        #     "tri_min_angle": 0.5,
-        # }
+        mapper_opts = {
+            "min_num_matches": 5,
+            "init_min_num_inliers": 6,
+            "abs_pose_min_num_inliers": 6,
+            "ba_refine_focal_length": True,
+            "ba_refine_principal_point": True,
+            "ba_refine_extra_params": True,
+            "multiple_models": False,
+            "tri_min_angle": 0.5,
+        }
 
         # camera_mode: "SINGLE" matches your ImageReader.single_camera=1
         # reconstruction.main(
@@ -551,16 +575,25 @@ def ensure_sparse_model(seq_dir: str, overwrite: bool = False, overlap: int = 5,
         # )
         
         
+     
+        # from pycolmap import CameraMode, ImageReaderOptions, IncrementalMapperOptions
+        # img_opts = ImageReaderOptions()
+        # map_opts = IncrementalMapperOptions()
         
-        # from pycolmap import CameraMode, ImageReaderOptions
+        # map_opts.init_min_num_inliers = 6
+
+        # #img_opts.single_camera = True                     # one shared camera
+        # img_opts.camera_model = "RADIAL_FISHEYE"          # enforce the model
+        
         # reconstruction.main(
         #     sfm_dir=sfm_dir,                        # Path ok
-        #     image_dir=str(images),                  # MUST be str
+        #     image_dir=(images),                  # MUST be str
         #     pairs=pairs_path,
         #     features=features_path,
         #     matches=matches_path,
         #     camera_mode=CameraMode.SINGLE,          # MUST be enum
-        #     image_options=ImageReaderOptions(),      # MUST be object, not dict
+        #     image_options=img_opts,      # MUST be object, not dict
+        #     #mapper_options=mapper_opts
             
         # )
 
@@ -583,7 +616,7 @@ def ensure_sparse_model(seq_dir: str, overwrite: bool = False, overlap: int = 5,
         #         "Sparse model has 0 registered images after hloc reconstruction. "
         #         "Possible causes: weak texture, too large frame spacing, or pairing config."
         #     )
-        # return model_out
+        # return rec
     
     
    
@@ -606,9 +639,14 @@ def ensure_sparse_model(seq_dir: str, overwrite: bool = False, overlap: int = 5,
 
         # 1) Import images into COLMAP DB (use correct arg types)
         img_opts = ImageReaderOptions()  # tweak if needed
+        
+      
+        #img_opts.single_camera = True                     # one shared camera
+        img_opts.camera_model = "RADIAL_FISHEYE"          # enforce the model
+        
         pycolmap.import_images(
-            str(database),               # str, NOT Path
-            str(images),                 # str, NOT Path
+            (database),               # str, NOT Path
+            (images),                 # str, NOT Path
             camera_mode=CameraMode.SINGLE,
             image_names=image_names,              # all images in folder
             options=img_opts
@@ -668,15 +706,15 @@ def ensure_sparse_model(seq_dir: str, overwrite: bool = False, overlap: int = 5,
             "--Mapper.tri_min_angle", "0.5",
         ])
 
-        # # 4) Copy model to seq_dir/colmap/sparse/0 (so your downstream stays unchanged)
-        # for fn in ("cameras.bin", "images.bin", "points3D.bin"):
-        #     src = sfm_dir / fn
-        #     if not src.exists():
-        #         raise RuntimeError(f"Expected file not found: {src}")
+        # 4) Copy model to seq_dir/colmap/sparse/0 (so your downstream stays unchanged)
+        for fn in ("cameras.bin", "images.bin", "points3D.bin"):
+            src = sfm_dir / fn
+            if not src.exists():
+                raise RuntimeError(f"Expected file not found: {src}")
 
-        # os.makedirs(model_out, exist_ok=True)
-        # for fn in ("cameras.bin", "images.bin", "points3D.bin"):
-        #     shutil.copy2(sfm_dir / fn, os.path.join(model_out, fn))
+        os.makedirs(model_out, exist_ok=True)
+        for fn in ("cameras.bin", "images.bin", "points3D.bin"):
+            shutil.copy2(sfm_dir / fn, os.path.join(model_out, fn))
 
         # 5) Sanity check
         rec = pycolmap.Reconstruction(sfm_dir)
