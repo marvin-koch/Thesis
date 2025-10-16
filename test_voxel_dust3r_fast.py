@@ -26,9 +26,10 @@ import time
 from voxel.utils import *
 from voxel.voxel import *
 from voxel.align import *
+from voxel.covisibility import *
+from voxel.viz_utils import *
 from preprocess_images.filter_images import changed_images
 import os, shutil, json
-
 
 
 GA_CACHE = {
@@ -49,46 +50,6 @@ def _clone(src, dst):
 
 def ensure_dir_for_file(path):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    
-def decide_grouping_vs_all(groups, changed_indices, rho=0.8):
-    """
-    Decide whether to run VGGT on groups or on all changed frames at once.
-
-    groups: list[list[int]]   # each group is a list of frame indices (already chosen)
-    changed_indices: list[int]  # the set you would process in one-shot mode
-    ref_id: int               # the reference frame id
-    include_ref_in_each: bool # if True, ref is duplicated in EVERY group (as your code does)
-    rho: float                # need Σ n_i^2 <= rho * S^2 to justify grouping
-    min_group: int            # avoid tiny groups (overhead dominates)
-    max_groups: int           # avoid too many groups (launcher/overheads)
-
-    Returns dict with decision and scores.
-    """
-    uniq = sorted(set(changed_indices))
-    S = len(uniq)
-
-    # Effective group sizes (count ref if you actually prepend it to each group)
-    n = []
-    for g in groups:
-        g_set = set(g)
-        n_i = len(g_set)
-        n.append(n_i)
-
-
-    score_all = S**2
-    score_groups = sum(k*k for k in n)
-
-    use_groups = (score_groups <= rho * score_all)
-    return {
-        "use_groups": use_groups,
-        "reason": "quadratic saving" if use_groups else "not enough saving",
-        "S": S,
-        "n": n,
-        "score_all": score_all,
-        "score_groups": score_groups,
-        "saving_ratio": (score_groups / score_all) if score_all > 0 else 1.0,
-        "num_groups": len(n),
-    }
 
 # ------------------- helpers -------------------
 def _reindex_local(imgs):
@@ -218,6 +179,152 @@ def robust_scores(edge_scores, squash=False):
         return {k: float(v) for k, v in zip(edge_scores.keys(), zrob)}
 
 
+# Round-robin pointers are implicit via deque rotation.
+def _good_edge(e, tau):
+    k = i_j_ij(e)[1]
+    return GA_CACHE["edge_scores"][k] >= tau  # (no age)
+
+def _pick_from_list(lst, ptr, tau):
+    n = len(lst)
+    for ofs in range(n):
+        e = lst[(ptr + ofs) % n]
+        if _good_edge(e, tau):
+            # advance pointer to the element AFTER the one we used
+            return e, (ptr + ofs + 1) % n
+    return None, ptr  # nothing passes the threshold
+
+def pick_for_image_mst(i, tau_mst, tau_extra):
+    # 1) try MST
+    lst = GA_CACHE["incident_mst"].get(i)
+    return lst
+    # if lst:
+    #     ptr = 0
+    #     e, ptr_new = _pick_from_list(lst, ptr, tau_mst)
+    #     if e is not None:
+    #         return e
+    
+def pick_one_for_image_extra(i, tau_mst, tau_extra):
+
+    # 2) fallback to non-MST
+    lst = GA_CACHE["incident_extra"].get(i)
+    if lst:
+        ptr = 0
+        e, ptr_new = _pick_from_list(lst, ptr, tau_extra)
+        if e is not None:
+            return e
+    return None
+
+def schedule_pairs(changed_gids, local2gid, pairs, budget,
+                tau_mst=0.0, tau_extra=0.4, max_count=4, refresh_one_stale_mst=True):
+    """
+    returns: pairs_to_run, run_mask (aligned with `pairs`), edge_lut (indices into `pairs`)
+    """
+    # which local image indices changed?
+    changed_local = {i for i, gid in local2gid.items() if gid in changed_gids}
+
+    run_set = set()     # edges as (i,j) with this direction
+    edge_lut = []       # indices into `pairs` list for what we run
+
+    # ≤1 edge per changed image
+    for i in changed_local:
+        if len(run_set) >= budget: break
+        
+        e = pick_for_image_mst(i, tau_mst, tau_extra)
+        print(e)
+        if e is None: 
+            continue
+        run_set.update(e)
+        
+        e = pick_one_for_image_extra(i, tau_mst, tau_extra)
+        if e is None: 
+            continue
+        print(e)
+        run_set.add(e)
+
+    print(run_set)
+
+        # # Optional: refresh the single stalest MST edge globally (drift control)
+        # if refresh_one_stale_mst and len(run_set) < budget:
+        #     mst_set = set(canonical(i,j) for i,j in GA_CACHE["mst_edges"])
+        #     # pick the MST edge with largest counter
+        #     def age_of(e_can):
+        #         k = i_j_ij(e_can)[1]
+        #         return GA_CACHE["edge_update_counter"][k]
+        #     stale = None
+        #     if mst_set:
+        #         stale = max(mst_set, key=age_of)
+        #     if stale is not None:
+        #         # choose a direction that matches `pairs` if possible; default to (i,j)
+        #         run_set.add(stale)
+
+        # reset counters for edges we run; increment otherwise
+    run_keys = set()
+    for e in run_set:
+        k = i_j_ij(e)[1]
+        run_keys.add(k)
+        GA_CACHE["edge_update_counter"][k] = 0
+
+    for (i,j_k), age in list(GA_CACHE["edge_update_counter"].items()):
+        if (i,j_k) not in GA_CACHE["edge_update_counter"]:
+            continue
+    for k in GA_CACHE["edge_update_counter"]:
+        if k not in run_keys:
+            GA_CACHE["edge_update_counter"][k] += 1
+
+    # Build outputs aligned with `pairs`
+    pairs_to_run = []
+    run_mask = []
+    for idx, (vi, vj) in enumerate(pairs):
+        i, j = vi["idx"], vj["idx"]
+        # if direction (i,j) not in run_set, accept (j,i) too
+        want = (i, j) in run_set or (j, i) in run_set
+        run_mask.append(want)
+        if want:
+            pairs_to_run.append((vi, vj))
+            edge_lut.append(idx)
+
+    return pairs_to_run, run_mask, edge_lut
+
+import scipy.sparse as sp
+from scipy.sparse.csgraph import minimum_spanning_tree
+def canonical(u, v):
+        return (u, v) if u <= v else (v, u)
+
+def build_mst_from_edge_scores(edge_scores):
+    """
+    edge_scores: dict[(i,j)] -> float   (higher = better)
+                may contain (i,j) and/or (j,i)
+    Returns: list of undirected edges in the MST as (i,j) with i<j
+    """
+    # 1) collect nodes
+    nodes = set()
+    for (i, j) in edge_scores.keys():
+        nodes.add(i); nodes.add(j)
+    n = max(nodes) + 1
+
+    # 2) make undirected weights: take the best score per undirected edge
+    und = {}
+    for (i,j), s in edge_scores.items():
+        ij = canonical(i,j)
+        und[ij] = max(und.get(ij, -np.inf), s)
+
+    # 3) build sparse matrix of "costs" = -score (so MST == maximum spanning tree on scores)
+    X = sp.dok_array((n, n), dtype=np.float32)
+    for (i,j), s in und.items():
+        if i == j: continue
+        c = -float(s)
+        X[i, j] = c
+        X[j, i] = c
+
+    # 4) MST (on costs)
+    T = minimum_spanning_tree(X).tocoo()
+
+    # 5) extract edges
+    mst_edges = [(int(i), int(j)) if i < j else (int(j), int(i))
+                for i, j in zip(T.row, T.col)]
+    mst_edges = sorted(set(mst_edges))
+    return mst_edges
+    
 # ------------------- main -------------------
 def get_reconstructed_scene(
     itr, outdir, imgs, model, device, silent, image_size, filelist, schedule, niter, min_conf_thr,
@@ -363,45 +470,6 @@ def get_reconstructed_scene(
     edge_lut = []            # back-map from compact run-list index -> edge index in 'pairs'
 
 
-    import scipy.sparse as sp
-    from scipy.sparse.csgraph import minimum_spanning_tree
-    def canonical(u, v):
-            return (u, v) if u <= v else (v, u)
-
-    def build_mst_from_edge_scores(edge_scores):
-        """
-        edge_scores: dict[(i,j)] -> float   (higher = better)
-                    may contain (i,j) and/or (j,i)
-        Returns: list of undirected edges in the MST as (i,j) with i<j
-        """
-        # 1) collect nodes
-        nodes = set()
-        for (i, j) in edge_scores.keys():
-            nodes.add(i); nodes.add(j)
-        n = max(nodes) + 1
-
-        # 2) make undirected weights: take the best score per undirected edge
-        und = {}
-        for (i,j), s in edge_scores.items():
-            ij = canonical(i,j)
-            und[ij] = max(und.get(ij, -np.inf), s)
-
-        # 3) build sparse matrix of "costs" = -score (so MST == maximum spanning tree on scores)
-        X = sp.dok_array((n, n), dtype=np.float32)
-        for (i,j), s in und.items():
-            if i == j: continue
-            c = -float(s)
-            X[i, j] = c
-            X[j, i] = c
-
-        # 4) MST (on costs)
-        T = minimum_spanning_tree(X).tocoo()
-
-        # 5) extract edges
-        mst_edges = [(int(i), int(j)) if i < j else (int(j), int(i))
-                    for i, j in zip(T.row, T.col)]
-        mst_edges = sorted(set(mst_edges))
-        return mst_edges
 
     if itr == 1:
         
@@ -433,108 +501,7 @@ def get_reconstructed_scene(
         GA_CACHE["incident_extra"] = {i: deque(sort_by_score(v)) for i, v in incident_extra.items()}
         
         
-        
-    # Round-robin pointers are implicit via deque rotation.
-    def _good_edge(e, tau):
-        k = i_j_ij(e)[1]
-        return GA_CACHE["edge_scores"][k] >= tau  # (no age)
     
-    def _pick_from_list(lst, ptr, tau):
-        n = len(lst)
-        for ofs in range(n):
-            e = lst[(ptr + ofs) % n]
-            if _good_edge(e, tau):
-                # advance pointer to the element AFTER the one we used
-                return e, (ptr + ofs + 1) % n
-        return None, ptr  # nothing passes the threshold
-
-    def pick_for_image_mst(i, tau_mst, tau_extra):
-        # 1) try MST
-        lst = GA_CACHE["incident_mst"].get(i)
-        return lst
-        # if lst:
-        #     ptr = 0
-        #     e, ptr_new = _pick_from_list(lst, ptr, tau_mst)
-        #     if e is not None:
-        #         return e
-        
-    def pick_one_for_image_extra(i, tau_mst, tau_extra):
-
-        # 2) fallback to non-MST
-        lst = GA_CACHE["incident_extra"].get(i)
-        if lst:
-            ptr = 0
-            e, ptr_new = _pick_from_list(lst, ptr, tau_extra)
-            if e is not None:
-                return e
-        return None
-
-    def schedule_pairs(changed_gids, local2gid, pairs, budget,
-                    tau_mst=0.0, tau_extra=0.5, max_count=4, refresh_one_stale_mst=True):
-        """
-        returns: pairs_to_run, run_mask (aligned with `pairs`), edge_lut (indices into `pairs`)
-        """
-        # which local image indices changed?
-        changed_local = {i for i, gid in local2gid.items() if gid in changed_gids}
-
-        run_set = set()     # edges as (i,j) with this direction
-        edge_lut = []       # indices into `pairs` list for what we run
-
-        # ≤1 edge per changed image
-        for i in changed_local:
-            if len(run_set) >= budget: break
-            
-            e = pick_for_image_mst(i, tau_mst, tau_extra)
-            if e is None: 
-                continue
-            run_set.update(e)
-            
-            e = pick_one_for_image_extra(i, tau_mst, tau_extra)
-            run_set.add(e)
-
-
-        # # Optional: refresh the single stalest MST edge globally (drift control)
-        # if refresh_one_stale_mst and len(run_set) < budget:
-        #     mst_set = set(canonical(i,j) for i,j in GA_CACHE["mst_edges"])
-        #     # pick the MST edge with largest counter
-        #     def age_of(e_can):
-        #         k = i_j_ij(e_can)[1]
-        #         return GA_CACHE["edge_update_counter"][k]
-        #     stale = None
-        #     if mst_set:
-        #         stale = max(mst_set, key=age_of)
-        #     if stale is not None:
-        #         # choose a direction that matches `pairs` if possible; default to (i,j)
-        #         run_set.add(stale)
-
-        # reset counters for edges we run; increment otherwise
-        run_keys = set()
-        for e in run_set:
-            k = i_j_ij(e)[1]
-            run_keys.add(k)
-            GA_CACHE["edge_update_counter"][k] = 0
-
-        for (i,j_k), age in list(GA_CACHE["edge_update_counter"].items()):
-            if (i,j_k) not in GA_CACHE["edge_update_counter"]:
-                continue
-        for k in GA_CACHE["edge_update_counter"]:
-            if k not in run_keys:
-                GA_CACHE["edge_update_counter"][k] += 1
-
-        # Build outputs aligned with `pairs`
-        pairs_to_run = []
-        run_mask = []
-        for idx, (vi, vj) in enumerate(pairs):
-            i, j = vi["idx"], vj["idx"]
-            # if direction (i,j) not in run_set, accept (j,i) too
-            want = (i, j) in run_set or (j, i) in run_set
-            run_mask.append(want)
-            if want:
-                pairs_to_run.append((vi, vj))
-                edge_lut.append(idx)
-
-        return pairs_to_run, run_mask, edge_lut
-
     B = max(1,  5 *len(imgs))  # hard cap
     pairs_to_run, run_mask, edge_lut = schedule_pairs(
         changed_gids=changed_gids,
@@ -875,52 +842,6 @@ for i, images in enumerate(sub_dirs):
 
         print("Running inference took", length, "seconds!")
         
-        start = time.time()
-
-        # S = predictions["world_points"].shape[0]
-        # T_cw = np.tile(np.eye(4, dtype=np.float32), (S, 1, 1))
-        # extr = predictions["extrinsic"]
-        # T_cw[:,:3,:3] = extr[:,:3,:3]
-        # T_cw[:,:3, 3] = extr[:,:3, 3]
-        
-        # T_cw = np.tile(np.eye(4, dtype=np.float32), (S, 1, 1))
-
-        # # Fill with extrinsic [R|t]
-        # extr = predictions["extrinsic"]  # (S,3,4)
-        # T_cw[:, :3, :4] = extr
-
-        # covisibility_graph = covisibility_from_world_proximity(
-        #     P_world=predictions[POINTS],
-        #     conf_map=predictions[CONF],
-        #     stride=4,           # try 8 or 4 for denser sampling
-        #     max_points=50000,   # keep computation manageable
-        #     eps=0.05,           # 5 cm if units are meters; tune to your data
-        #     sym="mean",
-        #     normalize=True,
-        #     chunk_size=10000,
-        #     dtype=dtype,
-        #     conf_percentile=threshold
-        # )
-        
-        # print(covisibility_graph)
-        
-        end = time.time()
-        length = end - start
-
-        # Turn extrinsic into homogeneous (S,4,4)
-  
-
-        # import matplotlib.pyplot as plt
-
-        # plt.figure(figsize=(6,6))
-        # plt.imshow(covisibility_graph, cmap="viridis")
-        # plt.colorbar(label="Covisibility weight")
-        # plt.title("Covisibility matrix")
-        # plt.xlabel("Frame index")
-        # plt.ylabel("Frame index")
-        # plt.show()
-        print("Building covisiblity graph took", length, "seconds!")
-        
         stacked_predictions = [predictions]
 
     else:
@@ -977,57 +898,6 @@ for i, images in enumerate(sub_dirs):
         keyframes.index_copy_(0, idx_t, image_tensors.index_select(0, idx_t))
         
         
-        # idx_t = torch.tensor(changed_idx, device=device, dtype=torch.long)
-        # covisibility_changed = covisibility_graph.index_select(0, idx_t).index_select(1, idx_t)
-    
-        
-   
-        # adj = covis_to_adj(covisibility_changed, tau=0.3, kmin=0)
-        
-        # print(adj)
-        
-        
-
-        # groups = compute_tight_components(adj,          
-        #             mutual=True,        # require i<->j
-        #             window=None,           # keep only neighbors within ±2 frames (tune or None)
-        #             jaccard_tau=False,    # drop weak overlaps (0.1–0.4 typical), or None
-        #             k_core_k=False       # e.g., 2 or 3 to peel fringes, or None)
-        # )
-        
-        # groups = merge_singletons_to_next(groups, adj.shape[0])
-        
-        
-        # # groups = [[0] + [x for x in group if x != 0] for group in groups]
-
-        # groups = [[index_map[x] for x in group] for group in groups]
-        # print(groups)
-        
-        
-        # new_vggt_input = []
-        # grown_groups = []
-        # for group in groups:
-        #     # _, path,_ = dijkstra_to_any(covisibility_graph, group)
-        #     if group == [0]:
-        #         continue
-            
-        #     group, _ ,_ = grow_set_until_coverage(covisibility_graph, thresh=coverage_threshold, start=group)
-        #     group = [0] + [x for x in group if x != 0]
-        #     grown_groups.append(group)
-        #     print(group)
-        #     new_vggt_input.append([imgs[g] for g in group])
-        
-        
-        # grown_changed_idx,_,_ = grow_set_until_coverage(covisibility_graph, thresh=coverage_threshold, start=changed_idx)
-        
-        # print(grown_changed_idx)
-    
-        # decision = decide_grouping_vs_all(grown_groups, grown_changed_idx, rho=0.9)
-
-        # print(decision)
-        
-        # new_vggt_input = new_vggt_input if decision["use_groups"] else [[imgs[g] for g in grown_changed_idx]]
-        
         print("final changed idx:", changed_idx)
         new_vggt_input = [[imgs[g] for g in changed_idx]]
 
@@ -1037,8 +907,7 @@ for i, images in enumerate(sub_dirs):
         # for input_frames in [imgs]:
         predictions = get_reconstructed_scene(i, ".", imgs, model, device, False, 512, target_dir + images, "linear", 100, 1, True, False, True, False, 0.05, "oneref", 1, 0, changed_gids=changed_idx)
         
-        # predictions = run_model(model, vggt_input, attn_mask=adj)
-
+        # predictions = run_model(model, vggt_input, attn_mask=adj)s
             
         end = time.time()
         length = end - start
@@ -1059,9 +928,6 @@ for i, images in enumerate(sub_dirs):
     # print("Align Point Cloud")
 
     start = time.time()
-    
-    
-    
     
     WPTS_m = rotate_points(predictions[POINTS], R_w2m, t_w2m)
 
