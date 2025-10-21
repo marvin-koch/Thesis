@@ -37,7 +37,7 @@ class VoxelParams:
     st_decay_gamma: float = 0.0       # 0.0 -> ST clears every epoch
 
     # ---------- NEW: Epoch-based LT promotion ----------
-    promote_epochs: int = 50         # promote to LT if seen occupied in >= N distinct epochs
+    promote_epochs: int = 5         # promote to LT if seen occupied in >= N distinct epochs
     lt_min_view_sectors: int = 1      # require >= M distinct yaw sectors across epochs (1 disables)
     lt_promotion_mode: str = "once"   # "once" -> set to target; "accumulate" -> add each qualifying epoch
     lt_promote_value: float = 0.8     # target LT level for "once" mode

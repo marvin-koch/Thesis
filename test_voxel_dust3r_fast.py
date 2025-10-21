@@ -132,8 +132,8 @@ def make_edge_from_image_cache(i, j, depth_list, K_list, Twc_list, conf_list=Non
     Pi_world = cam_to_world(unproject_depth(Di, Ki), Tiw)   # (H,W,3)
     Pj_world = cam_to_world(unproject_depth(Dj, Kj), Tjw)   # (H,W,3)
 
-    conf_i = conf_list[i] if conf_list is not None else np.ones(Di.shape, np.float32)
-    conf_j = conf_list[j] if conf_list is not None else np.ones(Dj.shape, np.float32)
+    conf_i = conf_list[i] if conf_list is not None else (np.ones(Di.shape, np.float32))
+    conf_j = conf_list[j] if conf_list is not None else (np.ones(Dj.shape, np.float32))
 
     view1 = {"idx": i, "true_shape": np.int32([[Di.shape[0], Di.shape[1]]]), "img": np.int32([[Di.shape[0], Di.shape[1]]])}
     view2 = {"idx": j, "true_shape": np.int32([[Dj.shape[0], Dj.shape[1]]]), "img": np.int32([[Dj.shape[0], Dj.shape[1]]])}
@@ -227,7 +227,7 @@ def schedule_pairs(changed_gids, local2gid, pairs, budget,
 
     # ≤1 edge per changed image
     for i in changed_local:
-        if len(run_set) >= budget: break
+        if len(run_set) > budget: break
         
         e = pick_for_image_mst(i, tau_mst, tau_extra)
         print(e)
@@ -235,6 +235,8 @@ def schedule_pairs(changed_gids, local2gid, pairs, budget,
             continue
         run_set.update(e)
         
+    for i in changed_local:
+        if len(run_set) > budget: break
         e = pick_one_for_image_extra(i, tau_mst, tau_extra)
         if e is None: 
             continue
@@ -277,7 +279,7 @@ def schedule_pairs(changed_gids, local2gid, pairs, budget,
     for idx, (vi, vj) in enumerate(pairs):
         i, j = vi["idx"], vj["idx"]
         # if direction (i,j) not in run_set, accept (j,i) too
-        want = (i, j) in run_set or (j, i) in run_set
+        want = (i, j) in run_set #or (j, i) in run_set
         run_mask.append(want)
         if want:
             pairs_to_run.append((vi, vj))
@@ -394,7 +396,9 @@ def get_reconstructed_scene(
         GA_CACHE["depth"] = depth_list  # NEW
         GA_CACHE["pw_poses"] = scene.pw_poses.detach().cpu().numpy()    
         GA_CACHE["pw_adaptors"] = scene.pw_adaptors.detach().cpu().numpy() 
-        
+        GA_CACHE["conf_i"] = scene.conf_i
+        GA_CACHE["conf_j"] = scene.conf_j
+
         GA_CACHE["base_scale"] = scene.base_scale
         GA_CACHE["pw_break"] = scene.pw_break
         GA_CACHE["norm_pw"] = scene.norm_pw_scale
@@ -423,7 +427,6 @@ def get_reconstructed_scene(
         else:
             P = np.array(pts, dtype=object)        # fallback
             C = np.array(confs_raw, dtype=object)  # fallback
-
 
 
         predictions = {
@@ -460,6 +463,8 @@ def get_reconstructed_scene(
     depth_all = GA_CACHE["depth"]
     K_all     = GA_CACHE["K"]
     Twc_all   = GA_CACHE["Twc"]
+    conf_i = GA_CACHE["conf_i"]
+    conf_j = GA_CACHE["conf_j"]
 
     # Map local idx -> global gid for this subset
     local2gid = {d["idx"]: d["gid"] for d in imgs}
@@ -486,12 +491,12 @@ def get_reconstructed_scene(
         for (vi, vj) in pairs:
             i = vi["idx"]; j = vj["idx"]
 
-            if (i, j) in mst_edges or (j, i) in mst_edges:
+            if (i, j) in mst_edges:
                 incident_mst[i].append((i, j))
-                incident_mst[j].append((j, i))
+                incident_mst[j].append((i, j))
             else:
                 incident_extra[i].append((i, j))
-                incident_extra[j].append((j, i))
+                incident_extra[j].append((i, j))
 
         # Order each list by a stable priority (e.g., cached score descending)
         def sort_by_score(lst):
@@ -502,7 +507,7 @@ def get_reconstructed_scene(
         
         
     
-    B = max(1,  5 *len(imgs))  # hard cap
+    B = max(1, len(imgs))  # hard cap
     pairs_to_run, run_mask, edge_lut = schedule_pairs(
         changed_gids=changed_gids,
         local2gid=local2gid,
@@ -515,6 +520,8 @@ def get_reconstructed_scene(
     )
     
     print("running pairs")
+    
+    pairs_to_run_tuples = [(vi["idx"], vj["idx"]) for (vi, vj) in pairs_to_run]
     for (vi, vj) in pairs_to_run:
         print(vi["idx"], vj["idx"])
 
@@ -610,12 +617,12 @@ def get_reconstructed_scene(
             scene.im_pp.requires_grad_(was_pp)
 
         # 3) NEW: warm-start depths (critical for small initial loss)
-        if depth0_all is not None and len(depth0_all) > 0:
-            for i, dct in enumerate(imgs):
-                gi = dct['gid']
-                di_np = depth0_all[gi]
-                di_t  = torch.as_tensor(di_np)
-                scene._set_depthmap(i, di_t, force=True)
+        # if depth0_all is not None and len(depth0_all) > 0:
+        #     for i, dct in enumerate(imgs):
+        #         gi = dct['gid']
+        #         di_np = depth0_all[gi]
+        #         di_t  = torch.as_tensor(di_np)
+        #         scene._set_depthmap(i, di_t, force=True)
         
 
         
@@ -640,21 +647,57 @@ def get_reconstructed_scene(
         scene.base_scale = GA_CACHE["base_scale"]
         scene.pw_break = GA_CACHE["pw_break"] 
         scene.norm_pw_scale = GA_CACHE["norm_pw"]
-        
+        scene.conf_i = conf_i
+        scene.conf_j = conf_j
 
         # 6) NEW: seed per-edge latents using current poses (PnP-like), but no steps yet
-        try:
-            _ = scene.compute_global_alignment(init='known', niter=niter/20, schedule=schedule, lr=1e-2)
-        except Exception:
-            print("Exception")
-            # Fallback: a 0-iter 'mst' or a tiny run to seed edge vars
-            _ = scene.compute_global_alignment(init='mst', niter=0)
+        # try:
+        #     _ = scene.compute_global_alignment(init='known', niter=0, schedule=schedule, lr=1e-2)
+        # except Exception:
+        #     print("Exception")
+        #     # Fallback: a 0-iter 'mst' or a tiny run to seed edge vars
+        #     _ = scene.compute_global_alignment(init='mst', niter=0)
 
         # print("pw_poses", scene.get_pw_poses())
 
+        if depth0_all is not None and len(depth0_all) > 0:
+            for i, dct in enumerate(imgs):
+                gi = dct['gid']
+                di_np = depth0_all[gi]
+                di_t  = torch.as_tensor(di_np)
+                if i not in changed_gids:
+                    scene._set_depthmap(i, di_t, force=True)
+                    
+                    
+        best_depthmaps = {}
+        # init all pairwise poses
+        for e, (i, j) in enumerate(scene.edges):
+            i_j = edge_str(i, j)
+            # remember if this is a good depthmap
+            score = float(scene.conf_i[i_j].mean())
+            s = scene.get_pw_scale()[e]
+            if score > best_depthmaps.get(i, (0,))[0] and (i,j) in pairs_to_run_tuples:
+                best_depthmaps[i] = score, i_j, s
+                print(score)
+      
+
+        # init all image poses
+        for n in range(scene.n_imgs):
+            #assert known_poses_msk[n]
+            # score, i_j, scale = best_depthmaps[n]
+
+            item = best_depthmaps.get(n)
+            if item is None:
+                continue  # skip if not found
+            score, i_j, scale = item
+
+            print(score, i_j)
+            depth = scene.pred_i[i_j][:, :, 2]
+            print(depth)
+            scene._set_depthmap(n, depth * scale)
 
         # 7) short refine without re-init
-        # _ = scene.compute_global_alignment(init=None, niter=niter/5, schedule=schedule, lr=1e-2) #5e-2
+        _ = scene.compute_global_alignment(init=None, niter=niter/20, schedule=schedule, lr=1e-2) #5e-2
 
     # Read subset outputs
     Twc_sub = scene.get_im_poses().detach().cpu().numpy()    # (M,4,4)
@@ -731,13 +774,12 @@ def get_reconstructed_scene(
         refined_depth_i = scene.get_depthmaps()[i].detach().cpu().numpy()
         GA_CACHE["depth"][dct["gid"]] = refined_depth_i
 
-    
-
+    scene_imgs = [im["img"].detach().cpu().numpy() for im in imgs_clean if im["idx"] in changed_gids]
         
     predictions = {
         "world_points":       P,
         "world_points_conf":  C,
-        "images":             np.array(scene_imgs, dtype=object),
+        "images":             np.array(scene_imgs, dtype=object).squeeze(1),
         "extrinsic":          np.stack(Tcw_sub, axis=0),   # (M,4,4)
         "intrinsic_K":        K_sub,
         "gids":               np.array([d["gid"] for d in imgs]),
@@ -787,7 +829,9 @@ vox = TorchSparseVoxelGrid(
     device=device, dtype=torch.float32
 )
 
-save_root = "kitchen_habitat_dust3r_fast/"
+save_root = "kitchen_habitat_dust3r_fast_2/"
+os.makedirs(save_root, exist_ok=True)
+
 # target_dir = "/Users/marvin/Documents/Thesis/vggt/examples/fishbowl1/"
 # sub_dirs = ["images","images", "images1", "images2", "images3"]
 # sub_dirs = ["00000000", "00000050","00000100", "00000150", "00000200", "00000250"]
@@ -845,6 +889,7 @@ for i, images in enumerate(sub_dirs):
         stacked_predictions = [predictions]
 
     else:
+    
         start = time.time()
 
         changed_idx = changed_images(image_tensors, keyframes, thresh=0.000005)
@@ -975,7 +1020,7 @@ for i, images in enumerate(sub_dirs):
         bev_window_m=(5.0, 5.0), # local 20x20 m
         bev_origin_xy=(-2.0, -2.0),
         z_clip_vox=(-np.inf, np.inf),
-        z_band_bev=(-0.02, 0.5),
+        z_band_bev=(0.02, 0.5),
         max_range_m=None,
         carve_free=True,
         samples_per_voxel=0.7,#1,

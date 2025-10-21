@@ -6,10 +6,8 @@ import time
 from voxel.utils import *
 from voxel.voxel import *
 from voxel.align import *
+from voxel.viz_utils import *
 from preprocess_images.filter_images import changed_images
-
-import os, json, numpy as np, torch
-import imageio.v2 as imageio
 
 import os, json, numpy as np, torch
 import imageio.v2 as imageio
@@ -140,91 +138,6 @@ def load_habitat_time_as_predictions(
     }
     return predictions, (H, W)
 
-# def load_habitat_time_as_predictions(time_dir, intrinsics_json_path,
-#                                            device="cuda", dtype=torch.float16):
-#     """
-#     Builds VGGT-shaped predictions for one time folder:
-#       images:   (S,3,H,W) float in [0,1]
-#       intrinsic:(S,3,3)
-#       extrinsic:(S,3,4)  OpenCV w2c (R|t)
-#       world_points: (S,H,W,3) world coords; invalid pixels = NaN
-#       world_points_conf: (S,H,W) confidences (0 if invalid, 100 otherwise)
-#     """
-#     with open(intrinsics_json_path, "r") as f:
-#         intr = json.load(f)
-#     fx, fy, cx, cy = float(intr["fl_x"]), float(intr["fl_y"]), float(intr["cx"]), float(intr["cy"])
-#     H, W = int(intr["h"]), int(intr["w"])
-
-#     with open(os.path.join(time_dir, "poses.json"), "r") as f:
-#         poses_pack = json.load(f)
-#     poses = sorted(poses_pack["poses"], key=lambda p: int(p["camera_index"]))
-#     S = len(poses)
-
-#     images   = torch.empty((S, 3, H, W), dtype=torch.float32, device=device)
-#     K_mats   = torch.empty((S, 3, 3),     dtype=torch.float32, device=device)
-#     w2c_mats = torch.empty((S, 3, 4),     dtype=torch.float32, device=device)
-
-#     # Dense outputs (keep on CPU as NumPy for memory ease, move to torch later if needed)
-#     P_world_all = np.full((S, H, W, 3), np.nan, dtype=np.float32)
-#     Conf_all    = np.zeros((S, H, W),    dtype=np.float32)
-
-#     K_np = np.array([[fx, 0,  cx],
-#                      [0,  fy, cy],
-#                      [0,  0,   1]], dtype=np.float32)
-
-#     # Precompute pixel grid
-#     ys, xs = np.meshgrid(np.arange(H, dtype=np.float32),
-#                          np.arange(W, dtype=np.float32), indexing="ij")
-
-#     for i, p in enumerate(poses):
-#         # --- image ---
-#         rgb = imageio.imread(os.path.join(time_dir, p["file_path"]))[..., :3]
-#         if rgb.shape[0] != H or rgb.shape[1] != W:
-#             raise ValueError(f"Image size mismatch: got {rgb.shape[:2]}, expected {(H,W)}")
-#         images[i] = torch.from_numpy((rgb.astype(np.float32)/255.0).transpose(2,0,1)).to(device)
-
-#         # --- intrinsics / extrinsics ---
-#         K_mats[i] = torch.from_numpy(K_np).to(device)
-
-#         c2w = np.array(p["transform_matrix"], dtype=np.float32)   # 4x4 camera_to_world
-#         Rcw = c2w[:3, :3]
-#         tcw = c2w[:3,  3]
-#         Rwc = Rcw.T
-#         twc = -Rwc @ tcw
-#         w2c = np.concatenate([Rwc, twc[:,None]], axis=1).astype(np.float32)  # 3x4 OpenCV
-#         w2c_mats[i] = torch.from_numpy(w2c).to(device)
-
-#         # --- depth -> dense world points ---
-#         dfile = p.get("depth_file", None)
-#         if dfile is None:
-#             continue
-#         D = np.load(os.path.join(time_dir, dfile)).astype(np.float32)  # HxW meters
-
-#         valid = np.isfinite(D) & (D > 0.0)
-#         if not np.any(valid):
-#             continue
-
-#         Z = D
-#         X = (xs - cx) * Z / fx
-#         Y = (ys - cy) * Z / fy
-#         P_cam = np.stack([X, Y, Z], axis=-1)  # (H,W,3)
-
-#         # cam -> world: Xw = Rcw @ Xc + tcw
-#         P_world = (P_cam.reshape(-1,3) @ Rcw.T) + tcw[None,:]
-#         P_world = P_world.reshape(H, W, 3)
-
-#         # fill outputs
-#         P_world_all[i] = np.where(valid[...,None], P_world, np.nan)
-#         Conf_all[i]    = np.where(valid, 100.0, 0.0)  # high conf for valid pixels
-
-#     predictions = {
-#         "images":    images.to(dtype),     # (S,3,H,W)
-#         "intrinsic": K_mats,               # (S,3,3)
-#         "extrinsic": w2c_mats,             # (S,3,4)
-#         POINTS:      P_world_all,          # (S,H,W,3) np.float32 with NaNs for invalid
-#         CONF:        Conf_all,             # (S,H,W)   np.float32
-#     }
-#     return predictions, (H, W)
 
 sys.path.append("vggt/")
 
@@ -252,7 +165,7 @@ vox = TorchSparseVoxelGrid(
     device=device, dtype=torch.float32
 )
 
-root = "/Users/marvin/Documents/Thesis/repo/dataset_generation/habitat/frames"  # folder that contains intrinsics.json and time_XXXXX/
+root = "/Users/marvin/Documents/Thesis/repo/dataset_generation/habitat/frames_kitchen"  # folder that contains intrinsics.json and time_XXXXX/
 intrinsics_json = os.path.join(root, "intrinsics.json")
 time_dirs = sorted([d for d in os.listdir(root) if d.startswith("time_")])
 
@@ -325,7 +238,7 @@ for i, td in enumerate(time_dirs):
 
     # save if you want (same as your VGGT code)
     
-    save_root = "living_room_habitat/"
+    save_root = "kitchen_habitat/"
     # Files
     # Files
     save_bev(bev, meta, save_root + f"bev_{i}.png", save_root + f"bev_{i}_np.npy", save_root + f"bev_{i}_meta.json")

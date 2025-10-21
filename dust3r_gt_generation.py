@@ -560,13 +560,13 @@ vox = TorchSparseVoxelGrid(
     device=device, dtype=torch.float32
 )
 
-save_root = "living_room_habitat_dust3r_gt/"
+save_root = "kitchen_habitat_dust3r_gt/"
 # target_dir = "/Users/marvin/Documents/Thesis/vggt/examples/fishbowl1/"
 # sub_dirs = ["images","images", "images1", "images2", "images3"]
 # sub_dirs = ["00000000", "00000050","00000100", "00000150", "00000200", "00000250"]
 # sub_dirs = ["00000000", "00000300",  "00000350", "00000400"]
 
-target_dir = "/Users/marvin/Documents/Thesis/repo/dataset_generation/habitat/frames/"  # folder that contains intrinsics.json and time_XXXXX/
+target_dir = "/Users/marvin/Documents/Thesis/repo/dataset_generation/habitat/frames_kitchen/"  # folder that contains intrinsics.json and time_XXXXX/
 
 sub_dirs = sorted([d for d in os.listdir(target_dir) 
             if os.path.isdir(os.path.join(target_dir, d))])
@@ -849,7 +849,7 @@ for i, images in enumerate(sub_dirs):
             bev_window_m=(5.0, 5.0), # local 20x20 m
             bev_origin_xy=(-2.0, -2.0),
             z_clip_vox=(-np.inf, np.inf),
-            z_band_bev=(0.04, 0.5),
+            z_band_bev=(-0.06, 0.5),
             max_range_m=None,
             carve_free=True,
             samples_per_voxel=0.7,#1,
