@@ -52,7 +52,6 @@ dash-table==5.0.0
 datasets==3.4.1
 debugpy==1.8.12
 decorator==5.2.1
-deeplsd @ git+https://github.com/cvg/DeepLSD.git@88c589dfdd824a94051131cd5bce88588009bebb
 defusedxml==0.7.1
 Deprecated==1.2.18
 diffusers==0.20.0
@@ -84,15 +83,13 @@ gitdb==4.0.12
 GitPython==3.1.44
 glcontext==3.0.0
 glog==0.3.1
-gluestick @ git+https://github.com/cvg/GlueStick.git@0f28efd33ed6e43ab63760decd62750cdede5721
 gradio==5.17.1
 gradio_client==1.7.1
 groovy==0.1.2
 grpcio==1.71.0
 h11==0.14.0
 h5py==3.13.0
-hdbscan==0.8.40
--e git+https://github.com/B1ueber2y/Hierarchical-Localization.git@dfe106a93264cd168b633b2186c013bcc8403eba#egg=hloc
+
 hpsv2==1.2.0
 httpcore==1.0.7
 httpx==0.28.1
@@ -133,10 +130,8 @@ kiwisolver==1.4.8
 kornia==0.8.0
 kornia_rs==0.1.8
 lazy_loader==0.4
-lightglue @ git+https://github.com/cvg/LightGlue@edb2b838efb2ecfe3f88097c5fad9887d95aedad
 lightning==2.5.1
 lightning-utilities==0.14.3
--e git+https://github.com/cvg/limap.git@c89ff02cb1a4ecc7c58b110f31f37bf759d0c9cb#egg=limap
 llvmlite==0.45.0
 lxml==6.0.1
 lz4==4.4.4
@@ -153,7 +148,6 @@ mistune==3.1.3
 mmcv==2.2.0
 mmengine==0.10.7
 moderngl==5.12.0
-moge @ git+https://github.com/microsoft/MoGe.git@a8c37341bc0325ca99b9d57981cc3bb2bd3e255b
 mpmath==1.3.0
 msgspec==0.19.0
 multidict==6.2.0
@@ -228,7 +222,6 @@ python-dateutil==2.9.0.post0
 python-gflags==3.1.2
 python-json-logger==3.3.0
 python-multipart==0.0.20
-pytlsd @ git+https://github.com/iago-suarez/pytlsd.git@37ac583341cbca74c2bbb1e07b82e1447f7cdf5f
 pytorch-lightning==2.5.1
 pytz==2025.1
 pyvista==0.44.2
