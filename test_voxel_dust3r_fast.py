@@ -6,8 +6,8 @@ import sys
 import tempfile
 import matplotlib.pyplot as pl
 import copy
+import pow3r2.tools.path_to_dust3r
 
-import pow3r.tools.path_to_dust3r
 from dust3r.utils.device import todevice, to_numpy
 from dust3r.inference import inference
 from dust3r.image_pairs import make_pairs
@@ -44,6 +44,16 @@ GA_CACHE = {
     "pw_adaptors": None
 }
 
+
+def to_torch(x, device="cuda"):
+    """Convert to PyTorch tensor if not already."""
+    if isinstance(x, np.ndarray):
+        return torch.from_numpy(x).to(device, dtype=torch.float32)
+    elif isinstance(x, torch.Tensor):
+        return x.to(device, dtype=torch.float32)
+    else:
+        return torch.tensor(x, device=device, dtype=torch.float32)
+    
 def _clone(src, dst):
     os.makedirs(os.path.dirname(dst), exist_ok=True)
     shutil.copyfile(src, dst)
@@ -230,7 +240,6 @@ def schedule_pairs(changed_gids, local2gid, pairs, budget,
         if len(run_set) > budget: break
         
         e = pick_for_image_mst(i, tau_mst, tau_extra)
-        print(e)
         if e is None: 
             continue
         run_set.update(e)
@@ -240,10 +249,8 @@ def schedule_pairs(changed_gids, local2gid, pairs, budget,
         e = pick_one_for_image_extra(i, tau_mst, tau_extra)
         if e is None: 
             continue
-        print(e)
         run_set.add(e)
 
-    print(run_set)
 
         # # Optional: refresh the single stalest MST edge globally (drift control)
         # if refresh_one_stale_mst and len(run_set) < budget:
@@ -370,9 +377,8 @@ def get_reconstructed_scene(
 
         # pairs = [(imgs_clean[0], imgs_clean[1]), (imgs_clean[0], imgs_clean[2])]
 
-        output = inference(pairs, model, device, batch_size=4, verbose=not silent)
+        output = inference(pairs, model, device, batch_size=16, verbose=not silent)
 
-        print(output.keys())
         mode = GlobalAlignerMode.PointCloudOptimizer if len(imgs) > 2 else GlobalAlignerMode.PairViewer
         scene = global_aligner(output, device=device, mode=mode, verbose=not silent)
 
@@ -547,7 +553,7 @@ def get_reconstructed_scene(
 
     # Run the network ONLY for needed edges
     if len(pairs_to_run):
-        out_delta = inference(pairs_to_run, model, device, batch_size=4, verbose=not silent)
+        out_delta = inference(pairs_to_run, model, device, batch_size=16, verbose=not silent)
         
     else:
         # fabricate an empty structure with lists
@@ -678,7 +684,6 @@ def get_reconstructed_scene(
             s = scene.get_pw_scale()[e]
             if score > best_depthmaps.get(i, (0,))[0] and (i,j) in pairs_to_run_tuples:
                 best_depthmaps[i] = score, i_j, s
-                print(score)
       
 
         # init all image poses
@@ -691,9 +696,7 @@ def get_reconstructed_scene(
                 continue  # skip if not found
             score, i_j, scale = item
 
-            print(score, i_j)
             depth = scene.pred_i[i_j][:, :, 2]
-            print(depth)
             scene._set_depthmap(n, depth * scale)
 
         # 7) short refine without re-init
@@ -788,10 +791,10 @@ def get_reconstructed_scene(
 
 
 
-sys.path.append("vggt/")
+sys.path.append("Thesis/")
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-dtype = torch.float16
+dtype = torch.bfloat16
 POINTS = "world_points"
 CONF = "world_points_conf"
 VIZ = False
@@ -837,7 +840,7 @@ os.makedirs(save_root, exist_ok=True)
 # sub_dirs = ["00000000", "00000050","00000100", "00000150", "00000200", "00000250"]
 # sub_dirs = ["00000000", "00000300",  "00000350", "00000400"]
 
-target_dir = "/Users/marvin/Documents/Thesis/repo/dataset_generation/habitat/frames_kitchen/"  # folder that contains intrinsics.json and time_XXXXX/
+target_dir = "../frames_bedroom/"  # folder that contains intrinsics.json and time_XXXXX/
 
 sub_dirs = sorted([d for d in os.listdir(target_dir) 
             if os.path.isdir(os.path.join(target_dir, d))])
@@ -870,7 +873,7 @@ for i, images in enumerate(sub_dirs):
             t = t / 255.0
         image_tensors.append(t.clamp(0,1))
         
-    image_tensors = torch.stack(image_tensors, dim=0)  
+    image_tensors = torch.stack(image_tensors, dim=0).to(device)
 
 
     if i < 1:
@@ -979,29 +982,41 @@ for i, images in enumerate(sub_dirs):
     # if VIZ:
     #     visualize_vggt_pointcloud(predictions, key=POINTS, conf_key=CONF, threshold=threshold)
 
-    Rmw, tmw, info = align_pointcloud(WPTS_m, inlier_dist=voxel_size*0.75)
+    Rmw, tmw, info = align_pointcloud_torch(WPTS_m, inlier_dist=voxel_size*0.75)
     WPTS_m = rotate_points(WPTS_m, Rmw, tmw)
     predictions[POINTS] = WPTS_m
 
+    end = time.time()
+    length = end - start
+
+    print("Aligning frames took", length, "seconds!")
+    
     if VIZ:
         visualize_vggt_pointcloud(predictions, key=POINTS, conf_key=CONF, threshold=threshold)
 
     # print("Building Voxels and BEV")
+    start = time.time()
+
+
+    R_w2m = to_torch(R_w2m, device=device)
+    t_w2m = to_torch(t_w2m, device=device)
 
     camera_R = R_w2m @ Rmw
     camera_t = t_w2m + tmw
-    frames_map, cam_centers_map, conf_map, (S,H,W) = build_frames_and_centers_vectorized(
+    frames_map, cam_centers_map, conf_map, (S,H,W), frame_ids = build_frames_and_centers_vectorized_torch(
         predictions,
         POINTS=POINTS,
         CONF=CONF,
         threshold=threshold,
         Rmw=camera_R, tmw=camera_t,
         z_clip_map=z_clip_map,   # or None
+        return_flat=True
+       # dtype=dtype
     )   
     end = time.time()
     length = end - start
 
-    print("Aligning and building frames/camera centers took", length, "seconds!")
+    print("Building frames/camera centers took", length, "seconds!")
 
     start = time.time()
 
@@ -1026,6 +1041,7 @@ for i, images in enumerate(sub_dirs):
         samples_per_voxel=0.7,#1,
         ray_stride=6,#2,
         max_free_rays=10000,
+        frame_ids=frame_ids
     )
 
     # if i == 0:
