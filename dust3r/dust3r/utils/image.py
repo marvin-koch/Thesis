@@ -93,6 +93,7 @@ def load_images(folder_or_list, size, square_ok=False, verbose=True):
 
     #REMOVE
     # folder_content = [s for s in folder_content if any(ch in "02468" for ch in s)]
+    folder_content = [s for s in folder_content if s[-5] in "02468"]
     # print(folder_content)
     
     

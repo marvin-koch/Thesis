@@ -30,7 +30,7 @@ def to_numpy(x):
     if isinstance(x, torch.Tensor):
         return x.detach().cpu().numpy()
     elif isinstance(x, (list, tuple)):
-        return type(x)(to_numpy(xx) for xx in x)
+        return np.stack([to_numpy(xx) for xx in x])
 
     elif isinstance(x, dict):
         return {k: to_numpy(v) for k, v in x.items()}
@@ -215,6 +215,8 @@ def build_frames_and_centers_vectorized(
     *,
     POINTS: str = "world_points_from_depth",
     CONF: str = "world_points_conf",
+    IMG: str = "images",
+    FEAT: str = None,
     EXTR_KEY: str = "extrinsic",
     threshold: float = 50.0,     # percentile in [0,100]
     Rmw: np.ndarray = np.eye(3, dtype=np.float32),   # (optional) world->map rot (not applied to points here)
@@ -235,14 +237,21 @@ def build_frames_and_centers_vectorized(
     """ 
 
     # --- load arrays ---
+
     P = to_numpy(predictions[POINTS]).astype(np.float32)   # (S,H,W,3)
-    C = to_numpy(predictions.get(CONF, np.ones_like(P[...,0], dtype=np.float32))).astype(np.float32)  # (S,H,W)
     
+    if FEAT is not None:
+        F = to_numpy(predictions[FEAT]).astype(np.float32)   # (S,H,W,3)
+        feat_dim = F.shape[-1]
+
+    C = to_numpy(predictions.get(CONF, np.ones_like(P[...,0], dtype=np.float32))).astype(np.float32)  # (S,H,W)
+    I = to_numpy(predictions[IMG]).astype(np.float32)
     print(P.shape)
     print(C.shape)
     EXTR = to_numpy(predictions[EXTR_KEY])                 # (S,3,4) or (S,4,4)
 
     S, H, W = P.shape[:3]
+    
     
     if threshold == 0.0:
         conf_threshold = 0.0
@@ -284,20 +293,30 @@ def build_frames_and_centers_vectorized(
 
     # --- gather per-frame points (no per-point loops) ---
     P_flat = P.reshape(S, -1, 3)         # (S, H*W, 3)
+    I_flat = I.reshape(S, -1, 3)
     V_flat = valid.reshape(S, -1)        # (S, H*W)
     C_flat = C.reshape(S,-1)
     
+    if FEAT is not None:
+        F_flat = F.reshape(S, -1, feat_dim)
+
     frames_map = []
     conf_map = []
-
+    images_map = []
+    feat_map = []
+    
     for f in range(S):
         conf_map.append(C_flat[f][V_flat[f]].astype(np.float32))
         if not np.any(V_flat[f]):
             frames_map.append(np.empty((0,3), dtype=np.float32))
             continue
         frames_map.append(P_flat[f][V_flat[f]].astype(np.float32))
-
-    return frames_map, cam_centers_map, conf_map, (S, H, W)
+        images_map.append(I_flat[f][V_flat[f]].astype(np.float32))
+        
+        if FEAT is not None:
+            feat_map.append(F_flat[f][V_flat[f]].astype(np.float32))
+        
+    return frames_map, cam_centers_map, conf_map, images_map, feat_map if (FEAT is not None) else None , (S, H, W)
 
 # =============================
 # ----- BEV rasterization -----
@@ -485,14 +504,12 @@ def build_maps_from_points_and_centers_torch(
                     for P, C, CONF in zip(frames_xyz, cam_centers, conf_map)
                     if (P is not None and P.size and C is not None)]
     
-    print("1")
     if not valid_frames:
         bev_spec = BevSpec(resolution=voxel_size, width_m=float(bev_window_m[0]),
                            height_m=float(bev_window_m[1]), origin_xy=bev_origin_xy, z_band=z_band_bev)
         bev, meta = bev_from_voxels(tvox, bev_spec, include_free=True)
         return tvox, bev, meta
 
-    print("2")
 
     lengths = [pf.shape[0] for pf, _, _ in valid_frames]
     P_all = np.concatenate([pf for pf, _, _ in valid_frames], axis=0)              # (M,3)
@@ -500,13 +517,11 @@ def build_maps_from_points_and_centers_torch(
                             for n, (_, cf, _) in zip(lengths, valid_frames)], axis=0)  # (M,3)
     CONF_all = np.concatenate([c for _, _, c in valid_frames], axis=0)              # (M,3)
 
-    print("3")
 
     # drop NaNs early (keeps alignment)
     keep = np.isfinite(P_all).all(axis=1) & np.isfinite(C_all).all(axis=1)
     P_all = P_all[keep]; C_all = C_all[keep]; CONF_all = CONF_all[keep]
     
-    print("4")
 
     if align_to_voxel:
         _, pts, cameras = sim3_align_to_voxel(
@@ -534,69 +549,6 @@ def build_maps_from_points_and_centers_torch(
             )
         )
         
-        # _, pts, cameras = sim3_icp_align_to_voxel(
-        #     pts_world=torch.from_numpy(P_all),
-        #     cams_world=torch.from_numpy(C_all),
-        #     grid=tvox,                         # your TorchSparseVoxelGrid
-        #     conf_world=torch.from_numpy(CONF_all),
-        #     cfg=AlignCfg(
-        #         iters=5,
-        #         downsample_points=50000,
-        #         pad_vox=48,
-        #         max_block_vox=192,
-        #         samples_per_ray=16,
-        #         lambda_free=0.1,
-        #         lambda_prior_t=1e-4,
-        #         lambda_prior_r=1e-4,
-        #         lambda_prior_s=1e-4,
-        #         step=2e-1,
-        #         use_sim3=True,
-        #         rot_clamp_deg=10.0,
-        #         trans_clamp_m=5*voxel_size,
-        #         scale_clamp=0.1,
-        #         conf_filter=True,
-        #         conf_quantile=0.3,
-        #         icp_max_iters=50,
-        #         icp_trim_fraction=0.7,
-        #         icp_huber_delta=0.03,         # ~3 cm
-        #         icp_dist_thresh=0.05,         # 20 cm cutoff early
-        #         icp_nn_subsample=50000,
-        #         icp_max_map_points=50000,
-        #     )
-        # )
-
-        # _, pts, cameras = sim3_align_to_voxel_robust(
-        #     pts_world=torch.from_numpy(P_all),
-        #     cams_world=torch.from_numpy(C_all),
-        #     conf_world=torch.from_numpy(CONF_all),
-        #     grid=tvox,
-        #     cfg=AlignCfg(
-        #         iters=12,
-        #         downsample_points=30000,
-        #         pad_vox=24,
-        #         max_block_vox=192,
-        #         samples_per_ray=16,
-        #         lambda_free_schedule=[0.001],
-        #         lambda_prior_t=1e-4,
-        #         lambda_prior_r=1e-4,
-        #         lambda_prior_s=1e-4,
-        #         step=2e-1,
-        #         use_sim3=True,
-        #         rot_clamp_deg=10.0,
-        #         trans_clamp_m=2*voxel_size,#0.5*voxel_size,
-        #         scale_clamp=0.1,
-        #         sigmas=[3.0, 2.0, 1.0],
-        #         sdf_mode="logit",
-        #         free_margin_m=2.0*voxel_size,
-        #         free_step_m=0.5*voxel_size,
-        #         lambda_norm=0.1,
-        #         conf_filter=True,
-        #         conf_quantile=0.1,
-        #         huber_delta=0.05,
-        #         bootstrap_nn_max_m=0.05*voxel_size,
-        #         bootstrap_icp_iters=2
-        #     )
-        # )
     else:
         pts, cameras = torch.from_numpy(P_all).to(device), torch.from_numpy(C_all).to(device),
 
@@ -643,37 +595,128 @@ def build_maps_from_points_and_centers_torch(
     bev, meta = bev_from_voxels(tvox, bev_spec, include_free=True)
     return tvox, bev, meta
 
-def build_maps_from_points_and_centers(
+
+
+def build_maps_from_latent_features(
+    i,
     frames_xyz: list[np.ndarray],          # list of (N_i,3) in MAP frame
     cam_centers: list[np.ndarray],         # list of (3,) in MAP frame
+    conf_map: list[np.ndarray],         
+    features: list[np.ndarray],
+    tvox,
     *,
+    align_to_voxel=False,
     voxel_size: float = 0.10,
     bev_window_m=(20.0, 20.0),
     bev_origin_xy=(-10.0, -10.0),
     z_clip_vox=(-np.inf, np.inf),
     z_band_bev=(0.05, 1.80),
-    max_range_m: float | None = 12.0,
-    carve_free: bool = True,
+ 
+    # new (optional) tuning/throughput controls:
+    device: str = "cpu",
+
+    batch_chunk_points: int | None = None,  # e.g., 2_000_000 to limit RAM
 ):
-    vox = SparseVoxelGrid(origin=np.zeros(3, dtype=np.float32),
-                          params=VoxelParams(voxel_size=voxel_size))
-    for P, C in zip(frames_xyz, cam_centers):
-        if P.size == 0: 
-            continue
-        P = P[~np.isnan(P).any(axis=1)]
-        vox.integrate_frame(P, C, carve_free=carve_free, max_range=max_range_m, z_clip=z_clip_vox)
+
+    # 1) Concatenate all frames once (no per-frame integrate calls)
+    #    Build per-point camera centers by repeating each frame center.
+    valid_frames = [(np.asarray(P, np.float32), np.asarray(C, np.float32).reshape(3), np.asarray(CONF, np.float32), np.asarray(F, np.float32))
+                    for P, C, CONF, F in zip(frames_xyz, cam_centers, conf_map, features)
+                    if (P is not None and P.size and C is not None)]
+    
+    if not valid_frames:
+        bev_spec = BevSpec(resolution=voxel_size, width_m=float(bev_window_m[0]),
+                           height_m=float(bev_window_m[1]), origin_xy=bev_origin_xy, z_band=z_band_bev)
+        bev, meta = bev_from_voxels(tvox, bev_spec, include_free=True)
+        return tvox, bev, meta
+
+
+    lengths = [pf.shape[0] for pf, _, _,_ in valid_frames]
+    P_all = np.concatenate([pf for pf, _, _,_ in valid_frames], axis=0)              # (M,3)
+    C_all = np.concatenate([np.repeat(cf[None, :], n, axis=0)
+                            for n, (_, cf, _,_) in zip(lengths, valid_frames)], axis=0)  # (M,3)
+    CONF_all = np.concatenate([c for _, _, c,_ in valid_frames], axis=0)              # (M,3)
+    F_all = np.concatenate([f for _, _, _,f in valid_frames], axis=0)              # (M,3)
+
+
+    # drop NaNs early (keeps alignment)
+    keep = np.isfinite(P_all).all(axis=1) & np.isfinite(C_all).all(axis=1)
+    P_all = P_all[keep]; C_all = C_all[keep]; CONF_all = CONF_all[keep]
+    
+
+    if align_to_voxel:
+        _, pts, cameras = sim3_align_to_voxel(
+            pts_world=torch.from_numpy(P_all),
+            cams_world=torch.from_numpy(C_all),
+            conf_world=torch.from_numpy(CONF_all),
+            grid=tvox,
+            cfg=AlignCfg(
+                iters=5,
+                downsample_points=50000,
+                pad_vox=48,
+                max_block_vox=192,
+                samples_per_ray=16,
+                lambda_free=0.1,
+                lambda_prior_t=1e-4,
+                lambda_prior_r=1e-4,
+                lambda_prior_s=1e-4,
+                step=2e-1,
+                use_sim3=True,
+                rot_clamp_deg=10.0,
+                trans_clamp_m=5*voxel_size,
+                scale_clamp=0.1,
+                conf_filter=True,
+                conf_quantile=0.3,
+            )
+        )
         
+    else:
+        pts, fts = torch.from_numpy(P_all).to(device), torch.from_numpy(F_all).to(device),
 
-    bev_spec = BevSpec(
-        resolution=voxel_size,
-        width_m=float(bev_window_m[0]),
-        height_m=float(bev_window_m[1]),
-        origin_xy=bev_origin_xy,
-        z_band=z_band_bev,
+
+    print(pts.shape)
+    # 2) Integrate once (optionally in chunks to cap memory)
+    if i == 0:
+        # Initialize voxel latents + (optionally) occupancy
+        tvox.initialize_latents_from_full_cloud(
+            pts_world=pts, f_pts=fts)
+    else:
+        radius = 0.25
+        if batch_chunk_points is None or pts.shape[0] <= batch_chunk_points:
+            tvox.update_with_features(
+                                pts,  # (N,3)
+                                fts,      # (N,D)
+                                radius=radius)
+            print("INTEGRATED")
+        else:
+            m = pts.shape[0]
+            for s in range(0, m, batch_chunk_points):
+                e = min(s + batch_chunk_points, m)
+                tvox.update_with_features(
+                            pts[s:e],  # (N,3)
+                            fts[s:e],      # (N,D)
+                            radius=radius)
+
+    
+    # Prepare BEV ranges for the to_bev() call
+    x0, y0 = float(bev_origin_xy[0]), float(bev_origin_xy[1])
+    W, H = float(bev_window_m[0]), float(bev_window_m[1])
+    x_range = (x0, x0 + W)
+    y_range = (y0, y0 + H)
+    res_xy = float(voxel_size)
+    z_min, z_max = float(z_band_bev[0]), float(z_band_bev[1])
+
+    bev, meta = tvox.to_bev(
+        x_range=x_range,
+        y_range=y_range,
+        res_xy=res_xy,
+        z_min=z_min,
+        z_max=z_max,
+        agg="max",
+        with_xyz_cond=False,
     )
-    bev, meta = bev_from_voxels(vox, bev_spec, include_free=True)
-    return vox, bev, meta
-
+    # bev, meta = bev_from_voxels(tvox, bev_spec, include_free=True)
+    return tvox, bev, meta
 
 def load_images(target_dir, device="cpu"): 
     image_names = glob.glob(os.path.join(target_dir, "*"))

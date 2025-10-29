@@ -20,18 +20,18 @@ from dust3r.model import AsymmetricCroCo3DStereo
 
 from dust3r.cloud_opt.commons import i_j_ij, compute_edge_scores, edge_str
 
+from inference.utils import *
 
 import numpy as np
 import time
 from voxel.utils import *
-from voxel.voxel import *
+from voxel.latent_voxel import *
 from voxel.align import *
 from voxel.covisibility import *
 from voxel.viz_utils import *
 from preprocess_images.filter_images import changed_images
 import os, shutil, json
 
-from inference.utils import *
 
 
 sys.path.append("vggt/")
@@ -67,12 +67,12 @@ model.eval()
 model = model.to(device)
 # model = model.to(dtype)
 
-
+feature_dim = 64
 voxel_size = 0.01
-vox = TorchSparseVoxelGrid(
+vox = LatentVoxelGrid(
     origin_xyz=np.zeros(3, dtype=np.float32),
     params=VoxelParams(voxel_size=voxel_size, promote_hits=2),
-    device=device, dtype=torch.float32
+    device=device, dtype=torch.float32, feature_dim=feature_dim
 )
 
 save_root = "kitchen_habitat_dust3r_fast_2/"
@@ -240,6 +240,7 @@ for i, images in enumerate(sub_dirs):
         predictions,
         POINTS=POINTS,
         CONF=CONF,
+        IMG="images",
         threshold=threshold,
         Rmw=camera_R, tmw=camera_t,
         z_clip_map=z_clip_map,   # or None
@@ -253,13 +254,23 @@ for i, images in enumerate(sub_dirs):
 
     align_to_voxel = False #(i > 0)
     
-    # if i == 0:
-    #     vox.begin_bootstrap()
+ 
+    vf = predictions.get("view_feats", None)
+    if vf is None:
+        vf_t = torch.zeros((len(images_map), feature_dim), device=device)
+    else:
+        vf_t = torch.as_tensor(vf, device=device, dtype=torch.float32)  # [N,D_dec]
 
+    features_map = [vf_t[i] for i in range(vf_t.size(0))]  # one vector per image
+
+    # features_map = [pointnext_inference(preprocess_points(f,i)) for f, i in zip(frames_map, images_map)]
+    
     vox, bev, meta = build_maps_from_latent_features(
+        i,
         frames_map,
         cam_centers_map,
         conf_map,
+        features_map,
         vox,
         align_to_voxel=align_to_voxel,
         voxel_size=voxel_size,           # 10 cm
@@ -267,16 +278,10 @@ for i, images in enumerate(sub_dirs):
         bev_origin_xy=(-2.0, -2.0),
         z_clip_vox=(-np.inf, np.inf),
         z_band_bev=(0.02, 0.5),
-        max_range_m=None,
-        carve_free=True,
         samples_per_voxel=0.7,#1,
-        ray_stride=6,#2,
-        max_free_rays=10000,
     )
 
-    # if i == 0:
-    #     vox.end_bootstrap()   # promotes current occupied to LT and clears ST
-    #     vox.lock_long_term()  # optional: forbids any future LT change
+  
         
     end = time.time()
     length = end - start
