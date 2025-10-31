@@ -60,6 +60,296 @@ def get_conf_frame(predictions, f, conf_key="confidence"):
         C = C.astype(np.float32) / 255.0
     return C[f].astype(np.float32)  # (H,W)
 
+import math
+import torch
+
+def align_pointcloud_torch_fast(
+    points_world_S_HW3,
+    *,
+    max_samples=500_000,
+    ransac_iters=1000,
+    inlier_dist=0.03,
+    min_up_dot=0.8,
+    floor_bottom_frac=0.30,
+    z_tiebreak_q=0.20,
+    seed=0,
+    shortlist_k=8,           # keep only top-K planes across all batches for tiebreak
+    point_chunk=400_000,     # process points in chunks to limit (N x V) memory
+    cand_chunk=4096,         # process candidates in chunks when counting inliers
+    use_amp=True,            # enable half/bfloat16 matmuls where safe
+    device="cuda" if torch.cuda.is_available() else "cpu",
+):
+    """
+    GPU-accelerated Z-up frame alignment with floor detection (optimized).
+
+    Returns:
+      R_w2m (3x3) torch.Tensor, t_w2m (3,) torch.Tensor, info dict
+    """
+    gen = torch.Generator(device=device)
+    gen.manual_seed(seed)
+
+    R_basic = torch.eye(3, dtype=torch.float32, device=device)
+
+    # ---- Load / flatten / filter ----
+    if not isinstance(points_world_S_HW3, torch.Tensor):
+        WPTS = torch.from_numpy(
+            torch.as_tensor(points_world_S_HW3).cpu().numpy()
+        )  # defensive; you can just do torch.from_numpy(np.asarray(...,np.float32)) if you prefer
+    else:
+        WPTS = points_world_S_HW3
+
+    WPTS = WPTS.to(device=device, dtype=torch.float32).view(-1, 3)
+    valid = torch.isfinite(WPTS).all(dim=1)
+    WPTS = WPTS[valid]
+    if WPTS.numel() == 0:
+        return R_basic, torch.zeros(3, dtype=torch.float32, device=device), {"reason": "no_points"}
+
+    # basic rotation (identity)
+    P0 = WPTS @ R_basic.T
+
+    # Downsample
+    if P0.shape[0] > max_samples:
+        idx = torch.randperm(P0.shape[0], device=device, generator=gen)[:max_samples]
+        P0 = P0[idx]
+
+    N = P0.shape[0]
+    if N < 3:
+        return R_basic, torch.zeros(3, dtype=torch.float32, device=device), {"reason": "too_few_points"}
+
+    # ---- Floor bias pool ----
+    z = P0[:, 2]
+    finite_z = torch.isfinite(z)
+    if finite_z.any():
+        z_thresh = torch.quantile(z[finite_z], floor_bottom_frac)
+        low_mask = z <= z_thresh
+        P_low = P0[low_mask]
+        if P_low.shape[0] < 200:
+            P_low = P0
+    else:
+        P_low = P0
+
+    N_low = P_low.shape[0]
+    if N_low < 3:
+        return R_basic, torch.zeros(3, dtype=torch.float32, device=device), {"reason": "too_few_points_after_filter"}
+
+    up = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32, device=device)
+
+    # ---- Vectorized RANSAC with shortlisting ----
+    batch_size = min(ransac_iters, 10000)
+    num_batches = (ransac_iters + batch_size - 1) // batch_size
+
+    # Keep global shortlist of best planes by count (and later z-quantile)
+    shortlist_counts = torch.empty(0, device=device, dtype=torch.int32)
+    shortlist_normals = torch.empty(0, 3, device=device, dtype=torch.float32)
+    shortlist_d = torch.empty(0, device=device, dtype=torch.float32)
+
+    # AMP context for fast matmul
+    autocast_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+    amp_ctx = torch.cuda.amp.autocast if (use_amp and device.startswith("cuda")) else torch.cpu.amp.autocast
+    amp_kwargs = dict(dtype=autocast_dtype) if (use_amp and device.startswith("cuda")) else {}
+
+    for b in range(num_batches):
+        cur = min(batch_size, ransac_iters - b * batch_size)
+
+        # Sample triplets (with replacement). For fewer degenerate triplets,
+        # you can sample without replacement per-candidate if N_low is large.
+        idxs = torch.randint(0, N_low, (cur, 3), device=device, generator=gen)
+        tri = P_low[idxs]                  # (cur, 3, 3)
+        p0, p1, p2 = tri[:, 0], tri[:, 1], tri[:, 2]
+
+        # Normals from cross product
+        v1 = p1 - p0
+        v2 = p2 - p0
+        normals = torch.cross(v1, v2, dim=1)            # (cur, 3)
+        lengths = torch.linalg.vector_norm(normals, dim=1)  # (cur,)
+        valid_normals = lengths > 1e-9
+        if not valid_normals.any():
+            continue
+
+        normals = normals[valid_normals]
+        p0_v = p0[valid_normals]
+        lengths = lengths[valid_normals]
+
+        normals = normals / lengths.unsqueeze(1)
+        # Flip downward normals
+        flip = normals[:, 2] < 0
+        normals[flip] = -normals[flip]
+
+        # Upward alignment filter
+        up_dots = (normals @ up)                        # (V,)
+        keep = up_dots >= min_up_dot
+        if not keep.any():
+            continue
+
+        normals = normals[keep]                         # (V,3)
+        p0_v = p0_v[keep]                               # (V,3)
+        d_vals = -(normals * p0_v).sum(dim=1)           # (V,)
+
+        V = normals.shape[0]
+        if V == 0:
+            continue
+
+        # Count inliers for all candidates but do it in chunks to save memory
+        counts = torch.zeros(V, device=device, dtype=torch.int32)
+
+        # to avoid big (N x V) allocations, tile either points or candidates
+        if N <= point_chunk:
+            # Chunk over candidates
+            with amp_ctx(**amp_kwargs):
+                P0_cast = P0
+                for start in range(0, V, cand_chunk):
+                    end = min(start + cand_chunk, V)
+                    n_blk = normals[start:end]              # (v,3)
+                    d_blk = d_vals[start:end]               # (v,)
+                    # (N,v) = (N,3) @ (3,v)
+                    dist_blk = torch.abs(P0_cast @ n_blk.T + d_blk)
+                    counts[start:end] = (dist_blk < inlier_dist).sum(dim=0).to(torch.int32)
+                    # free intermediate
+                    del dist_blk
+        else:
+            # Chunk over points
+            with amp_ctx(**amp_kwargs):
+                for pstart in range(0, N, point_chunk):
+                    pend = min(pstart + point_chunk, N)
+                    P_blk = P0[pstart:pend]                 # (n,3)
+                    # Do all candidates at once for this point block, but possibly in candidate chunks
+                    for cstart in range(0, V, cand_chunk):
+                        cend = min(cstart + cand_chunk, V)
+                        n_blk = normals[cstart:cend]        # (v,3)
+                        d_blk = d_vals[cstart:cend]         # (v,)
+                        dist_blk = torch.abs(P_blk @ n_blk.T + d_blk)   # (n,v)
+                        counts[cstart:cend] += (dist_blk < inlier_dist).sum(dim=0).to(torch.int32)
+                        del dist_blk
+
+        # Merge into global shortlist (by count)
+        if counts.numel() > 0:
+            if counts.numel() <= shortlist_k:
+                # just append
+                shortlist_counts = torch.cat([shortlist_counts, counts])
+                shortlist_normals = torch.cat([shortlist_normals, normals])
+                shortlist_d = torch.cat([shortlist_d, d_vals])
+            else:
+                # local top-k
+                c_vals, c_idx = torch.topk(counts, k=min(shortlist_k, counts.numel()), largest=True, sorted=False)
+                shortlist_counts = torch.cat([shortlist_counts, c_vals])
+                shortlist_normals = torch.cat([shortlist_normals, normals[c_idx]])
+                shortlist_d = torch.cat([shortlist_d, d_vals[c_idx]])
+
+            # keep only global top-k
+            if shortlist_counts.numel() > shortlist_k:
+                g_vals, g_idx = torch.topk(shortlist_counts, k=shortlist_k, largest=True, sorted=False)
+                shortlist_counts = g_vals
+                shortlist_normals = shortlist_normals[g_idx]
+                shortlist_d = shortlist_d[g_idx]
+
+    if shortlist_counts.numel() == 0:
+        return R_basic, torch.zeros(3, dtype=torch.float32, device=device), {"reason": "ransac_failed"}
+
+    # ---- Final tiebreak on small shortlist: recompute precise z-quantile ----
+    # For each shortlisted plane, compute inlier mask once and measure z-quantile.
+    best_counts = -1
+    best_zq = float("inf")
+    best_n = None
+    best_d = None
+    best_mask = None
+
+    # Recompute distances plane-by-plane (shortlist size is tiny, so this is cheap)
+    for n_vec, d_val, cnt in zip(shortlist_normals, shortlist_d, shortlist_counts):
+        # distances for all points (chunked if needed)
+        inliers_total = 0
+        z_vals = []
+
+        if N <= point_chunk:
+            dist = torch.abs(P0 @ n_vec.unsqueeze(1) + d_val)[:, 0]
+            mask = dist < inlier_dist
+            inliers_total = int(mask.sum().item())
+            if inliers_total > 0:
+                z_vals = P0[mask, 2]
+        else:
+            vals = []
+            mcount = 0
+            # chunk over points
+            for pstart in range(0, N, point_chunk):
+                pend = min(pstart + point_chunk, N)
+                dist_blk = torch.abs(P0[pstart:pend] @ n_vec + d_val)
+                mask_blk = dist_blk < inlier_dist
+                mcount += int(mask_blk.sum().item())
+                if mask_blk.any():
+                    vals.append(P0[pstart:pend, 2][mask_blk])
+            inliers_total = mcount
+            if vals:
+                z_vals = torch.cat(vals, dim=0)
+
+        # Compute z-quantile (only if we have inliers)
+        if inliers_total > 0:
+            z_q = torch.quantile(z_vals, z_tiebreak_q).item()
+        else:
+            z_q = float("inf")
+
+        better = (inliers_total > best_counts) or (
+            best_counts > 0 and inliers_total >= int(0.98 * best_counts) and z_q < best_zq
+        )
+        if better:
+            best_counts = inliers_total
+            best_zq = z_q
+            best_n = n_vec.clone()
+            best_d = float(d_val.item())
+            # Keep a mask for refinement
+            if N <= point_chunk:
+                best_mask = (torch.abs(P0 @ best_n.unsqueeze(1) + best_d)[:, 0] < inlier_dist)
+            else:
+                # recompute once fully if needed
+                dm = torch.abs(P0 @ best_n.unsqueeze(1) + best_d)[:, 0]
+                best_mask = (dm < inlier_dist)
+
+    if best_n is None:
+        return R_basic, torch.zeros(3, dtype=torch.float32, device=device), {"reason": "tiebreak_failed"}
+
+    # ---- Refine plane on inliers with PCA/SVD ----
+    if best_mask is not None and int(best_mask.sum().item()) >= 50:
+        Q = P0[best_mask]
+        Qc = Q - Q.mean(dim=0, keepdim=True)
+        # the normal is eigenvector of smallest eigenvalue
+        # low-rank pca is faster for large N:
+        U, S, Vh = torch.linalg.svd(Qc, full_matrices=False)  # (n,3) -> Vh is (3,3)
+        n_ref = Vh[-1, :]  # last row is normal (smallest singular value)
+        if n_ref[2] < 0:
+            n_ref = -n_ref
+        up_dot_ref = float(n_ref @ up)
+        if up_dot_ref >= min_up_dot:
+            d_ref = -float(n_ref @ Q.mean(dim=0))
+            best_n = n_ref
+            best_d = d_ref
+
+    n = best_n
+    d = best_d
+    up_dot = float(n @ up)
+
+    # Rodrigues (rotate n -> z)
+    v = torch.cross(n, up)
+    s = float(torch.linalg.vector_norm(v))
+    c = up_dot
+
+    if s < 1e-8:
+        R_corr = torch.eye(3, dtype=torch.float32, device=device)
+    else:
+        vx = torch.tensor([[ 0.0,   -v[2].item(),  v[1].item()],
+                           [ v[2].item(),  0.0,   -v[0].item()],
+                           [-v[1].item(),  v[0].item(),  0.0]], dtype=torch.float32, device=device)
+        R_corr = torch.eye(3, dtype=torch.float32, device=device) + vx + (vx @ vx) * ((1 - c) / (s ** 2))
+
+    R_w2m = R_corr @ R_basic
+    t_w2m = torch.tensor([0.0, 0.0, d], dtype=torch.float32, device=device)
+
+    info = {
+        "ransac_inliers": int(best_counts),
+        "inlier_dist": float(inlier_dist),
+        "floor_bottom_frac": float(floor_bottom_frac),
+        "z_tiebreak_q": float(best_zq),
+        "angle_to_up_deg": float(torch.rad2deg(torch.arccos(torch.clamp(torch.tensor(up_dot), -1.0, 1.0))).item()),
+        "shortlist_k": int(shortlist_k),
+    }
+    return R_w2m, t_w2m, info
 
 def align_pointcloud(points_world_S_HW3,
                      *,
