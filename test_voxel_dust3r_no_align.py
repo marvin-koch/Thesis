@@ -75,7 +75,7 @@ vox = TorchSparseVoxelGrid(
     device=device, dtype=torch.float32
 )
 
-save_root = "kitchen_habitat_dust3r_fast_2/"
+save_root = "kitchen_habitat_dust3r_fast_3/"
 os.makedirs(save_root, exist_ok=True)
 
 # target_dir = "/Users/marvin/Documents/Thesis/vggt/examples/fishbowl1/"
@@ -196,7 +196,7 @@ for i, images in enumerate(sub_dirs):
 
         # stacked_predictions = []
         # for input_frames in [imgs]:
-        predictions = get_reconstructed_scene(i, ".", imgs, model, device, False, 512, target_dir + images, "linear", 100, 1, True, False, True, False, 0.05, "oneref", 1, 0, changed_gids=changed_idx)
+        predictions = get_reconstructed_scene_unaligned_2(i, ".", imgs, model, device, False, 512, target_dir + images, "linear", 100, 1, True, False, True, False, 0.05, "oneref", 1, 0, changed_gids=changed_idx)
         
         # predictions = run_model(model, vggt_input, attn_mask=adj)s
             
@@ -204,8 +204,6 @@ for i, images in enumerate(sub_dirs):
         length = end - start
 
         print("Running inference took", length, "seconds!")
-
-
 
 
     # Keep tensors; only extract what we need later.
@@ -238,7 +236,7 @@ for i, images in enumerate(sub_dirs):
 
     camera_R = R_w2m @ Rmw
     camera_t = t_w2m + tmw
-    frames_map, cam_centers_map, conf_map, images_map, (S,H,W) = build_frames_and_centers_vectorized(
+    frames_map, cam_centers_map, conf_map, images_map, _, (S,H,W) = build_frames_and_centers_vectorized(
         predictions,
         POINTS=POINTS,
         CONF=CONF,

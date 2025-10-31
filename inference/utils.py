@@ -462,7 +462,7 @@ def _pick_from_list(lst, ptr, tau):
 def pick_for_image_mst(i, tau_mst, tau_extra):
     # 1) try MST
     lst = GA_CACHE["incident_mst"].get(i)
-    return lst
+    return lst[0]
     # if lst:
     #     ptr = 0
     #     e, ptr_new = _pick_from_list(lst, ptr, tau_mst)
@@ -499,7 +499,7 @@ def schedule_pairs(changed_gids, local2gid, pairs, budget,
         print(e)
         if e is None: 
             continue
-        run_set.update(e)
+        run_set.add(e)
         
     for i in changed_local:
         if len(run_set) > budget: break
@@ -508,24 +508,7 @@ def schedule_pairs(changed_gids, local2gid, pairs, budget,
             continue
         print(e)
         run_set.add(e)
-
-    print(run_set)
-
-        # # Optional: refresh the single stalest MST edge globally (drift control)
-        # if refresh_one_stale_mst and len(run_set) < budget:
-        #     mst_set = set(canonical(i,j) for i,j in GA_CACHE["mst_edges"])
-        #     # pick the MST edge with largest counter
-        #     def age_of(e_can):
-        #         k = i_j_ij(e_can)[1]
-        #         return GA_CACHE["edge_update_counter"][k]
-        #     stale = None
-        #     if mst_set:
-        #         stale = max(mst_set, key=age_of)
-        #     if stale is not None:
-        #         # choose a direction that matches `pairs` if possible; default to (i,j)
-        #         run_set.add(stale)
-
-        # reset counters for edges we run; increment otherwise
+        
     run_keys = set()
     for e in run_set:
         k = i_j_ij(e)[1]
@@ -539,6 +522,42 @@ def schedule_pairs(changed_gids, local2gid, pairs, budget,
         if k not in run_keys:
             GA_CACHE["edge_update_counter"][k] += 1
 
+    # Build outputs aligned with `pairs`
+    pairs_to_run = []
+    run_mask = []
+    for idx, (vi, vj) in enumerate(pairs):
+        i, j = vi["idx"], vj["idx"]
+        # if direction (i,j) not in run_set, accept (j,i) too
+        want = (i, j) in run_set #or (j, i) in run_set
+        run_mask.append(want)
+        if want:
+            pairs_to_run.append((vi, vj))
+            edge_lut.append(idx)
+
+    return pairs_to_run, run_mask, edge_lut
+
+
+def schedule_pairs_mst(changed_gids, local2gid, pairs, budget,
+                tau_mst=0.0, tau_extra=0.4, max_count=4, refresh_one_stale_mst=True):
+    """
+    returns: pairs_to_run, run_mask (aligned with `pairs`), edge_lut (indices into `pairs`)
+    """
+    # which local image indices changed?
+    changed_local = {i for i, gid in local2gid.items() if gid in changed_gids}
+
+    run_set = set()     # edges as (i,j) with this direction
+    edge_lut = []       # indices into `pairs` list for what we run
+
+    # ≤1 edge per changed image
+    for i in changed_local:
+        if len(run_set) > budget: break
+        
+        e = pick_for_image_mst(i, tau_mst, tau_extra)
+        print(e)
+        if e is None: 
+            continue
+        run_set.add(e)
+        
     # Build outputs aligned with `pairs`
     pairs_to_run = []
     run_mask = []
@@ -593,6 +612,1070 @@ def build_mst_from_edge_scores(edge_scores):
     mst_edges = sorted(set(mst_edges))
     return mst_edges
     
+# ------------------- main -------------------
+def get_reconstructed_scene_unaligned(
+    itr, outdir, imgs, model, device, silent, image_size, filelist, schedule, niter, min_conf_thr,
+    as_pointcloud, mask_sky, clean_depth, transparent_cams, cam_size,
+    scenegraph_type, winsize, refid, changed_gids=None, tau=0.45
+):
+    """
+    Iter 0: pass ALL images, each with d['gid'] = its global index (0..N-1).
+            We solve globally and cache Twc/K/pp and the anchor gid (+ per-image depths).
+    Iter >0: pass ONLY CHANGED images (subset), each with d['gid'] pointing to the original image.
+             Subset must include the anchor image (gid == GA_CACHE['anchor']).
+             We warm-start from cached Twc/K/pp/depth for these gids, seed per-edge vars, and refine.
+    """
+    # ---- helpers expected: _reindex_local, _require_gids, _sanitize_for_inference, _find_local_index_by_gid
+    imgs = _reindex_local(imgs)
+    _require_gids(imgs)
+    imgs_clean = _sanitize_for_inference(imgs)  # strip custom fields for inference()
+
+    # scene graph
+    if scenegraph_type == "swin":
+        scenegraph = f"swin-{winsize}"
+    elif scenegraph_type == "oneref":
+        scenegraph = "oneref"  # we’ll set the local anchor below
+    else:
+        scenegraph = scenegraph_type
+
+    # ---------- iter 0: full run ----------
+    if itr == 0:
+        GA_CACHE["anchor"] = int(refid)  # choose the anchor by gid
+
+        if scenegraph.startswith("oneref"):
+            anchor_local = _find_local_index_by_gid(imgs, GA_CACHE["anchor"])
+            if anchor_local is None:
+                raise ValueError(f"Anchor gid {GA_CACHE['anchor']} not present in imgs at iter 0.")
+            sg = f"oneref-{anchor_local}"
+        else:
+            sg = scenegraph
+
+        # Stronger constraints: symmetrize=True helps stability
+        pairs = make_pairs(imgs_clean, scene_graph='complete', prefilter=None, symmetrize=True)
+
+        # pairs = [(imgs_clean[0], imgs_clean[1]), (imgs_clean[0], imgs_clean[2])]
+
+        # output = inference(pairs, model, device, batch_size=4, verbose=not silent)
+        
+        output, view_feats = inference_with_features(
+            pairs, model, device, batch_size=4, verbose=not silent
+        )
+        
+        # print(view_feats)
+        
+        print(output.keys())
+        mode = GlobalAlignerMode.PointCloudOptimizer if len(imgs) > 2 else GlobalAlignerMode.PairViewer
+        scene = global_aligner(output, device=device, mode=mode, verbose=not silent)
+
+        if mode == GlobalAlignerMode.PointCloudOptimizer:
+            _ = scene.compute_global_alignment(init='mst', niter=niter, schedule=schedule, lr=1e-2)
+
+        # Cache cameras (full set)
+        Twc = scene.get_im_poses().detach().cpu().numpy()   # (N,4,4)
+        K   = scene.get_intrinsics().detach().cpu().numpy() # (N,3,3)
+        try:
+            pp = scene.get_principal_points().detach().cpu().numpy()
+        except Exception:
+            pp = None
+
+        # NEW: cache per-image depths (raw, NOT normalized)
+        depth_list = [d.detach().cpu().numpy() if torch.is_tensor(d) else d for d in scene.get_depthmaps()]
+
+        GA_CACHE["Twc"]  = Twc
+        GA_CACHE["K"]    = K
+        GA_CACHE["pp"]   = pp
+        GA_CACHE["depth"] = depth_list  # NEW
+        GA_CACHE["pw_poses"] = scene.pw_poses.detach().cpu().numpy()    
+        GA_CACHE["pw_adaptors"] = scene.pw_adaptors.detach().cpu().numpy() 
+        GA_CACHE["conf_i"] = scene.conf_i
+        GA_CACHE["conf_j"] = scene.conf_j
+
+        GA_CACHE["base_scale"] = scene.base_scale
+        GA_CACHE["pw_break"] = scene.pw_break
+        GA_CACHE["norm_pw"] = scene.norm_pw_scale
+
+        
+
+        edges = scene.edges
+        conf_i = scene.conf_i
+        conf_j = scene.conf_j
+
+        edge_scores = compute_edge_scores(map(i_j_ij, edges), conf_i, conf_j)
+        
+        GA_CACHE["edge_scores"] = robust_scores(edge_scores, squash=True)
+        GA_CACHE["edge_update_counter"] = {edge: 0 for edge in GA_CACHE["edge_scores"]}
+        
+        # Outputs (stack as float arrays if all same size)
+        pts       = [p.detach().cpu().numpy() if torch.is_tensor(p) else p for p in scene.get_pts3d()]
+        confs_raw = [c.detach().cpu().numpy() if torch.is_tensor(c) else c for c in scene.im_conf]
+        Tcw       = [np.linalg.inv(Twc[i]) for i in range(len(Twc))]
+
+        # Stack safely if same (H,W)
+        h0, w0 = pts[0].shape[:2]
+        if all(p.shape[:2] == (h0, w0) for p in pts):
+            P = np.stack(pts, axis=0).astype(np.float32)
+            C = np.stack(confs_raw, axis=0).astype(np.float32)
+        else:
+            P = np.array(pts, dtype=object)        # fallback
+            C = np.array(confs_raw, dtype=object)  # fallback
+
+
+        predictions = {
+            "world_points":       P,
+            "world_points_conf":  C,
+            "images":             np.array(scene.imgs, dtype=object),
+            "extrinsic":          np.stack(Tcw, axis=0),   # (N,4,4) world->camera
+            "intrinsic_K":        K,
+            "gids":               np.array([d["gid"] for d in imgs]),
+            "view_feats":           view_feats
+
+        }
+        return predictions
+
+    # ---------- iter > 0: subset run ----------
+    if GA_CACHE.get("Twc") is None or GA_CACHE.get("K") is None:
+        raise RuntimeError("GA_CACHE is empty—run itr=0 with the full set first.")
+
+    # Require anchor in subset
+    anchor_gid = GA_CACHE["anchor"]
+    anchor_local = _find_local_index_by_gid(imgs, anchor_gid)
+    if anchor_local is None:
+        raise ValueError(
+            f"Subset must include the anchor image (gid={anchor_gid}). "
+            "Add that image to imgs for iter > 0 so we can pin the world frame."
+        )
+
+    # Build star (consider union with logwin-3 if weak overlap)
+    sg = f"oneref-{anchor_local}" if scenegraph.startswith("oneref") else scenegraph
+    
+    pairs = make_pairs(imgs_clean, scene_graph='complete', prefilter=None, symmetrize=True)
+    
+    
+
+    # ---------- MIXED EDGE CONSTRUCTION ----------
+    depth_all = GA_CACHE["depth"]
+    K_all     = GA_CACHE["K"]
+    Twc_all   = GA_CACHE["Twc"]
+    conf_i = GA_CACHE["conf_i"]
+    conf_j = GA_CACHE["conf_j"]
+
+    # Map local idx -> global gid for this subset
+    local2gid = {d["idx"]: d["gid"] for d in imgs}
+
+    # Decide which edges need fresh DUSt3R vs can be synthesized
+    run_mask = []            # per edge in 'pairs'
+    pairs_to_run = []        # the subset we actually send to inference()
+    edge_lut = []            # back-map from compact run-list index -> edge index in 'pairs'
+
+
+
+    if itr == 1:
+        
+        mst_edges = build_mst_from_edge_scores(GA_CACHE["edge_scores"])
+        
+        GA_CACHE["mst_edges"] = mst_edges
+
+        from collections import defaultdict, deque
+
+        # Build per-image lists of incident edges, split into MST vs non-MST.
+        incident_mst   = defaultdict(list)   # i -> list of (i,j) in MST
+        incident_extra = defaultdict(list)   # i -> list of (i,j) not in MST
+        
+
+        for (vi, vj) in pairs:
+            i = vi["idx"]; j = vj["idx"]
+
+            if (i, j) in mst_edges:
+                incident_mst[i].append((i, j))
+                incident_mst[j].append((i, j))
+            else:
+                incident_extra[i].append((i, j))
+                incident_extra[j].append((i, j))
+
+        # Order each list by a stable priority (e.g., cached score descending)
+        def sort_by_score(lst):
+            return sorted(lst, key=lambda e: GA_CACHE["edge_scores"][i_j_ij(e)[1]], reverse=True)
+
+        GA_CACHE["incident_mst"]   = {i: deque(sort_by_score(v)) for i, v in incident_mst.items()}
+        GA_CACHE["incident_extra"] = {i: deque(sort_by_score(v)) for i, v in incident_extra.items()}
+        
+        
+    
+    B = max(1, len(imgs))  # hard cap
+    pairs_to_run, run_mask, edge_lut = schedule_pairs_mst(
+        changed_gids=changed_gids,
+        local2gid=local2gid,
+        pairs=pairs,          # full pair list (vi, vj)
+        budget=B,
+        tau_mst=0.0,          # be lenient on MST edges
+        tau_extra=0.5,        # stricter on non-MST
+        max_count=4,
+        refresh_one_stale_mst=True
+    )
+    
+    print("running pairs")
+    
+    pairs_to_run_tuples = [(vi["idx"], vj["idx"]) for (vi, vj) in pairs_to_run]
+    for (vi, vj) in pairs_to_run:
+        print(vi["idx"], vj["idx"])
+    # Run the network ONLY for needed edges
+    if len(pairs_to_run):
+        # out_delta = inference(pairs_to_run, model, device, batch_size=4, verbose=not silent)
+        out_delta, view_feats = inference_with_features(pairs_to_run, model, device, batch_size=4, verbose=not silent)
+    else:
+        # fabricate an empty structure with lists
+        out_delta = {"view1":{"idx":[],"true_shape":[]},
+                    "view2":{"idx":[],"true_shape":[]},
+                    "pred1":{"pts3d":[],"conf":[]},
+                    "pred2":{"pts3d_in_other_view":[],"conf":[]}}
+
+        view_feats = None
+
+    # Extract per-edge outputs in the SAME order as 'pairs'
+    mixed_edges = []
+    run_k = 0
+    for e, (vi, vj) in enumerate(pairs):
+        i = vi["idx"]; j = vj["idx"]
+        gi = local2gid[i]; gj = local2gid[j]
+        if run_mask[e]:
+            # take kth slice from out_delta
+            v1 = {"idx": i, "true_shape": out_delta["view1"]["true_shape"][run_k], "img": out_delta["view1"]["img"][run_k]}
+            v2 = {"idx": j, "true_shape": out_delta["view2"]["true_shape"][run_k], "img": out_delta["view2"]["img"][run_k]}
+            p1 = {"pts3d": out_delta["pred1"]["pts3d"][run_k],
+                "conf":  out_delta["pred1"]["conf"][run_k]}
+            p2 = {"pts3d_in_other_view": out_delta["pred2"]["pts3d_in_other_view"][run_k],
+                "conf":                out_delta["pred2"]["conf"][run_k]}
+            mixed_edges.append((v1,v2,p1,p2))
+            run_k += 1
+        else:
+            # synthesize from cache (use GLOBAL ids to fetch per-image data)
+            v1,v2,p1,p2 = make_edge_from_image_cache(
+                gi, gj, depth_all, K_all, Twc_all, conf_list=None
+            )
+            # fix view indices to LOCAL indices expected by the optimizer
+            v1["idx"] = i
+            v2["idx"] = j
+            mixed_edges.append((v1,v2,p1,p2))
+
+
+    output = pack_edges(mixed_edges, device)
+
+    
+        
+
+    mode = GlobalAlignerMode.PointCloudOptimizer if len(imgs) > 2 else GlobalAlignerMode.PairViewer
+    scene = global_aligner(output, device=device, mode=mode, verbose=not silent)
+
+    # Warm-start from cache for this subset
+    Twc0, K0, pp0 = GA_CACHE["Twc"], GA_CACHE["K"], GA_CACHE["pp"]
+    depth0_all = GA_CACHE.get("depth")  # NEW
+    M = len(imgs)
+
+    if mode == GlobalAlignerMode.PointCloudOptimizer:
+        # 1) poses
+        subset_Twc = [torch.tensor(Twc0[d['gid']], dtype=torch.float32) for d in imgs]
+        scene.preset_pose(subset_Twc, pose_msk=None)
+
+        # 2) intrinsics
+        subset_f = [float(K0[d['gid'], 0, 0]) for d in imgs]
+        scene.preset_focal(subset_f, msk=None)
+        if pp0 is not None:
+            was_pp = scene.im_pp.requires_grad
+            scene.im_pp.requires_grad_(True)
+            subset_pp = [pp0[d['gid']] for d in imgs]
+            scene.preset_principal_point(subset_pp, msk=None)
+            scene.im_pp.requires_grad_(was_pp)
+
+        # 3) NEW: warm-start depths (critical for small initial loss)
+        # if depth0_all is not None and len(depth0_all) > 0:
+        #     for i, dct in enumerate(imgs):
+        #         gi = dct['gid']
+        #         di_np = depth0_all[gi]
+        #         di_t  = torch.as_tensor(di_np)
+        #         scene._set_depthmap(i, di_t, force=True)
+        
+
+        
+        # 4) freeze intrinsics during subset refine to avoid scale/pp drift
+        scene.im_focals.requires_grad_(False)
+        scene.im_pp.requires_grad_(False)
+        scene.im_depthmaps.requires_grad_(True)
+
+        # 5) enable pose grads (preset_pose froze them)
+        scene.im_poses.requires_grad_(False)
+        scene.pw_poses.requires_grad_(True)
+        
+        # print("pw_poses", GA_CACHE["pw_poses"])
+        
+        scene.pw_adaptors.requires_grad_(True)
+
+        with torch.no_grad():
+            scene.pw_poses.copy_(torch.from_numpy(GA_CACHE["pw_poses"]).to(device))
+            scene.pw_adaptors.copy_(torch.from_numpy(GA_CACHE["pw_adaptors"]).to(device))
+     
+             
+        scene.base_scale = GA_CACHE["base_scale"]
+        scene.pw_break = GA_CACHE["pw_break"] 
+        scene.norm_pw_scale = GA_CACHE["norm_pw"]
+        scene.conf_i = conf_i
+        scene.conf_j = conf_j
+
+        # 6) NEW: seed per-edge latents using current poses (PnP-like), but no steps yet
+        # try:
+        #     _ = scene.compute_global_alignment(init='known', niter=0, schedule=schedule, lr=1e-2)
+        # except Exception:
+        #     print("Exception")
+        #     # Fallback: a 0-iter 'mst' or a tiny run to seed edge vars
+        #     _ = scene.compute_global_alignment(init='mst', niter=0)
+
+        # print("pw_poses", scene.get_pw_poses())
+
+        if depth0_all is not None and len(depth0_all) > 0:
+            for i, dct in enumerate(imgs):
+                gi = dct['gid']
+                di_np = depth0_all[gi]
+                di_t  = torch.as_tensor(di_np)
+                if i not in changed_gids:
+                    scene._set_depthmap(i, di_t, force=True)
+                    
+                    
+        best_depthmaps = {}
+        # init all pairwise poses
+        for e, (i, j) in enumerate(scene.edges):
+            i_j = edge_str(i, j)
+            # remember if this is a good depthmap
+            score = float(scene.conf_i[i_j].mean())
+            s = scene.get_pw_scale()[e]
+            if score > best_depthmaps.get(i, (0,))[0] and (i,j) in pairs_to_run_tuples:
+                best_depthmaps[i] = score, i_j, s
+                print(score)
+      
+
+        # init all image poses
+        for n in range(scene.n_imgs):
+            #assert known_poses_msk[n]
+            # score, i_j, scale = best_depthmaps[n]
+
+            item = best_depthmaps.get(n)
+            if item is None:
+                continue  # skip if not found
+            score, i_j, scale = item
+
+            print(score, i_j)
+            depth = scene.pred_i[i_j][:, :, 2]
+            scene._set_depthmap(n, depth * scale)
+
+        # 7) short refine without re-init
+        # _ = scene.compute_global_alignment(init=None, niter=0, schedule=schedule, lr=1e-2) #5e-2
+
+    # Read subset outputs
+    Twc_sub = scene.get_im_poses().detach().cpu().numpy()    # (M,4,4)
+    K_sub   = scene.get_intrinsics().detach().cpu().numpy()
+
+    # # --- Align to original world via anchor (exact gauge match) ---
+    # anchor_local = next(d['idx'] for d in imgs if d['gid'] == anchor_gid)
+    # T_align = Twc0[anchor_gid] @ np.linalg.inv(Twc_sub[anchor_local])
+    # Twc_sub = np.einsum('ab,sbc->sac', T_align, Twc_sub)
+
+    # Points / conf (raw)
+    pts  = [p.detach().cpu().numpy() if torch.is_tensor(p) else p for p in scene.get_pts3d()]
+    conf = [c.detach().cpu().numpy() if torch.is_tensor(c) else c for c in scene.im_conf]
+    scene_imgs = [img.detach().cpu().numpy() if torch.is_tensor(img) else img for img in scene.imgs]
+
+    # 3) slice cameras/intrinsics to changed frames only
+    Twc_sub = Twc_sub[changed_gids]                 # (Mchg,4,4) cam->world
+    K_sub   = K_sub[changed_gids]                   # (Mchg,3,3)
+
+    pts  = [pts[i]  for i in changed_gids]
+    conf = [conf[i] for i in changed_gids]
+    scene_imgs = [scene_imgs[i] for i in changed_gids]
+
+    # --- SIM(3) scale snap (about anchor camera center) ---
+    # get depths
+    depth_ref = GA_CACHE["depth"][anchor_gid]                              # from iter-0 (cached)
+    depth_cur = scene.get_depthmaps()[anchor_local].detach().cpu().numpy() # current subset
+
+    # median depth ratio → global scale
+    s = _median_scale_from_depths(depth_ref, depth_cur)
+
+    # if s is NaN/inf or extreme, clamp/fallback
+    if not np.isfinite(s) or s < 0.25 or s > 4.0:
+        s = 1.0  # safe fallback; tune bounds as you prefer
+
+    # similarity matrix about the (already aligned) anchor camera center
+    C_anchor = Twc_sub[anchor_local][:3, 3].copy()       # after SE(3) snap, equals Twc0[anchor_gid][:3,3]
+    S_C = _sim3_about_center_matrix(C_anchor, s)
+
+    # apply to all subset cameras
+    Twc_sub = np.einsum('ab,sbc->sac', S_C, Twc_sub)
+
+    # ... after you computed Twc_sub (aligned cameras) and have T_align:
+    # transform the *subset* 3D pointmaps into the original world frame
+    
+    
+    pts = [_apply_se3_to_pointmap(p, S_C) for p in pts]
+
+
+    err = np.linalg.norm(Twc0[anchor_gid][:3,3] - Twc_sub[anchor_local][:3,3])
+    print(f"[snap] anchor translation error after align: {err:.6f}")  # should be ~0
+
+   
+    
+    # If all same size, stack (nice for downstream)
+    h0, w0 = pts[0].shape[:2]
+    if all(p.shape[:2] == (h0, w0) for p in pts):
+        P = np.stack(pts, axis=0).astype(np.float32)
+        C = np.stack(conf, axis=0).astype(np.float32)
+    else:
+        P = np.array(pts, dtype=object)
+        C = np.array(conf, dtype=object)
+
+    Tcw_sub = [np.linalg.inv(k) for k in Twc_sub]
+
+    # Write back ALIGNED cameras (+ keep cached depths as-is, or replace if you wish)
+    
+    for i, dct in enumerate(imgs):
+        # GA_CACHE["Twc"][dct["gid"]] = Twc_sub[i]
+        # GA_CACHE["K"][dct["gid"]]   = K_sub[i]
+    
+    
+        # Optional: refresh cached depth with the refined one
+        refined_depth_i = scene.get_depthmaps()[i].detach().cpu().numpy()
+        GA_CACHE["depth"][dct["gid"]] = refined_depth_i
+
+    scene_imgs = [im["img"].detach().cpu().numpy() for im in imgs_clean if im["idx"] in changed_gids]
+        
+    predictions = {
+        "world_points":       P,
+        "world_points_conf":  C,
+        "images":             np.array(scene_imgs, dtype=object).squeeze(1),
+        "extrinsic":          np.stack(Tcw_sub, axis=0),   # (M,4,4)
+        "intrinsic_K":        K_sub,
+        "gids":               np.array([d["gid"] for d in imgs]),
+        "view_feats":         view_feats
+
+    }
+    return predictions
+
+
+
+
+
+# ------------------- main -------------------
+def get_reconstructed_scene_unaligned_2(
+    itr, outdir, imgs, model, device, silent, image_size, filelist, schedule, niter, min_conf_thr,
+    as_pointcloud, mask_sky, clean_depth, transparent_cams, cam_size,
+    scenegraph_type, winsize, refid, changed_gids=None, tau=0.45
+):
+    """
+    Iter 0: pass ALL images, each with d['gid'] = its global index (0..N-1).
+            We solve globally and cache Twc/K/pp and the anchor gid (+ per-image depths).
+    Iter >0: pass ONLY CHANGED images (subset), each with d['gid'] pointing to the original image.
+             Subset must include the anchor image (gid == GA_CACHE['anchor']).
+             We warm-start from cached Twc/K/pp/depth for these gids, seed per-edge vars, and refine.
+    """
+    # ---- helpers expected: _reindex_local, _require_gids, _sanitize_for_inference, _find_local_index_by_gid
+    imgs = _reindex_local(imgs)
+    _require_gids(imgs)
+    imgs_clean = _sanitize_for_inference(imgs)  # strip custom fields for inference()
+
+    # scene graph
+    if scenegraph_type == "swin":
+        scenegraph = f"swin-{winsize}"
+    elif scenegraph_type == "oneref":
+        scenegraph = "oneref"  # we’ll set the local anchor below
+    else:
+        scenegraph = scenegraph_type
+
+    # ---------- iter 0: full run ----------
+    if itr == 0:
+        GA_CACHE["anchor"] = int(refid)  # choose the anchor by gid
+
+        if scenegraph.startswith("oneref"):
+            anchor_local = _find_local_index_by_gid(imgs, GA_CACHE["anchor"])
+            if anchor_local is None:
+                raise ValueError(f"Anchor gid {GA_CACHE['anchor']} not present in imgs at iter 0.")
+            sg = f"oneref-{anchor_local}"
+        else:
+            sg = scenegraph
+
+        # Stronger constraints: symmetrize=True helps stability
+        pairs = make_pairs(imgs_clean, scene_graph='complete', prefilter=None, symmetrize=True)
+
+        # pairs = [(imgs_clean[0], imgs_clean[1]), (imgs_clean[0], imgs_clean[2])]
+
+        output = inference(pairs, model, device, batch_size=16, verbose=not silent)
+
+        mode = GlobalAlignerMode.PointCloudOptimizer if len(imgs) > 2 else GlobalAlignerMode.PairViewer
+        scene = global_aligner(output, device=device, mode=mode, verbose=not silent)
+
+        if mode == GlobalAlignerMode.PointCloudOptimizer:
+            _ = scene.compute_global_alignment(init='mst', niter=niter, schedule=schedule, lr=1e-2)
+
+        # Cache cameras (full set)
+        Twc = scene.get_im_poses().detach().cpu().numpy()   # (N,4,4)
+        K   = scene.get_intrinsics().detach().cpu().numpy() # (N,3,3)
+        try:
+            pp = scene.get_principal_points().detach().cpu().numpy()
+        except Exception:
+            pp = None
+
+        # NEW: cache per-image depths (raw, NOT normalized)
+        depth_list = [d.detach().cpu().numpy() if torch.is_tensor(d) else d for d in scene.get_depthmaps()]
+
+        GA_CACHE["Twc"]  = Twc
+        GA_CACHE["K"]    = K
+        GA_CACHE["pp"]   = pp
+        GA_CACHE["depth"] = depth_list  # NEW
+        GA_CACHE["pw_poses"] = scene.pw_poses.detach().cpu().numpy()    
+        GA_CACHE["pw_adaptors"] = scene.pw_adaptors.detach().cpu().numpy() 
+        GA_CACHE["conf_i"] = scene.conf_i
+        GA_CACHE["conf_j"] = scene.conf_j
+
+        GA_CACHE["base_scale"] = scene.base_scale
+        GA_CACHE["pw_break"] = scene.pw_break
+        GA_CACHE["norm_pw"] = scene.norm_pw_scale
+
+        
+
+        edges = scene.edges
+        conf_i = scene.conf_i
+        conf_j = scene.conf_j
+
+        edge_scores = compute_edge_scores(map(i_j_ij, edges), conf_i, conf_j)
+        
+        GA_CACHE["edge_scores"] = robust_scores(edge_scores, squash=True)
+        GA_CACHE["edge_update_counter"] = {edge: 0 for edge in GA_CACHE["edge_scores"]}
+        
+        # Outputs (stack as float arrays if all same size)
+        pts       = [p.detach().cpu().numpy() if torch.is_tensor(p) else p for p in scene.get_pts3d()]
+        confs_raw = [c.detach().cpu().numpy() if torch.is_tensor(c) else c for c in scene.im_conf]
+        Tcw       = [np.linalg.inv(Twc[i]) for i in range(len(Twc))]
+
+        # Stack safely if same (H,W)
+        h0, w0 = pts[0].shape[:2]
+        if all(p.shape[:2] == (h0, w0) for p in pts):
+            P = np.stack(pts, axis=0).astype(np.float32)
+            C = np.stack(confs_raw, axis=0).astype(np.float32)
+        else:
+            P = np.array(pts, dtype=object)        # fallback
+            C = np.array(confs_raw, dtype=object)  # fallback
+
+
+        predictions = {
+            "world_points":       P,
+            "world_points_conf":  C,
+            "images":             np.array(scene.imgs, dtype=object),
+            "extrinsic":          np.stack(Tcw, axis=0),   # (N,4,4) world->camera
+            "intrinsic_K":        K,
+            "gids":               np.array([d["gid"] for d in imgs]),
+        }
+        return predictions
+
+    # ---------- iter > 0: subset run ----------
+    if GA_CACHE.get("Twc") is None or GA_CACHE.get("K") is None:
+        raise RuntimeError("GA_CACHE is empty—run itr=0 with the full set first.")
+
+    # Require anchor in subset
+    anchor_gid = GA_CACHE["anchor"]
+    anchor_local = _find_local_index_by_gid(imgs, anchor_gid)
+    if anchor_local is None:
+        raise ValueError(
+            f"Subset must include the anchor image (gid={anchor_gid}). "
+            "Add that image to imgs for iter > 0 so we can pin the world frame."
+        )
+
+    # Build star (consider union with logwin-3 if weak overlap)
+    sg = f"oneref-{anchor_local}" if scenegraph.startswith("oneref") else scenegraph
+    
+    pairs = make_pairs(imgs_clean, scene_graph='complete', prefilter=None, symmetrize=True)
+    
+    
+
+    # ---------- MIXED EDGE CONSTRUCTION ----------
+    depth_all = GA_CACHE["depth"]
+    K_all     = GA_CACHE["K"]
+    Twc_all   = GA_CACHE["Twc"]
+    conf_i = GA_CACHE["conf_i"]
+    conf_j = GA_CACHE["conf_j"]
+
+    # Map local idx -> global gid for this subset
+    local2gid = {d["idx"]: d["gid"] for d in imgs}
+
+    # Decide which edges need fresh DUSt3R vs can be synthesized
+    run_mask = []            # per edge in 'pairs'
+    pairs_to_run = []        # the subset we actually send to inference()
+    edge_lut = []            # back-map from compact run-list index -> edge index in 'pairs'
+
+
+
+    if itr == 1:
+        
+        mst_edges = build_mst_from_edge_scores(GA_CACHE["edge_scores"])
+        
+        GA_CACHE["mst_edges"] = mst_edges
+
+        from collections import defaultdict, deque
+
+        # Build per-image lists of incident edges, split into MST vs non-MST.
+        incident_mst   = defaultdict(list)   # i -> list of (i,j) in MST
+        incident_extra = defaultdict(list)   # i -> list of (i,j) not in MST
+
+        for (vi, vj) in pairs:
+            i = vi["idx"]; j = vj["idx"]
+
+            if (i, j) in mst_edges:
+                incident_mst[i].append((i, j))
+                incident_mst[j].append((i, j))
+            else:
+                incident_extra[i].append((i, j))
+                incident_extra[j].append((i, j))
+
+        # Order each list by a stable priority (e.g., cached score descending)
+        def sort_by_score(lst):
+            return sorted(lst, key=lambda e: GA_CACHE["edge_scores"][i_j_ij(e)[1]], reverse=True)
+
+        GA_CACHE["incident_mst"]   = {i: deque(sort_by_score(v)) for i, v in incident_mst.items()}
+        GA_CACHE["incident_extra"] = {i: deque(sort_by_score(v)) for i, v in incident_extra.items()}
+        
+        
+    
+    B = max(1, len(imgs))  # hard cap
+    pairs_to_run, run_mask, edge_lut = schedule_pairs(
+        changed_gids=changed_gids,
+        local2gid=local2gid,
+        pairs=pairs,          # full pair list (vi, vj)
+        budget=B,
+        tau_mst=0.0,          # be lenient on MST edges
+        tau_extra=0.5,        # stricter on non-MST
+        max_count=4,
+        refresh_one_stale_mst=True
+    )
+    
+    print("running pairs")
+    
+    pairs_to_run_tuples = [(vi["idx"], vj["idx"]) for (vi, vj) in pairs_to_run]
+    for (vi, vj) in pairs_to_run:
+        print(vi["idx"], vj["idx"])
+
+
+    # Run the network ONLY for needed edges
+    
+    start = time.time()
+
+    if len(pairs_to_run):
+        out_delta = inference(pairs_to_run, model, device, batch_size=16, verbose=not silent)
+        
+    else:
+        # fabricate an empty structure with lists
+        out_delta = {"view1":{"idx":[],"true_shape":[]},
+                    "view2":{"idx":[],"true_shape":[]},
+                    "pred1":{"pts3d":[],"conf":[]},
+                    "pred2":{"pts3d_in_other_view":[],"conf":[]}}
+
+    end = time.time()
+    
+    print("ONLY INFERENCE", end - start)
+
+
+
+    start = time.time()
+
+    # # Extract per-edge outputs in the SAME order as 'pairs'
+    # mixed_edges = []
+    # run_k = 0
+    # for e, (vi, vj) in enumerate(pairs):
+    #     i = vi["idx"]; j = vj["idx"]
+    #     gi = local2gid[i]; gj = local2gid[j]
+    #     if run_mask[e]:
+    #         # take kth slice from out_delta
+    #         v1 = {"idx": i, "true_shape": out_delta["view1"]["true_shape"][run_k], "img": out_delta["view1"]["img"][run_k]}
+    #         v2 = {"idx": j, "true_shape": out_delta["view2"]["true_shape"][run_k], "img": out_delta["view2"]["img"][run_k]}
+    #         p1 = {"pts3d": out_delta["pred1"]["pts3d"][run_k],
+    #             "conf":  out_delta["pred1"]["conf"][run_k]}
+    #         p2 = {"pts3d_in_other_view": out_delta["pred2"]["pts3d_in_other_view"][run_k],
+    #             "conf":                out_delta["pred2"]["conf"][run_k]}
+    #         mixed_edges.append((v1,v2,p1,p2))
+    #         run_k += 1
+    #     else:
+    #         # synthesize from cache (use GLOBAL ids to fetch per-image data)
+    #         v1,v2,p1,p2 = make_edge_from_image_cache(
+    #             gi, gj, depth_all, K_all, Twc_all, conf_list=None
+    #         )
+    #         # fix view indices to LOCAL indices expected by the optimizer
+    #         v1["idx"] = i
+    #         v2["idx"] = j
+    #         mixed_edges.append((v1,v2,p1,p2))
+    
+  
+    # E = len(pairs)
+    # ones_dtype = out_delta["pred1"]["pts3d"].dtype if torch.is_tensor(out_delta["pred1"]["pts3d"]) else torch.float32
+
+    # # Preallocate lists at the correct length (keeps indexing stable)
+    # view1 = {"idx": [None]*E, "true_shape": [None]*E, "img": [None]*E}
+    # view2 = {"idx": [None]*E, "true_shape": [None]*E, "img": [None]*E}
+    # pred1 = {"pts3d": [None]*E, "conf": [None]*E}
+    # pred2 = {"pts3d_in_other_view": [None]*E, "conf": [None]*E}
+
+    # # Normalize mask and compute k for each TRUE edge via cumsum
+    # run_mask_t = torch.as_tensor(run_mask, dtype=torch.bool)
+    # run_idx = (run_mask_t.cumsum(0) - 1)  # tensor of same length; valid only where mask True
+
+    # # Hoist out_delta references
+    # od_v1_ts = out_delta["view1"]["true_shape"]
+    # od_v1_im = out_delta["view1"]["img"]
+    # od_v2_ts = out_delta["view2"]["true_shape"]
+    # od_v2_im = out_delta["view2"]["img"]
+    # od_p1_p  = out_delta["pred1"]["pts3d"]
+    # od_p1_c  = out_delta["pred1"]["conf"]
+    # od_p2_p  = out_delta["pred2"]["pts3d_in_other_view"]
+    # od_p2_c  = out_delta["pred2"]["conf"]
+
+    # # Single pass
+    # for e, (vi, vj) in enumerate(pairs):
+    #     i = vi["idx"]; j = vj["idx"]
+    #     view1["idx"][e] = i
+    #     view2["idx"][e] = j
+
+    #     if run_mask_t[e]:
+    #         k = int(run_idx[e].item())
+    #         # Copy metadata straight from out_delta
+    #         view1["true_shape"][e] = od_v1_ts[k]
+    #         view1["img"][e]        = od_v1_im[k]
+    #         view2["true_shape"][e] = od_v2_ts[k]
+    #         view2["img"][e]        = od_v2_im[k]
+
+    #         # Ensure tensors are on the requested device
+    #         pred1["pts3d"][e] = torch.as_tensor(od_p1_p[k], device=device)
+    #         pred1["conf"][e]  = torch.as_tensor(od_p1_c[k], device=device)
+    #         pred2["pts3d_in_other_view"][e] = torch.as_tensor(od_p2_p[k], device=device)
+    #         pred2["conf"][e]                = torch.as_tensor(od_p2_c[k], device=device)
+
+    #     else:
+    #         # Make "ones" placeholders for non-run edges, sized from the global images
+    #         gi = local2gid[i]; gj = local2gid[j]
+    #         Di = depth_all[gi]; Dj = depth_all[gj]
+    #         Hi, Wi = int(Di.shape[0]), int(Di.shape[1])
+    #         Hj, Wj = int(Dj.shape[0]), int(Dj.shape[1])
+
+    #         # Match your earlier dict shape convention (1x2 int32 arrays)
+    #         ts_i = np.int32([[Hi, Wi]])
+    #         ts_j = np.int32([[Hj, Wj]])
+    #         view1["true_shape"][e] = ts_i
+    #         view1["img"][e]        = ts_i
+    #         view2["true_shape"][e] = ts_j
+    #         view2["img"][e]        = ts_j
+
+    #         # Ones tensors with correct shapes
+    #         pred1["pts3d"][e] = torch.ones((Hi, Wi, 3), dtype=ones_dtype, device=device)
+    #         pred1["conf"][e]  = torch.ones((Hi, Wi),     dtype=ones_dtype, device=device)
+    #         pred2["pts3d_in_other_view"][e] = torch.ones((Hj, Wj, 3), dtype=ones_dtype, device=device)
+    #         pred2["conf"][e]                = torch.ones((Hj, Wj),     dtype=ones_dtype, device=device)
+
+    # output = {"view1": view1, "view2": view2, "pred1": pred1, "pred2": pred2}
+
+
+
+
+
+
+    E = len(pairs)
+    use_cache_for_nonrun = False
+    ones_dtype = out_delta["pred1"]["pts3d"].dtype if torch.is_tensor(out_delta["pred1"]["pts3d"]) else torch.float32
+
+    # Preallocate lists for stable ordering
+    view1 = {"idx": [None]*E, "true_shape": [None]*E, "img": [None]*E}
+    view2 = {"idx": [None]*E, "true_shape": [None]*E, "img": [None]*E}
+    pred1 = {"pts3d": [None]*E, "conf": [None]*E}
+    pred2 = {"pts3d_in_other_view": [None]*E, "conf": [None]*E}
+
+    # Build per-edge k index for run edges
+    run_mask_t = torch.as_tensor(run_mask, dtype=torch.bool)
+    run_idx = (run_mask_t.cumsum(0) - 1)
+
+    # Hoist out_delta refs
+    od_v1_ts = out_delta["view1"]["true_shape"]
+    od_v1_im = out_delta["view1"]["img"]
+    od_v2_ts = out_delta["view2"]["true_shape"]
+    od_v2_im = out_delta["view2"]["img"]
+    od_p1_p  = out_delta["pred1"]["pts3d"]
+    od_p1_c  = out_delta["pred1"]["conf"]
+    od_p2_p  = out_delta["pred2"]["pts3d_in_other_view"]
+    od_p2_c  = out_delta["pred2"]["conf"]
+
+    # Optional memo for cache path to avoid recomputing repeated (gi, gj)
+    cache_memo = {}
+
+    for e, (vi, vj) in enumerate(pairs):
+        i = vi["idx"]; j = vj["idx"]
+        view1["idx"][e] = i
+        view2["idx"][e] = j
+
+        if run_mask_t[e]:
+            k = int(run_idx[e].item())
+
+            view1["true_shape"][e] = od_v1_ts[k]
+            view1["img"][e]        = od_v1_im[k]
+            view2["true_shape"][e] = od_v2_ts[k]
+            view2["img"][e]        = od_v2_im[k]
+
+            pred1["pts3d"][e] = torch.as_tensor(od_p1_p[k], device=device)
+            pred1["conf"][e]  = torch.as_tensor(od_p1_c[k], device=device)
+            pred2["pts3d_in_other_view"][e] = torch.as_tensor(od_p2_p[k], device=device)
+            pred2["conf"][e]                = torch.as_tensor(od_p2_c[k], device=device)
+
+        else:
+            gi = local2gid[i]; gj = local2gid[j]
+
+            if use_cache_for_nonrun and make_edge_from_image_cache is not None:
+                key = (gi, gj)
+                if key in cache_memo:
+                    v1c, v2c, p1c, p2c = cache_memo[key]
+                else:
+                    v1c, v2c, p1c, p2c = make_edge_from_image_cache(
+                        gi, gj, depth_all, K_all, Twc_all, conf_list=None
+                    )
+                    cache_memo[key] = (v1c, v2c, p1c, p2c)
+
+                # Keep LOCAL indices in packed output, but use cached tensors
+                Hi, Wi = int(v1c["true_shape"][0,0]), int(v1c["true_shape"][0,1])
+                Hj, Wj = int(v2c["true_shape"][0,0]), int(v2c["true_shape"][0,1])
+
+                # metadata (use the same 1x2 int32 arrays convention)
+                view1["true_shape"][e] = np.int32([[Hi, Wi]])
+                view1["img"][e]        = np.int32([[Hi, Wi]])
+                view2["true_shape"][e] = np.int32([[Hj, Wj]])
+                view2["img"][e]        = np.int32([[Hj, Wj]])
+
+                # tensors
+                pred1["pts3d"][e] = torch.as_tensor(p1c["pts3d"], device=device)
+                pred1["conf"][e]  = torch.as_tensor(p1c["conf"],  device=device)
+                pred2["pts3d_in_other_view"][e] = torch.as_tensor(p2c["pts3d_in_other_view"], device=device)
+                pred2["conf"][e]                = torch.as_tensor(p2c["conf"], device=device)
+
+            else:
+                # Fast placeholder path: ones with correct shapes from depth_all
+                Di = depth_all[gi]; Dj = depth_all[gj]
+                Hi, Wi = int(Di.shape[0]), int(Di.shape[1])
+                Hj, Wj = int(Dj.shape[0]), int(Dj.shape[1])
+
+                ts_i = np.int32([[Hi, Wi]])
+                ts_j = np.int32([[Hj, Wj]])
+                view1["true_shape"][e] = ts_i
+                view1["img"][e]        = ts_i
+                view2["true_shape"][e] = ts_j
+                view2["img"][e]        = ts_j
+
+                pred1["pts3d"][e] = torch.ones((Hi, Wi, 3), dtype=ones_dtype, device=device)
+                pred1["conf"][e]  = torch.ones((Hi, Wi),     dtype=ones_dtype, device=device)
+                pred2["pts3d_in_other_view"][e] = torch.ones((Hj, Wj, 3), dtype=ones_dtype, device=device)
+                pred2["conf"][e]                = torch.ones((Hj, Wj),     dtype=ones_dtype, device=device)
+
+    output = {"view1": view1, "view2": view2, "pred1": pred1, "pred2": pred2}
+    
+    # output = pack_edges(mixed_edges, device)
+
+    # packed, remap = compact_packed_edges(out_delta)
+
+  
+    end = time.time()
+    
+    print("global alignment", end - start)
+    
+    # output = inference(pairs, model, device, batch_size=1, verbose=not silent)
+    
+
+    mode = GlobalAlignerMode.PointCloudOptimizer if len(imgs) > 2 else GlobalAlignerMode.PairViewer
+    scene = global_aligner(output, device=device, mode=mode, verbose=not silent)
+
+    # Warm-start from cache for this subset
+    Twc0, K0, pp0 = GA_CACHE["Twc"], GA_CACHE["K"], GA_CACHE["pp"]
+    depth0_all = GA_CACHE.get("depth")  # NEW
+    M = len(imgs)
+    
+    # M = len(remap)
+    # inv = {new: old for old, new in remap.items()}          # new_local -> old_local
+    # gid_by_new = [imgs[inv[n]]['gid'] for n in range(M)]    # global ids in new-local order
+
+    # Optionally, replace imgs with a remapped version so everything else stays consistent
+    # imgs = [{'gid': gid, 'lid': n} for n, gid in enumerate(gid_by_new)]
+
+    if mode == GlobalAlignerMode.PointCloudOptimizer:
+        # 1) poses (match new-local order)
+        subset_Twc = [torch.tensor(Twc0[d['gid']], dtype=torch.float32) for d in imgs]
+        scene.preset_pose(subset_Twc, pose_msk=None)
+
+        # 2) intrinsics (match new-local order)
+        subset_f = [float(K0[d['gid'], 0, 0]) for d in imgs]
+        scene.preset_focal(subset_f, msk=None)
+
+        if pp0 is not None:
+            was_pp = scene.im_pp.requires_grad
+            scene.im_pp.requires_grad_(True)
+            subset_pp = [pp0[d['gid']] for d in imgs]
+            scene.preset_principal_point(subset_pp, msk=None)
+            scene.im_pp.requires_grad_(was_pp)
+
+        # 4) freeze intrinsics during subset refine
+        scene.im_focals.requires_grad_(False)
+        scene.im_pp.requires_grad_(False)
+        scene.im_depthmaps.requires_grad_(True)
+
+        # 5) enable pose grads (preset_pose froze them)
+        scene.im_poses.requires_grad_(False)
+        scene.pw_poses.requires_grad_(True)
+        scene.pw_adaptors.requires_grad_(True)
+
+        with torch.no_grad():
+            scene.pw_poses.copy_(torch.from_numpy(GA_CACHE["pw_poses"]).to(device))
+            scene.pw_adaptors.copy_(torch.from_numpy(GA_CACHE["pw_adaptors"]).to(device))
+     
+        scene.base_scale   = GA_CACHE["base_scale"]
+        scene.pw_break     = GA_CACHE["pw_break"]
+        scene.norm_pw_scale = GA_CACHE["norm_pw"]
+        # scene.conf_i = conf_i
+        # scene.conf_j = conf_j
+
+        # 6) NEW: seed per-edge latents using current poses (PnP-like), but no steps yet
+        # try:
+        #     _ = scene.compute_global_alignment(init='known', niter=0, schedule=schedule, lr=1e-2)
+        # except Exception:
+        #     print("Exception")
+        #     # Fallback: a 0-iter 'mst' or a tiny run to seed edge vars
+        #     _ = scene.compute_global_alignment(init='mst', niter=0)
+
+        # print("pw_poses", scene.get_pw_poses())
+
+        # if depth0_all is not None and len(depth0_all) > 0:
+        #     for i, dct in enumerate(imgs):
+        #         gi = dct['gid']
+        #         di_np = depth0_all[gi]
+        #         di_t  = torch.as_tensor(di_np)
+        #         if i not in changed_gids:
+        #             scene._set_depthmap(i, di_t, force=True)
+                    
+                    
+        best_depthmaps = {}
+        # init all pairwise poses
+        for e, (i, j) in enumerate(scene.edges):
+            i_j = edge_str(i, j)
+            # remember if this is a good depthmap
+            score = float(scene.conf_i[i_j].mean())
+            s = scene.get_pw_scale()[e]
+            if score > best_depthmaps.get(i, (0,))[0] and (i,j) in pairs_to_run_tuples:
+                best_depthmaps[i] = score, i_j, s
+      
+
+        # init all image poses
+        for n in range(scene.n_imgs):
+            #assert known_poses_msk[n]
+            # score, i_j, scale = best_depthmaps[n]
+
+            item = best_depthmaps.get(n)
+            if item is None:
+                continue  # skip if not found
+            score, i_j, scale = item
+
+            depth = scene.pred_i[i_j][:, :, 2]
+            scene._set_depthmap(n, depth * scale)
+
+        # 7) short refine without re-init
+        # _ = scene.compute_global_alignment(init=None, niter=niter/20, schedule=schedule, lr=1e-2) #5e-2
+
+
+    # Read subset outputs
+    Twc_sub = scene.get_im_poses().detach().cpu().numpy()    # (M,4,4)
+    K_sub   = scene.get_intrinsics().detach().cpu().numpy()
+
+    # # --- Align to original world via anchor (exact gauge match) ---
+    # anchor_local = next(d['idx'] for d in imgs if d['gid'] == anchor_gid)
+    # T_align = Twc0[anchor_gid] @ np.linalg.inv(Twc_sub[anchor_local])
+    # Twc_sub = np.einsum('ab,sbc->sac', T_align, Twc_sub)
+
+    # Points / conf (raw)
+    pts  = [p.detach().cpu().numpy() if torch.is_tensor(p) else p for p in scene.get_pts3d()]
+    conf = [c.detach().cpu().numpy() if torch.is_tensor(c) else c for c in scene.im_conf]
+    scene_imgs = [img.detach().cpu().numpy() if torch.is_tensor(img) else img for img in scene.imgs]
+
+    # 3) slice cameras/intrinsics to changed frames only
+    Twc_sub = Twc_sub[changed_gids]                 # (Mchg,4,4) cam->world
+    K_sub   = K_sub[changed_gids]                   # (Mchg,3,3)
+
+    pts  = [pts[i]  for i in changed_gids]
+    conf = [conf[i] for i in changed_gids]
+    scene_imgs = [scene_imgs[i] for i in changed_gids]
+
+    # --- SIM(3) scale snap (about anchor camera center) ---
+    # get depths
+    depth_ref = GA_CACHE["depth"][anchor_gid]                              # from iter-0 (cached)
+    depth_cur = scene.get_depthmaps()[anchor_local].detach().cpu().numpy() # current subset
+
+    # median depth ratio → global scale
+    s = _median_scale_from_depths(depth_ref, depth_cur)
+
+    # if s is NaN/inf or extreme, clamp/fallback
+    if not np.isfinite(s) or s < 0.25 or s > 4.0:
+        s = 1.0  # safe fallback; tune bounds as you prefer
+
+    # similarity matrix about the (already aligned) anchor camera center
+    C_anchor = Twc_sub[anchor_local][:3, 3].copy()       # after SE(3) snap, equals Twc0[anchor_gid][:3,3]
+    S_C = _sim3_about_center_matrix(C_anchor, s)
+
+    # apply to all subset cameras
+    Twc_sub = np.einsum('ab,sbc->sac', S_C, Twc_sub)
+
+    # ... after you computed Twc_sub (aligned cameras) and have T_align:
+    # transform the *subset* 3D pointmaps into the original world frame
+    
+    
+    pts = [_apply_se3_to_pointmap(p, S_C) for p in pts]
+
+
+    err = np.linalg.norm(Twc0[anchor_gid][:3,3] - Twc_sub[anchor_local][:3,3])
+    print(f"[snap] anchor translation error after align: {err:.6f}")  # should be ~0
+
+   
+    
+    # If all same size, stack (nice for downstream)
+    h0, w0 = pts[0].shape[:2]
+    if all(p.shape[:2] == (h0, w0) for p in pts):
+        P = np.stack(pts, axis=0).astype(np.float32)
+        C = np.stack(conf, axis=0).astype(np.float32)
+    else:
+        P = np.array(pts, dtype=object)
+        C = np.array(conf, dtype=object)
+
+    Tcw_sub = [np.linalg.inv(k) for k in Twc_sub]
+
+    # Write back ALIGNED cameras (+ keep cached depths as-is, or replace if you wish)
+    
+    for i, dct in enumerate(imgs):
+        # GA_CACHE["Twc"][dct["gid"]] = Twc_sub[i]
+        # GA_CACHE["K"][dct["gid"]]   = K_sub[i]
+    
+    
+        # Optional: refresh cached depth with the refined one
+        refined_depth_i = scene.get_depthmaps()[i].detach().cpu().numpy()
+        GA_CACHE["depth"][dct["gid"]] = refined_depth_i
+
+    scene_imgs = [im["img"].detach().cpu().numpy() for im in imgs_clean if im["idx"] in changed_gids]
+        
+    predictions = {
+        "world_points":       P,
+        "world_points_conf":  C,
+        "images":             np.array(scene_imgs, dtype=object).squeeze(1),
+        "extrinsic":          np.stack(Tcw_sub, axis=0),   # (M,4,4)
+        "intrinsic_K":        K_sub,
+        "gids":               np.array([d["gid"] for d in imgs]),
+    }
+    return predictions
+
+
+
+
+
+
+
 # ------------------- main -------------------
 def get_reconstructed_scene(
     itr, outdir, imgs, model, device, silent, image_size, filelist, schedule, niter, min_conf_thr,
