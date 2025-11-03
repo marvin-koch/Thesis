@@ -197,7 +197,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
         t_w2m = np.zeros(3, dtype=np.float32)
 
-
+        R_w2m = to_torch(R_w2m, device=device)
+        t_w2m = to_torch(t_w2m, device=device)
         
         image_tensors = torch.stack([d["img"] for d in imgs])
 
@@ -220,33 +221,33 @@ class VoxelUpdaterSystem(pl.LightningModule):
             
             start = time.time()
 
-            # predictions = get_reconstructed_scene(i, ".", imgs, self.model, self.device, False, 512, "", "linear", 100, 1, True, False, True, False, 0.05, "oneref", 1, 0)
+            predictions = get_reconstructed_scene_no_opt(i, ".", imgs, self.model, self.device, False, 512, "", "linear", 100, 1, True, False, True, False, 0.05, "oneref", 1, 0)
             
-            predictions = _profile_block(
-                f"inference_t{i}_full",
-                get_reconstructed_scene,
-                i,                 # itr
-                ".",               # outdir
-                imgs,              # imgs
-                self.model,        # model
-                self.device,       # device
-                False,             # silent
-                512,               # image_size
-                "",                # filelist
-                "linear",          # schedule
-                100,               # niter
-                1,                 # min_conf_thr
-                True,              # as_pointcloud
-                False,             # mask_sky
-                True,              # clean_depth
-                False,             # transparent_cams
-                0.05,              # cam_size
-                "oneref",          # scenegraph_type
-                1,                 # winsize
-                0                  # refid
-                # changed_gids=None (implicit)
-                # tau=0.45 (default)
-            )
+            # predictions = _profile_block(
+            #     f"inference_t{i}_full",
+            #     get_reconstructed_scene,
+            #     i,                 # itr
+            #     ".",               # outdir
+            #     imgs,              # imgs
+            #     self.model,        # model
+            #     self.device,       # device
+            #     False,             # silent
+            #     512,               # image_size
+            #     "",                # filelist
+            #     "linear",          # schedule
+            #     100,               # niter
+            #     1,                 # min_conf_thr
+            #     True,              # as_pointcloud
+            #     False,             # mask_sky
+            #     True,              # clean_depth
+            #     False,             # transparent_cams
+            #     0.05,              # cam_size
+            #     "oneref",          # scenegraph_type
+            #     1,                 # winsize
+            #     0                  # refid
+            #     # changed_gids=None (implicit)
+            #     # tau=0.45 (default)
+            # )
 
             self.keyframes = image_tensors.clone()
             
@@ -289,34 +290,34 @@ class VoxelUpdaterSystem(pl.LightningModule):
             # stacked_predictions = []
             # for input_frames in [imgs]:
             
-            # predictions = get_reconstructed_scene(i, ".", imgs, self.model, self.device, False, 512, "", "linear", 100, 1, True, False, True, False, 0.05, "oneref", 1, 0, changed_gids=changed_idx)
+            predictions = get_reconstructed_scene_no_opt(i, ".", imgs, self.model, self.device, False, 512, "", "linear", 100, 1, True, False, True, False, 0.05, "oneref", 1, 0, changed_gids=changed_idx)
             
             
-            predictions = _profile_block(
-                f"inference_t{i}_changed",
-                get_reconstructed_scene,
-                i,                 # itr
-                ".",               # outdir
-                imgs,              # imgs
-                self.model,        # model
-                self.device,       # device
-                False,             # silent
-                512,               # image_size
-                "",                # filelist
-                "linear",          # schedule
-                100,               # niter
-                1,                 # min_conf_thr
-                True,              # as_pointcloud
-                False,             # mask_sky
-                True,              # clean_depth
-                False,             # transparent_cams
-                0.05,              # cam_size
-                "oneref",          # scenegraph_type
-                1,                 # winsize
-                0,                 # refid
-                changed_idx        # changed_gids
-                # tau=0.45 (default)
-            )
+            # predictions = _profile_block(
+            #     f"inference_t{i}_changed",
+            #     get_reconstructed_scenet,
+            #     i,                 # itr
+            #     ".",               # outdir
+            #     imgs,              # imgs
+            #     self.model,        # model
+            #     self.device,       # device
+            #     False,             # silent
+            #     512,               # image_size
+            #     "",                # filelist
+            #     "linear",          # schedule
+            #     100,               # niter
+            #     1,                 # min_conf_thr
+            #     True,              # as_pointcloud
+            #     False,             # mask_sky
+            #     True,              # clean_depth
+            #     False,             # transparent_cams
+            #     0.05,              # cam_size
+            #     "oneref",          # scenegraph_type
+            #     1,                 # winsize
+            #     0,                 # refid
+            #     changed_idx        # changed_gids
+            #     # tau=0.45 (default)
+            # )
 
             # predictions = run_model(model, vggt_input, attn_mask=adj)s
                 
@@ -418,6 +419,9 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
 
 
+        R_w2m = to_torch(R_w2m, device=device)
+        t_w2m = to_torch(t_w2m, device=device)
+        
        
         
         image_tensors = torch.stack([d["img"] for d in imgs])
@@ -440,9 +444,9 @@ class VoxelUpdaterSystem(pl.LightningModule):
         
         start = time.time()
 
-        predictions = get_reconstructed_scene(0, ".", imgs, self.model, self.device, False, 512, "", "linear", 100, 1, True, False, True, False, 0.05, "oneref", 1, 0)
+        predictions = get_reconstructed_scene_no_opt(0, ".", imgs, self.model, self.device, False, 512, "", "linear", 100, 1, True, False, True, False, 0.05, "oneref", 1, 0)
         
-        self.keyframes = image_tensors.clone()
+        # self.keyframes = image_tensors.clone()
         
         end = time.time()
         length = end - start
@@ -472,14 +476,16 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
         camera_R = R_w2m @ Rmw
         camera_t = t_w2m + tmw
-        frames_map, cam_centers_map, conf_map, images_map, _, (S,H,W) = build_frames_and_centers_vectorized(
+        frames_map, cam_centers_map, conf_map, (S,H,W), frame_ids = build_frames_and_centers_vectorized_torch(
             predictions,
             POINTS=POINTS,
             CONF=CONF,
-            IMG="images",
+            # IMG="images",
             threshold=threshold,
             Rmw=camera_R, tmw=camera_t,
             z_clip_map=z_clip_map,   # or None
+            return_flat=True
+
         )   
         end = time.time()
         length = end - start
@@ -503,6 +509,9 @@ class VoxelUpdaterSystem(pl.LightningModule):
             z_clip_vox=(-np.inf, np.inf),
             z_band_bev=(0.02, 0.5),
             samples_per_voxel=0.7,#1,
+            ray_stride=6,#2,
+            max_free_rays=10000,
+            frame_ids=frame_ids
         )
 
         self.vox_gt = vox
@@ -592,9 +601,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
         for t in range(T):
             imgs = batch["imgs_t"][t]          # <--- this is your old `imgs`
 
-
-            bev = self.inference(t, imgs)
             bev_gt = self.inference_gt(t, imgs)
+            bev = self.inference(t, imgs)
 
         
 

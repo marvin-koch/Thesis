@@ -6,7 +6,7 @@ import sys
 import tempfile
 import matplotlib.pyplot as pl
 import copy
-import pow3r2.tools.path_to_dust3r
+import pow3r.tools.path_to_dust3r
 
 from dust3r.utils.device import todevice, to_numpy
 from dust3r.inference import inference
@@ -29,11 +29,10 @@ from voxel.align import *
 from voxel.covisibility import *
 from voxel.viz_utils import *
 from preprocess_images.filter_images import changed_images
+from inference.utils import *
 import os, shutil, json
 
-from inference.utils import *
 
-    
 
 
 sys.path.append("Thesis/")
@@ -57,6 +56,8 @@ R_w2m = np.array([[0, 0, -1],
 
 t_w2m = np.zeros(3, dtype=np.float32)
 
+R_w2m = to_torch(R_w2m, device=device)
+t_w2m = to_torch(t_w2m, device=device)
 # Initialize the model and load the pretrained weights.
 # This will automatically download the model weights the first time it's run, which may take a while.
 print("Loading DUST3R")
@@ -85,7 +86,7 @@ os.makedirs(save_root, exist_ok=True)
 # sub_dirs = ["00000000", "00000050","00000100", "00000150", "00000200", "00000250"]
 # sub_dirs = ["00000000", "00000300",  "00000350", "00000400"]
 
-target_dir = "../frames_bedroom/"  # folder that contains intrinsics.json and time_XXXXX/
+target_dir = "/Users/marvin/Documents/Thesis/repo/dataset_generation/habitat/frames_bedroom/"  # folder that contains intrinsics.json and time_XXXXX/
 
 sub_dirs = sorted([d for d in os.listdir(target_dir) 
             if os.path.isdir(os.path.join(target_dir, d))])
@@ -101,7 +102,7 @@ last_save_paths = None  # global-ish tracker for previous iter’s artifact path
 for i, images in enumerate(sub_dirs):
 
     print(f"Iteration {i}")
-   
+    start_full = time.time()
     imgs = li(target_dir + images, size=512, verbose=False)
     
     image_tensors = torch.stack([d["img"] for d in imgs])
@@ -125,7 +126,7 @@ for i, images in enumerate(sub_dirs):
         
         start = time.time()
 
-        predictions = get_reconstructed_scene(i, ".", imgs, model, device, False, 512, target_dir + images, "linear", 100, 1, True, False, True, False, 0.05, "oneref", 1, 0)
+        predictions = get_reconstructed_scene_no_opt(i, ".", imgs, model, device, False, 512, target_dir + images, "linear", 100, 1, True, False, True, False, 0.05, "oneref", 1, 0)
         
         keyframes = image_tensors.clone()
         
@@ -198,7 +199,7 @@ for i, images in enumerate(sub_dirs):
 
         # stacked_predictions = []
         # for input_frames in [imgs]:
-        predictions = get_reconstructed_scene(i, ".", imgs, model, device, False, 512, target_dir + images, "linear", 100, 1, True, False, True, False, 0.05, "oneref", 1, 0, changed_gids=changed_idx)
+        predictions = get_reconstructed_scene_no_opt(i, ".", imgs, model, device, False, 512, target_dir + images, "linear", 100, 1, True, False, True, False, 0.05, "oneref", 1, 0, changed_gids=changed_idx)
         
         # predictions = run_model(model, vggt_input, attn_mask=adj)s
             
@@ -206,8 +207,6 @@ for i, images in enumerate(sub_dirs):
         length = end - start
 
         print("Running inference took", length, "seconds!")
-
-
 
 
     # Keep tensors; only extract what we need later.
@@ -220,16 +219,28 @@ for i, images in enumerate(sub_dirs):
             del predictions[k]  # drop unneeded heavy stuff early
 
 
+
     # print("Align Point Cloud")
 
     start = time.time()
     
-    WPTS_m = rotate_points(predictions[POINTS], R_w2m, t_w2m)
+    WPTS_m = torch.from_numpy(predictions[POINTS]).to(device=device)
+    
+    WPTS_m = rotate_points(WPTS_m, R_w2m, t_w2m)
 
     # if VIZ:
     #     visualize_vggt_pointcloud(predictions, key=POINTS, conf_key=CONF, threshold=threshold)
 
-    Rmw, tmw, info = align_pointcloud_torch(WPTS_m, inlier_dist=voxel_size*0.75)
+    start2 = time.time()
+    
+
+    Rmw, tmw, info = align_pointcloud_torch_fast(WPTS_m, inlier_dist=voxel_size*0.75)
+    
+    end2 = time.time()
+
+    length2 = end2 - start2
+
+    print("Aligning pointcloud inside took", length2, "seconds!")
     WPTS_m = rotate_points(WPTS_m, Rmw, tmw)
     predictions[POINTS] = WPTS_m
 
@@ -250,7 +261,6 @@ for i, images in enumerate(sub_dirs):
 
     camera_R = R_w2m @ Rmw
     camera_t = t_w2m + tmw
-
     frames_map, cam_centers_map, conf_map, (S,H,W), frame_ids = build_frames_and_centers_vectorized_torch(
         predictions,
         POINTS=POINTS,
@@ -283,7 +293,7 @@ for i, images in enumerate(sub_dirs):
         bev_window_m=(5.0, 5.0), # local 20x20 m
         bev_origin_xy=(-2.0, -2.0),
         z_clip_vox=(-np.inf, np.inf),
-        z_band_bev=(0.02, 0.5),
+        z_band_bev=(-0.04, 0.5),
         max_range_m=None,
         carve_free=True,
         samples_per_voxel=0.7,#1,
@@ -320,9 +330,12 @@ for i, images in enumerate(sub_dirs):
     # save_bev_png(bev, meta, f"bev_{i}_{j}.png")
     # export_occupied_voxels_as_ply(vox, "voxels.ply")
         
+    end_full = time.time()
+    
+    print("Full iter took: ",end_full -  start_full)
 
-    # save_bev(bev, meta, save_root + f"bev_{i}.png", save_root + f"bev_{i}_np.npy", save_root + f"bev_{i}_meta.json")
-    # export_occupied_voxels(vox,save_root + f"voxels{i}.ply", save_root + f"voxels{i}_ijk.npy", save_root + f"voxels{i}_meta.json",z_clip_map)
+    save_bev(bev, meta, save_root + f"bev_{i}.png", save_root + f"bev_{i}_np.npy", save_root + f"bev_{i}_meta.json")
+    export_occupied_voxels(vox,save_root + f"voxels{i}.ply", save_root + f"voxels{i}_ijk.npy", save_root + f"voxels{i}_meta.json",z_clip_map)
 
     bev_png  = save_root + f"bev_{i}.png"
     bev_npy  = save_root + f"bev_{i}_np.npy"
@@ -343,5 +356,6 @@ for i, images in enumerate(sub_dirs):
         "vox_ply": vox_ply, "vox_ijk": vox_ijk, "vox_meta": vox_meta,
     }
 
+    
         
     vox.next_epoch()
