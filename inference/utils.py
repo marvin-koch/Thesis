@@ -1,7 +1,7 @@
 import torch
 import os
 
-import pow3r.tools.path_to_dust3r
+import pow3r2.tools.path_to_dust3r
 from dust3r.inference import inference
 from dust3r.image_pairs import make_pairs
 from dust3r.utils.image import load_images as li
@@ -304,7 +304,7 @@ def inference_with_features(
 
     if verbose:
         shapes = [None if fm is None else tuple(fm.shape) for fm in view_featmaps]
-        print(f"[featmaps] built {len(view_featmaps)} maps; sample shape(s): {shapes[:3]} ...")
+        print(f"[featmaps] built {len(view_featmaps)} maps; sample shape(s): {shapes} ...")
 
     return out, view_featmaps
 
@@ -501,13 +501,13 @@ def schedule_pairs(changed_gids, local2gid, pairs, budget,
             continue
         run_set.add(e)
         
-    for i in changed_local:
-        if len(run_set) > budget: break
-        e = pick_one_for_image_extra(i, tau_mst, tau_extra)
-        if e is None: 
-            continue
-        print(e)
-        run_set.add(e)
+    # for i in changed_local:
+    #     if len(run_set) > budget: break
+    #     e = pick_one_for_image_extra(i, tau_mst, tau_extra)
+    #     if e is None: 
+    #         continue
+    #     print(e)
+    #     run_set.add(e)
         
     run_keys = set()
     for e in run_set:
@@ -2122,7 +2122,7 @@ def get_reconstructed_scene(
     predictions = {
         "world_points":       P,
         "world_points_conf":  C,
-        "images":             np.array(scene_imgs, dtype=object).squeeze(1),
+        "images":             np.array(scene_imgs).squeeze(1),
         "extrinsic":          np.stack(Tcw_sub, axis=0),   # (M,4,4)
         "intrinsic_K":        K_sub,
         "gids":               np.array([d["gid"] for d in imgs]),
@@ -2240,7 +2240,7 @@ def get_reconstructed_scene_no_opt(
         predictions = {
             "world_points":       P,
             "world_points_conf":  C,
-            "images":             np.array(scene.imgs, dtype=object),
+            "images":             np.array(scene.imgs),
             "extrinsic":          np.stack(Tcw, axis=0),   # (N,4,4) world->camera
             "intrinsic_K":        K,
             "gids":               np.array([d["gid"] for d in imgs]),
@@ -2353,9 +2353,8 @@ def get_reconstructed_scene_no_opt(
 
     if len(pairs_to_run):
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-
-            output, view_feats = inference_with_features(
-                pairs, model, device, batch_size=4, verbose=not silent
+            out_delta, view_feats = inference_with_features(
+                pairs_to_run, model, device, batch_size=4, verbose=not silent
             )        
     else:
         # fabricate an empty structure with lists
@@ -2375,7 +2374,7 @@ def get_reconstructed_scene_no_opt(
 
     # Build per-edge k index for run edges
     run_mask_t = torch.as_tensor(run_mask, dtype=torch.bool)
-    run_idx = (run_mask_t.cumsum(0) - 1)
+    # run_idx = (run_mask_t.cumsum(0) - 1)
 
     # Hoist out_delta refs
     od_v1_ts = out_delta["view1"]["true_shape"]
@@ -2405,6 +2404,8 @@ def get_reconstructed_scene_no_opt(
         
     scales = np.exp(pw_poses[:, -1])
     scales = [d for d, m in zip(scales, run_mask_t) if m]
+    
+    final_changed = set()
 
     for e, (vi, vj) in enumerate(pairs_to_run):
         # if run_mask_t[e]:
@@ -2419,6 +2420,7 @@ def get_reconstructed_scene_no_opt(
         if od_p1_c[e].mean() > conf.get(i, torch.tensor(-10000.0)).mean():
             output[i] = cam_to_world_torch(unproject_depth_torch((s * od_p1_p[e][:, :, 2]), K0[i]), Twc0[i])   # (H,W,3)
             conf[i]  = torch.as_tensor(od_p1_c[e], device=device)
+            final_changed.add(i)
         # if od_p2_c[k].mean() > conf.get(j, torch.tensor(-10000.0)).mean():
         #     output[j] = cam_to_world_torch(unproject_depth_torch((s * od_p2_p[k][:, :, 2]), K0[j]), Twc0[j])   # (H,W,3)
         #     conf[j]  = torch.as_tensor(od_p2_c[k], device=device)
@@ -2436,17 +2438,17 @@ def get_reconstructed_scene_no_opt(
         P = np.array(pts, dtype=object)
         C = np.array(conf, dtype=object)
 
- 
-    scene_imgs = [im["img"].detach().cpu().numpy() for im in imgs_clean if im["idx"] in changed_gids]
-    
+    final_changed = list(final_changed)
+    scene_imgs = [im["img"].detach().cpu().numpy() for im in imgs_clean if im["idx"] in final_changed]
+    view_feats = [feat for l, feat in enumerate(view_feats) if l in final_changed]
     end = time.time()
 
     print("global alignment", end - start)
-
+    
     predictions = {
         "world_points":       P,
         "world_points_conf":  C,
-        "images":             np.array(scene_imgs, dtype=object).squeeze(1),
+        "images":             np.array(scene_imgs).squeeze(1),
         "extrinsic":          np.stack(Twc0.detach().cpu().numpy(), axis=0),   # (M,4,4)
         "intrinsic_K":        K0.detach().cpu().numpy(),
         "gids":               np.array([d["gid"] for d in imgs]),

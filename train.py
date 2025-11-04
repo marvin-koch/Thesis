@@ -17,7 +17,7 @@ from voxel.covisibility import *
 from voxel.viz_utils import *
 from voxel.latent_voxel import *
 
-import pow3r.tools.path_to_dust3r
+import pow3r2.tools.path_to_dust3r
 from dust3r.model import AsymmetricCroCo3DStereo
 import torch
 import os
@@ -174,11 +174,15 @@ class VoxelUpdaterSystem(pl.LightningModule):
         self.keyframes = []
         # convenience buffer for device transfers
         self.register_buffer("_origin", torch.zeros(3), persistent=False)
+        
+        self.projector = FeatureProjector()
 
     def configure_optimizers(self):
         params = list(self.vox.sim_net.parameters()) + \
                  list(self.vox.gru_cell.parameters()) + \
-                 list(self.vox.decoder.parameters())
+                 list(self.vox.decoder.parameters()) + \
+                 list(self.projector.parameters()) + \
+                 list(self.vox.gate_mlp.parameters())
         # if your feature extractor is finetuned, extend params with extractor params
         opt = torch.optim.AdamW(params, lr=self.cfg.lr, weight_decay=self.cfg.weight_decay)
         return opt
@@ -197,8 +201,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
         t_w2m = np.zeros(3, dtype=np.float32)
 
-        R_w2m = to_torch(R_w2m, device=device)
-        t_w2m = to_torch(t_w2m, device=device)
+        R_w2m = to_torch(R_w2m, device=self.device)
+        t_w2m = to_torch(t_w2m, device=self.device)
         
         image_tensors = torch.stack([d["img"] for d in imgs])
 
@@ -215,7 +219,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
             image_tensors.append(t.clamp(0,1))
             
         image_tensors = torch.stack(image_tensors, dim=0)  
-
+        image_tensors = image_tensors.to(self.device)
 
         if i < 1:
             
@@ -340,54 +344,81 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
         start = time.time()
         
+        WPTS_m = torch.from_numpy(predictions[POINTS]).to(device=self.device)
+
         WPTS_m = rotate_points(predictions[POINTS], R_w2m, t_w2m)
-        Rmw, tmw, info = align_pointcloud(WPTS_m, inlier_dist=self.voxel_size*0.75)
+        Rmw, tmw, info = align_pointcloud_torch_fast(WPTS_m, inlier_dist=self.voxel_size*0.75)
         WPTS_m = rotate_points(WPTS_m, Rmw, tmw)
         predictions[POINTS] = WPTS_m
 
-
-        camera_R = R_w2m @ Rmw
-        camera_t = t_w2m + tmw
-        frames_map, cam_centers_map, conf_map, images_map, features_map, (S,H,W) = build_frames_and_centers_vectorized(
-            predictions,
-            POINTS=POINTS,
-            CONF=CONF,
-            IMG="images",
-            FEAT="view_feats",
-            threshold=threshold,
-            Rmw=camera_R, tmw=camera_t,
-            z_clip_map=z_clip_map,   # or None
-        )   
         end = time.time()
         length = end - start
 
-        print("Aligning and building frames/camera centers took", length, "seconds!")
+        print("Aligning frames took", length, "seconds!")
+        start = time.time()
+
+        # camera_R = R_w2m @ Rmw
+        # camera_t = t_w2m + tmw
+        # frames_map, cam_centers_map, conf_map, images_map, features_map, (S,H,W), frame_ids = build_frames_and_centers_vectorized_torch(
+        #     predictions,
+        #     POINTS=POINTS,
+        #     CONF=CONF,
+        #     FEAT="view_feats",
+        #     threshold=threshold,
+        #     Rmw=camera_R, tmw=camera_t,
+        #     z_clip_map=z_clip_map,   # or None
+        #     return_flat=True
+
+        # )   
+        feats = torch.from_numpy(to_numpy(predictions["view_feats"]))
+        feats = feats.to(device=self.device, dtype=torch.float32)  # (S, H, W,)
+        
+        predictions["view_feats"] = self.projector(feats)
+        
+        del feats
+
+        end = time.time()
+        length = end - start
+
+        print("Projecting view feats", length, "seconds!")
+        
+        start = time.time()
+
+        frames_map, conf_map, images_map, features_map, (S,H,W), frame_ids = filter_frames(
+            predictions,
+            POINTS=POINTS,
+            CONF=CONF,
+            FEAT="view_feats",
+            threshold=threshold,
+            z_clip_map=z_clip_map,   # or None
+        )  
+        
+        end = time.time()
+        length = end - start
+
+        print("Building frames/camera centers took", length, "seconds!")
 
         start = time.time()
 
         align_to_voxel = False #(i > 0)
          
-        
-        print(frames_map[0].shape)
-        print(features_map[0].shape)
 
         #features_map = [vf_t[i] for i in range(vf.shape[0])]  # one vector per image
 
         # features_map = [pointnext_inference(preprocess_points(f,i)) for f, i in zip(frames_map, images_map)]
-        
+
         vox, bev, meta = build_maps_from_latent_features(
             i,
             frames_map,
-            cam_centers_map,
             conf_map,
             features_map,
             self.vox,
-            align_to_voxel=align_to_voxel,
             voxel_size=self.voxel_size,           # 10 cm
             bev_window_m=(5.0, 5.0), # local 20x20 m
             bev_origin_xy=(-2.0, -2.0),
             z_clip_vox=(-np.inf, np.inf),
             z_band_bev=(0.02, 0.5),
+            frame_ids=frame_ids
         )
 
         self.vox = vox
@@ -401,6 +432,13 @@ class VoxelUpdaterSystem(pl.LightningModule):
         
             
         self.vox.next_epoch()
+        
+        # after build_frames_and_centers_vectorized(...)
+        del predictions  # drops images, view_feats, etc. all at once
+
+        # after build_maps_from_latent_features(...)
+        del frames_map, conf_map, images_map, features_map
+        gc.collect()
 
         return bev
     
@@ -419,8 +457,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
 
 
-        R_w2m = to_torch(R_w2m, device=device)
-        t_w2m = to_torch(t_w2m, device=device)
+        R_w2m = to_torch(R_w2m, device=self.device)
+        t_w2m = to_torch(t_w2m, device=self.device)
         
        
         
@@ -468,15 +506,17 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
         start = time.time()
         
+        WPTS_m = torch.from_numpy(predictions[POINTS]).to(device=self.device)
+
         WPTS_m = rotate_points(predictions[POINTS], R_w2m, t_w2m)
-        Rmw, tmw, info = align_pointcloud(WPTS_m, inlier_dist=self.voxel_size*0.75)
+        Rmw, tmw, info = align_pointcloud_torch_fast(WPTS_m, inlier_dist=self.voxel_size*0.75)
         WPTS_m = rotate_points(WPTS_m, Rmw, tmw)
         predictions[POINTS] = WPTS_m
 
 
         camera_R = R_w2m @ Rmw
         camera_t = t_w2m + tmw
-        frames_map, cam_centers_map, conf_map, (S,H,W), frame_ids = build_frames_and_centers_vectorized_torch(
+        frames_map, cam_centers_map, conf_map, images_map, _, (S,H,W), frame_ids = build_frames_and_centers_vectorized_torch(
             predictions,
             POINTS=POINTS,
             CONF=CONF,
@@ -525,6 +565,14 @@ class VoxelUpdaterSystem(pl.LightningModule):
         
             
         self.vox_gt.next_epoch()
+        
+        
+          # after build_frames_and_centers_vectorized(...)
+        del predictions  # drops images, view_feats, etc. all at once
+
+        # after build_maps_from_latent_features(...)
+        del frames_map, cam_centers_map, conf_map, images_map
+        gc.collect()
 
         return bev
   
@@ -585,11 +633,15 @@ class VoxelUpdaterSystem(pl.LightningModule):
             params=VoxelParams(voxel_size=self.voxel_size, promote_hits=2),
             device=self.device, dtype=torch.float32
         )
+        
+        self.vox = self.vox.to(self.device)
+        
         self.vox_gt = TorchSparseVoxelGrid(
             origin_xyz=np.zeros(3, dtype=np.float32),
             params=VoxelParams(voxel_size=self.voxel_size, promote_hits=2),
             device=self.device, dtype=torch.float32
         )
+        
 
         # ---- unpack sequence ----
         T = batch["timesteps"]
@@ -599,11 +651,12 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
         # ---- iterate timesteps ----
         for t in range(T):
+            
+            print(f"=============================timestep {t}=============================")
             imgs = batch["imgs_t"][t]          # <--- this is your old `imgs`
 
             bev_gt = self.inference_gt(t, imgs)
             bev = self.inference(t, imgs)
-
         
 
             p_occ_tgt = self.vox_gt.vals_st
@@ -670,16 +723,13 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 "loss/tv": loss_tv,
                 "stats/num_voxels": float(self.vox.keys.numel())
             }, prog_bar=(t == T-1), on_step=True, on_epoch=True, sync_dist=False)
-
+                    
+            torch.cuda.empty_cache()
+        
         self.log("loss/total", loss_total, prog_bar=True)
         
         
-        # after build_frames_and_centers_vectorized(...)
-        del predictions  # drops images, view_feats, etc. all at once
-
-        # after build_maps_from_latent_features(...)
-        del frames_map, cam_centers_map, conf_map, images_map, features_map
-        gc.collect()
+      
 
         return loss_total
     
@@ -786,7 +836,7 @@ class HabitatDataModule(pl.LightningDataModule):
         self,
         dataset_root: str,
         batch_size: int = 1,
-        num_workers: int = 4,
+        num_workers: int = 1,
         size: int = 512,
         verbose: bool = False,
         train_val_split: float = 0.0,  # 0 = all train, else fraction for val (e.g., 0.1)
@@ -860,7 +910,8 @@ class HabitatDataModule(pl.LightningDataModule):
 def main():
     # Fill your paths here or read from CLI/yaml
     cfg = TrainConfig(
-        dataset_root="/Users/marvin/Documents/Thesis/repo/dataset_generation/habitat/",
+        # dataset_root="/Users/marvin/Documents/Thesis/repo/dataset_generation/habitat/",
+        dataset_root="/home/mpk40/Documents/data/",
         voxel_size=0.10,
         radius_m=0.25,
         topk=8,
@@ -870,7 +921,7 @@ def main():
         lr=1e-3,
         max_epochs=20,
         batch_size=1,
-        num_workers=4,
+        num_workers=0,
         precision="32",
     )
 

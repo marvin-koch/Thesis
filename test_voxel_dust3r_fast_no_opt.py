@@ -6,7 +6,7 @@ import sys
 import tempfile
 import matplotlib.pyplot as pl
 import copy
-import pow3r.tools.path_to_dust3r
+import pow3r2.tools.path_to_dust3r
 
 from dust3r.utils.device import todevice, to_numpy
 from dust3r.inference import inference
@@ -86,7 +86,8 @@ os.makedirs(save_root, exist_ok=True)
 # sub_dirs = ["00000000", "00000050","00000100", "00000150", "00000200", "00000250"]
 # sub_dirs = ["00000000", "00000300",  "00000350", "00000400"]
 
-target_dir = "/Users/marvin/Documents/Thesis/repo/dataset_generation/habitat/frames_bedroom/"  # folder that contains intrinsics.json and time_XXXXX/
+# target_dir = "/Users/marvin/Documents/Thesis/repo/dataset_generation/habitat/frames_bedroom/"  # folder that contains intrinsics.json and time_XXXXX/
+target_dir = "../data/frames_bedroom/"  # folder that contains intrinsics.json and time_XXXXX/
 
 sub_dirs = sorted([d for d in os.listdir(target_dir) 
             if os.path.isdir(os.path.join(target_dir, d))])
@@ -261,7 +262,7 @@ for i, images in enumerate(sub_dirs):
 
     camera_R = R_w2m @ Rmw
     camera_t = t_w2m + tmw
-    frames_map, cam_centers_map, conf_map, (S,H,W), frame_ids = build_frames_and_centers_vectorized_torch(
+    frames_map, cam_centers_map, conf_map, _, _, (S,H,W), frame_ids = build_frames_and_centers_vectorized_torch(
         predictions,
         POINTS=POINTS,
         CONF=CONF,

@@ -914,6 +914,8 @@ def build_frames_and_centers_vectorized_torch(
     *,
     POINTS: str = "world_points_from_depth",
     CONF: str = "world_points_conf",
+    IMG: str = "images",
+    FEAT: str = None,
     EXTR_KEY: str = "extrinsic",
     threshold: float = 50.0,
     Rmw: Optional[torch.Tensor] = None,
@@ -942,6 +944,25 @@ def build_frames_and_centers_vectorized_torch(
     else:
         C = torch.ones(P.shape[:-1], dtype=torch.float32, device=device)
     
+    
+    if FEAT is not None:
+        F = (predictions[FEAT])
+        if not isinstance(F, torch.Tensor):
+            F = torch.from_numpy(to_numpy(F))
+        feat_dim = F.shape[-1]
+        F = F.to(device=device, dtype=torch.float32)  # (S, H, W, 3)
+
+    I = predictions[IMG]
+    if not isinstance(I, torch.Tensor):
+        I = torch.from_numpy(I)
+    I = I.to(device=device, dtype=torch.float32)  # (S, H, W, 3)
+
+    print("frames shapes")
+    print(P.shape)
+    print(I.shape)
+    if FEAT is not None:
+        print(F.shape)
+        
     EXTR = predictions[EXTR_KEY]
     if not isinstance(EXTR, torch.Tensor):
         EXTR = torch.from_numpy(EXTR)
@@ -987,22 +1008,31 @@ def build_frames_and_centers_vectorized_torch(
         z0, z1 = z_clip_map
         z = P[..., 2]
         valid &= (z >= z0) & (z <= z1)
+
     
-    # --- OPTIMIZED: Use cumsum for frame boundaries instead of loop ---
-    P_flat = P.reshape(S, H * W, 3)  # (S, H*W, 3)
-    C_flat = C.reshape(S, H * W)     # (S, H*W)
-    V_flat = valid.reshape(S, H * W) # (S, H*W)
+    # --- gather per-frame points (no per-point loops) ---
+    P_flat = P.reshape(S, -1, 3)         # (S, H*W, 3)
+    I_flat = I.reshape(S, -1, 3)
+    V_flat = valid.reshape(S, -1)        # (S, H*W)
+    C_flat = C.reshape(S,-1)
     
+    if FEAT is not None:
+        F_flat = F.reshape(S, -1, feat_dim)
+        
     if return_flat:
         # Skip per-frame splitting entirely - return concatenated results
         all_valid = V_flat.reshape(-1)
         P_all = P_flat.reshape(-1, 3)[all_valid]
         C_all = C_flat.reshape(-1)[all_valid]
+        I_all = I_flat.reshape(-1, 3)[all_valid]
         
+            
+        if FEAT is not None:
+            F_all = F_flat.reshape(-1, feat_dim)[all_valid]
         # Build frame indices for later use
         frame_ids = torch.arange(S, device=device)[:, None].expand(S, H * W).reshape(-1)[all_valid]
         
-        return [P_all], [Cw], [C_all], (S, H, W), frame_ids
+        return [P_all], [Cw], [C_all], [I_all], [F_all] if (FEAT is not None) else None, (S, H, W), frame_ids
     
     # --- Optimized per-frame extraction using advanced indexing ---
     # Count valid points per frame
@@ -1021,22 +1051,303 @@ def build_frames_and_centers_vectorized_torch(
     frames_map = []
     conf_map = []
     cam_centers_map = []
+    images_map = []
+    feat_map = []
     
     for f in range(S):
-        mask = V_flat[f]
-        count = counts[f].item()
+        conf_map.append(C_flat[f][V_flat[f]].astype(np.float32))
+        if not np.any(V_flat[f]):
+            frames_map.append(np.empty((0,3), dtype=np.float32))
+            continue
+        frames_map.append(P_flat[f][V_flat[f]].astype(np.float32))
+        images_map.append(I_flat[f][V_flat[f]].astype(np.float32))
         
-        if count == 0:
-            frames_map.append(torch.empty((0, 3), dtype=torch.float32, device=device))
-            conf_map.append(torch.empty(0, dtype=torch.float32, device=device))
-        else:
-            # Use compress/masked_select (faster than boolean indexing for sparse masks)
-            frames_map.append(P_flat[f][mask])
-            conf_map.append(C_flat[f][mask])
+        if FEAT is not None:
+            feat_map.append(F_flat[f][V_flat[f]].astype(np.float32))
         
-        cam_centers_map.append(Cw[f])
+    return frames_map, cam_centers_map, conf_map, images_map, feat_map if (FEAT is not None) else None , (S, H, W)
+
+
+
+def build_frames_and_centers_vectorized_torch(
+    predictions: dict,
+    *,
+    POINTS: str = "world_points_from_depth",
+    CONF: str = "world_points_conf",
+    IMG: str = "images",
+    FEAT: str = None,
+    EXTR_KEY: str = "extrinsic",
+    threshold: float = 50.0,
+    Rmw: Optional[torch.Tensor] = None,
+    tmw: Optional[torch.Tensor] = None,
+    z_clip_map: Optional[tuple[float, float]] = None,
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+    return_flat: bool = False,  # NEW: skip per-frame splitting
+) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], tuple[int, int, int]]:
+    """
+    Heavily optimized version - eliminates the per-frame loop bottleneck.
     
-    return frames_map, cam_centers_map, conf_map, (S, H, W)
+    Set return_flat=True to skip per-frame splitting entirely if you don't need it.
+    """
+    
+    # --- Load tensors (minimize transfers) ---
+    P = predictions[POINTS]
+    if not isinstance(P, torch.Tensor):
+        P = torch.from_numpy(P)
+    P = P.to(device=device, dtype=torch.float32)  # (S, H, W, 3)
+    
+    if CONF in predictions:
+        C = predictions[CONF]
+        if not isinstance(C, torch.Tensor):
+            C = torch.from_numpy(C)
+        C = C.to(device=device, dtype=torch.float32)
+    else:
+        C = torch.ones(P.shape[:-1], dtype=torch.float32, device=device)
+    
+    
+    if FEAT is not None:
+        F = (predictions[FEAT])
+        if not isinstance(F, torch.Tensor):
+            F = torch.from_numpy(to_numpy(F))
+        feat_dim = F.shape[-1]
+        F = F.to(device=device, dtype=torch.float32)  # (S, H, W, 3)
+
+    I = predictions[IMG]
+    if not isinstance(I, torch.Tensor):
+        I = torch.from_numpy(I)
+    I = I.to(device=device, dtype=torch.float32)  # (S, H, W, 3)
+
+    print("frames shapes")
+    print(P.shape)
+    print(I.shape)
+    if FEAT is not None:
+        print(F.shape)
+        
+    EXTR = predictions[EXTR_KEY]
+    if not isinstance(EXTR, torch.Tensor):
+        EXTR = torch.from_numpy(EXTR)
+    EXTR = EXTR.to(device=device, dtype=torch.float32)
+    
+    S, H, W = P.shape[:3]
+    
+    # --- Compute confidence threshold (optimized) ---
+    if threshold == 0.0:
+        conf_threshold = 0.0
+    else:
+        # Sample for percentile instead of using all values
+        C_flat = C.reshape(-1)
+        if C_flat.numel() > 1_000_000:
+            # Random sample for large tensors
+            indices = torch.randperm(C_flat.numel(), device=device)[:1_000_000]
+            C_sample = C_flat[indices]
+            C_finite = C_sample[torch.isfinite(C_sample)]
+        else:
+            C_finite = C_flat[torch.isfinite(C_flat)]
+        
+        if len(C_finite) > 0:
+            conf_threshold = torch.quantile(C_finite, threshold / 100.0).item()
+        else:
+            conf_threshold = 0.0
+    
+    # --- Pad extrinsics if needed ---
+    if EXTR.dim() == 3 and EXTR.shape[1:] == (3, 4):
+        bottom = torch.tensor([[0, 0, 0, 1]], dtype=EXTR.dtype, device=device)
+        bottom = bottom.unsqueeze(0).expand(S, -1, -1)
+        EXTR = torch.cat([EXTR, bottom], dim=1)
+    
+    # --- Camera centers ---
+    Cw = EXTR[:, :3, 3]  # (S, 3)
+    
+    # --- Validity mask (fully vectorized) ---
+    finite_xyz = torch.isfinite(P).all(dim=-1)  # (S, H, W)
+    finite_conf = torch.isfinite(C)
+    conf_ok = (C >= conf_threshold) & (C > 1e-5)
+    valid = finite_xyz & finite_conf & conf_ok
+    
+    if z_clip_map is not None:
+        z0, z1 = z_clip_map
+        z = P[..., 2]
+        valid &= (z >= z0) & (z <= z1)
+
+    
+    # --- gather per-frame points (no per-point loops) ---
+    P_flat = P.reshape(S, -1, 3)         # (S, H*W, 3)
+    I_flat = I.reshape(S, -1, 3)
+    V_flat = valid.reshape(S, -1)        # (S, H*W)
+    C_flat = C.reshape(S,-1)
+    
+    if FEAT is not None:
+        F_flat = F.reshape(S, -1, feat_dim)
+        
+    if return_flat:
+        # Skip per-frame splitting entirely - return concatenated results
+        all_valid = V_flat.reshape(-1)
+        P_all = P_flat.reshape(-1, 3)[all_valid]
+        C_all = C_flat.reshape(-1)[all_valid]
+        I_all = I_flat.reshape(-1, 3)[all_valid]
+        
+            
+        if FEAT is not None:
+            F_all = F_flat.reshape(-1, feat_dim)[all_valid]
+        # Build frame indices for later use
+        frame_ids = torch.arange(S, device=device)[:, None].expand(S, H * W).reshape(-1)[all_valid]
+        
+        return [P_all], [Cw], [C_all], [I_all], [F_all] if (FEAT is not None) else None, (S, H, W), frame_ids
+    
+    
+from typing import Any, Dict, Optional, Tuple
+import torch
+
+@torch.no_grad()
+def filter_frames(
+    predictions: Dict[str, Any],
+    *,
+    POINTS: str = "world_points_from_depth",   # (S, H, W, 3)
+    CONF: str = "world_points_conf",           # (S, H, W)
+    IMG: str = "images",                       # (S, H, W, 3)
+    FEAT: Optional[str] = None,                # (S, H, W, D) optional
+    threshold: float = 50.0,                   # percentile [0..100]
+    z_clip_map: Optional[Tuple[float, float]] = None,
+    device: Optional[str] = None,
+) -> Tuple[
+    torch.Tensor,              # P_all: (N, 3)
+    torch.Tensor,              # C_all: (N,)
+    torch.Tensor,              # I_all: (N, 3)
+    Optional[torch.Tensor],    # F_all: (N, D) or None
+    Tuple[int, int, int],      # (S, H, W)
+    torch.Tensor               # frame_ids: (N,)
+]:
+    """
+    Vectorized filter that flattens across frames and returns only valid points.
+
+    Returns:
+        P_all      : (N, 3) filtered 3D points.
+        C_all      : (N,)   confidences aligned to P_all.
+        I_all      : (N, 3) RGB (float32) aligned to P_all.
+        F_all      : (N, D) features aligned to P_all, or None if FEAT is None.
+        (S, H, W)  : original dimensions.
+        frame_ids  : (N,) frame index for each kept point.
+
+    Notes:
+    - Entirely avoids Python loops over frames.
+    - Uses sampling (with replacement) for percentile estimation on very large
+      tensors to avoid `randperm` O(N) memory/time.
+    """
+
+    # ---- Resolve device ----
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = torch.device(device)
+
+    def to_f32_tensor(x: Any) -> torch.Tensor:
+        if isinstance(x, torch.Tensor):
+            return x.to(device=device, dtype=torch.float32, non_blocking=True)
+
+        if isinstance(x, np.ndarray):
+            if x.dtype == object:
+                x = np.stack([np.asarray(e) for e in x], axis=0)
+            return torch.from_numpy(x).to(device=device, dtype=torch.float32, non_blocking=True)
+
+        if isinstance(x, (list, tuple)):
+            if len(x) == 0:
+                raise ValueError("Cannot convert empty list/tuple to tensor.")
+            # ✅ list of tensors — fixed .to() call
+            if all(isinstance(e, torch.Tensor) for e in x):
+                return torch.stack(
+                    [e.to(device=device, dtype=torch.float32, non_blocking=True) for e in x],
+                    dim=0,
+                )
+            # list of numpy arrays
+            if all(isinstance(e, np.ndarray) for e in x):
+                arrs = [np.asarray(e) for e in x]
+                return torch.from_numpy(np.stack(arrs, axis=0)).to(device=device, dtype=torch.float32, non_blocking=True)
+            # fallback: numbers / nested lists (must be rectangular)
+            return torch.tensor(x, dtype=torch.float32, device=device)
+
+        # Last resort
+        arr = np.asarray(x)
+        if arr.dtype == object:
+            arr = np.stack(list(arr), axis=0)
+        return torch.from_numpy(arr).to(device=device, dtype=torch.float32, non_blocking=True)
+
+        
+    # Required tensors
+    P = to_f32_tensor(predictions[POINTS])  # (S, H, W, 3)
+    I = to_f32_tensor(predictions[IMG])     # (S, H, W, 3)
+
+    # Confidence (optional -> default ones)
+    if CONF in predictions and predictions[CONF] is not None:
+        C = to_f32_tensor(predictions[CONF])  # (S, H, W)
+    else:
+        C = torch.ones(P.shape[:-1], device=device, dtype=torch.float32)
+
+    # Optional features
+    F = None
+    if FEAT is not None:
+        F = to_f32_tensor(predictions[FEAT])  # (S, H, W, D)
+        feat_dim = F.shape[-1]
+
+    # ---- Shapes ----
+    S, H, W = P.shape[:3]
+
+    # ---- Compute confidence threshold (percentile) efficiently ----
+    if threshold <= 0.0:
+        conf_threshold = float("-inf")  # effectively disabled; still keep >1e-5 below
+    else:
+        # Flatten once; sample if huge to reduce compute & memory
+        C_flat = C.reshape(-1)
+        n = C_flat.numel()
+        # Sample up to 1e6 points with replacement (no O(N) `randperm`)
+        sample_size = min(1_000_000, n)
+        if n > sample_size:
+            idx = torch.randint(0, n, (sample_size,), device=device)
+            sample = C_flat.gather(0, idx)
+        else:
+            sample = C_flat
+
+        sample = sample[torch.isfinite(sample)]
+        if sample.numel() == 0:
+            conf_threshold = float("-inf")
+        else:
+            # torch.quantile expects tensor; clamp percentile into [0,1]
+            q = max(0.0, min(1.0, threshold / 100.0))
+            conf_threshold = torch.quantile(sample, q).item()
+
+    # ---- Valid mask (vectorized) ----
+    finite_xyz = torch.isfinite(P).all(dim=-1)     # (S, H, W)
+    finite_conf = torch.isfinite(C)                # (S, H, W)
+    conf_ok = (C >= conf_threshold) & (C > 1e-5)   # keep low-but-positive if threshold <= 0
+
+    valid = finite_xyz & finite_conf & conf_ok
+
+    if z_clip_map is not None:
+        z0, z1 = z_clip_map
+        z = P[..., 2]
+        valid = valid & (z >= z0) & (z <= z1)
+
+    # ---- Flatten & gather only valid entries ----
+    # Use reshape (contiguous-safe) after ensuring contiguous memory where needed
+    P_all = P.reshape(S * H * W, 3)
+    I_all = I.reshape(S * H * W, 3)
+    C_all = C.reshape(S * H * W)
+    V_all = valid.reshape(S * H * W)
+
+    # Frame ids without a Python loop
+    frame_ids = torch.arange(S, device=device).repeat_interleave(H * W)
+    keep = V_all.nonzero(as_tuple=False).squeeze(1)
+
+    P_all = P_all.index_select(0, keep)
+    I_all = I_all.index_select(0, keep)
+    C_all = C_all.index_select(0, keep)
+    frame_ids = frame_ids.index_select(0, keep)
+
+    F_all = None
+    if F is not None:
+        F_all = F.reshape(S * H * W, feat_dim).index_select(0, keep)
+
+    return [P_all], [C_all], [I_all], [F_all], (S, H, W), frame_ids
+
+
 # =============================
 # ----- BEV rasterization -----
 # =============================
@@ -1543,12 +1854,10 @@ def build_maps_from_points_and_centers_torch(
 def build_maps_from_latent_features(
     i,
     frames_xyz: list[np.ndarray],          # list of (N_i,3) in MAP frame
-    cam_centers: list[np.ndarray],         # list of (3,) in MAP frame
     conf_map: list[np.ndarray],         
     features: list[np.ndarray],
     tvox,
     *,
-    align_to_voxel=False,
     voxel_size: float = 0.10,
     bev_window_m=(20.0, 20.0),
     bev_origin_xy=(-10.0, -10.0),
@@ -1559,65 +1868,26 @@ def build_maps_from_latent_features(
     device: str = "cpu",
 
     batch_chunk_points: int | None = None,  # e.g., 2_000_000 to limit RAM
+    frame_ids: Optional[torch.Tensor] = None,  # NEW
+
 ):
 
-    # 1) Concatenate all frames once (no per-frame integrate calls)
-    #    Build per-point camera centers by repeating each frame center.
-    valid_frames = [(np.asarray(P, np.float32), np.asarray(C, np.float32).reshape(3), np.asarray(CONF, np.float32), np.asarray(F, np.float32))
-                    for P, C, CONF, F in zip(frames_xyz, cam_centers, conf_map, features)
-                    if (P is not None and P.size and C is not None)]
-    
-    if not valid_frames:
-        bev_spec = BevSpec(resolution=voxel_size, width_m=float(bev_window_m[0]),
-                           height_m=float(bev_window_m[1]), origin_xy=bev_origin_xy, z_band=z_band_bev)
-        bev, meta = bev_from_voxels(tvox, bev_spec, include_free=True)
-        return tvox, bev, meta
 
-
-    lengths = [pf.shape[0] for pf, _, _,_ in valid_frames]
-    P_all = np.concatenate([pf for pf, _, _,_ in valid_frames], axis=0)              # (M,3)
-    C_all = np.concatenate([np.repeat(cf[None, :], n, axis=0)
-                            for n, (_, cf, _,_) in zip(lengths, valid_frames)], axis=0)  # (M,3)
-    CONF_all = np.concatenate([c for _, _, c,_ in valid_frames], axis=0)              # (M,3)
-    F_all = np.concatenate([f for _, _, _,f in valid_frames], axis=0)              # (M,3)
-
-
-    # drop NaNs early (keeps alignment)
-    keep = np.isfinite(P_all).all(axis=1) & np.isfinite(C_all).all(axis=1)
-    P_all = P_all[keep]; C_all = C_all[keep]; CONF_all = CONF_all[keep]
-    
-
-    if align_to_voxel:
-        _, pts, cameras = sim3_align_to_voxel(
-            pts_world=torch.from_numpy(P_all),
-            cams_world=torch.from_numpy(C_all),
-            conf_world=torch.from_numpy(CONF_all),
-            grid=tvox,
-            cfg=AlignCfg(
-                iters=5,
-                downsample_points=50000,
-                pad_vox=48,
-                max_block_vox=192,
-                samples_per_ray=16,
-                lambda_free=0.1,
-                lambda_prior_t=1e-4,
-                lambda_prior_r=1e-4,
-                lambda_prior_s=1e-4,
-                step=2e-1,
-                use_sim3=True,
-                rot_clamp_deg=10.0,
-                trans_clamp_m=5*voxel_size,
-                scale_clamp=0.1,
-                conf_filter=True,
-                conf_quantile=0.3,
-            )
-        )
+    if frame_ids is not None:
+        # All points are already concatenated
+        pts = frames_xyz[0]
+        # Expand camera centers by frame_ids
+        CONF_all = conf_map[0]
         
-    else:
-        pts, fts = torch.from_numpy(P_all).to(device), torch.from_numpy(F_all).to(device),
+        F_all = features[0]
+        # Skip all the concatenation logic
+        keep = torch.isfinite(pts).all(dim=1) & torch.isfinite(CONF_all)
+        pts = pts[keep]
+        cameras = None
+        CONF_all = CONF_all[keep]
+        fts = F_all[keep]
+        
 
-
-    print(pts.shape)
     # 2) Integrate once (optionally in chunks to cap memory)
     if i == 0:
         # Initialize voxel latents + (optionally) occupancy
