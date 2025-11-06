@@ -73,7 +73,7 @@ model = model.to(device)
 
 
 voxel_size = 0.01
-feature_dim = 64
+feature_dim = 32
 vox = LatentVoxelGrid(
             origin_xyz=np.zeros(3, dtype=np.float16),
             params=VoxelParams(voxel_size=voxel_size, promote_hits=2),
@@ -119,9 +119,13 @@ for i, images in enumerate(sub_dirs):
 
     startc.record()
     
+
+    start = time.time()
     imgs = li(target_dir + images, size=512, verbose=False)
+
     
-    image_tensors = torch.stack([d["img"] for d in imgs])
+
+    #image_tensors = torch.stack([d["img"] for d in imgs])
 
     image_tensors = []
     for d in imgs:
@@ -136,6 +140,12 @@ for i, images in enumerate(sub_dirs):
         image_tensors.append(t.clamp(0,1))
         
     image_tensors = torch.stack(image_tensors, dim=0).to(device)
+
+    end = time.time()
+    length = end - start
+
+    print("tensors images took", length, "seconds!")
+        
 
 
     if i < 1:

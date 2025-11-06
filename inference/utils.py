@@ -2396,12 +2396,12 @@ def get_reconstructed_scene_no_opt(
     # Hoist out_delta refs
     od_v1_ts = out_delta["view1"]["true_shape"]
     od_v1_im = out_delta["view1"]["img"]
-    od_v2_ts = out_delta["view2"]["true_shape"]
-    od_v2_im = out_delta["view2"]["img"]
+    #od_v2_ts = out_delta["view2"]["true_shape"]
+    #od_v2_im = out_delta["view2"]["img"]
     od_p1_p  = out_delta["pred1"]["pts3d"].to(device)
     od_p1_c  = out_delta["pred1"]["conf"].to(device)
-    od_p2_p  = out_delta["pred2"]["pts3d_in_other_view"].to(device)
-    od_p2_c  = out_delta["pred2"]["conf"].to(device)
+    #od_p2_p  = out_delta["pred2"]["pts3d_in_other_view"].to(device)
+    #od_p2_c  = out_delta["pred2"]["conf"].to(device)
 
     # Optional memo for cache path to avoid recomputing repeated (gi, gj)
     cache_memo = {}
@@ -2458,6 +2458,10 @@ def get_reconstructed_scene_no_opt(
     final_changed = list(final_changed)
     scene_imgs = [im["img"].detach().cpu().numpy() for im in imgs_clean if im["idx"] in final_changed]
     view_feats = [feat for l, feat in enumerate(view_feats) if l in final_changed]
+    
+    
+    
+
     end = time.time()
 
     print("global alignment", end - start)

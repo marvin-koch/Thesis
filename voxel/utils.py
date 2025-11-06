@@ -137,7 +137,7 @@ def align_pointcloud_torch_fast(
     z = P0[:, 2]
     finite_z = torch.isfinite(z)
     if finite_z.any():
-        z_thresh = torch.quantile(z[finite_z], floor_bottom_frac)
+        z_thresh = torch.quantile((z[finite_z]).to(torch.float32), floor_bottom_frac)
         low_mask = z <= z_thresh
         P_low = P0[low_mask]
         if P_low.shape[0] < 200:
@@ -299,7 +299,7 @@ def align_pointcloud_torch_fast(
 
         # Compute z-quantile (only if we have inliers)
         if inliers_total > 0:
-            z_q = torch.quantile(z_vals, z_tiebreak_q).item()
+            z_q = torch.quantile(z_vals.to(torch.float32), z_tiebreak_q).item()
         else:
             z_q = float("inf")
 
@@ -328,7 +328,7 @@ def align_pointcloud_torch_fast(
         Qc = Q - Q.mean(dim=0, keepdim=True)
         # the normal is eigenvector of smallest eigenvalue
         # low-rank pca is faster for large N:
-        U, S, Vh = torch.linalg.svd(Qc, full_matrices=False)  # (n,3) -> Vh is (3,3)
+        U, S, Vh = torch.linalg.svd(Qc.to(torch.float32), full_matrices=False)  # (n,3) -> Vh is (3,3)
         n_ref = Vh[-1, :]  # last row is normal (smallest singular value)
         if n_ref[2] < 0:
             n_ref = -n_ref
@@ -402,7 +402,7 @@ def align_pointcloud(points_world_S_HW3,
     # ----- Floor bias: build a "low-z" pool for RANSAC sampling -----
     z = P0[:, 2]
     if np.isfinite(z).any():
-        z_thresh = np.quantile(z, floor_bottom_frac)
+        z_thresh = np.quantile(z.to(torch.float32), floor_bottom_frac.to(torch.float32))
         low_mask = z <= z_thresh
         P_low = P0[low_mask]
         # fallback if degenerate
@@ -1996,9 +1996,9 @@ def rotate_points(points, R, t):
     if is_numpy:
         # Convert PyTorch to NumPy if needed
         if is_torch_R:
-            R = R.cpu().numpy()
+            R = R.detach().cpu().numpy()
         if is_torch_t:
-            t = t.cpu().numpy()
+            t = t.detach().cpu().numpy()
         
         # Ensure correct types
         R = np.asarray(R, dtype=np.float32)

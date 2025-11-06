@@ -150,18 +150,19 @@ class VoxelUpdaterSystem(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters(cfg.__dict__)
         self.cfg = cfg
+        self.feature_dim = 32
         # ---- core components (replace with your actual imports) ----
         self.voxel_size = 0.01
         self.vox = LatentVoxelGrid(
             origin_xyz=np.zeros(3, dtype=np.float32),
             params=VoxelParams(voxel_size=self.voxel_size, promote_hits=2),
-            device=self.device, dtype=torch.float32
+            device=self.device, feature_dim=self.feature_dim
         )
         
         self.vox_gt = TorchSparseVoxelGrid(
             origin_xyz=np.zeros(3, dtype=np.float32),
             params=VoxelParams(voxel_size=self.voxel_size, promote_hits=2),
-            device=self.device, dtype=torch.float32
+            device=self.device 
         )
         
         weights_path = "naver/" + "DUSt3R_ViTLarge_BaseDecoder_512_dpt"
@@ -175,7 +176,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
         # convenience buffer for device transfers
         self.register_buffer("_origin", torch.zeros(3), persistent=False)
         
-        self.projector = FeatureProjector()
+        self.projector = FeatureProjector(out_dim=self.feature_dim)
 
     def configure_optimizers(self):
         params = list(self.vox.sim_net.parameters()) + \
@@ -225,7 +226,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
             
             start = time.time()
 
-            predictions = get_reconstructed_scene_no_opt(i, ".", imgs, self.model, self.device, False, 512, "", "linear", 100, 1, True, False, True, False, 0.05, "oneref", 1, 0)
+            predictions = get_reconstructed_scene_no_opt(i, ".", imgs, self.model, self.device, False, 512, "", "linear", 100, 1, True, False, True, False, 0.05, "oneref", 1, 0, projector=self.projector)
             
             # predictions = _profile_block(
             #     f"inference_t{i}_full",
@@ -294,7 +295,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
             # stacked_predictions = []
             # for input_frames in [imgs]:
             
-            predictions = get_reconstructed_scene_no_opt(i, ".", imgs, self.model, self.device, False, 512, "", "linear", 100, 1, True, False, True, False, 0.05, "oneref", 1, 0, changed_gids=changed_idx)
+            predictions = get_reconstructed_scene_no_opt(i, ".", imgs, self.model, self.device, False, 512, "", "linear", 100, 1, True, False, True, False, 0.05, "oneref", 1, 0, changed_gids=changed_idx, projector=self.projector)
             
             
             # predictions = _profile_block(
@@ -347,7 +348,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
         WPTS_m = torch.from_numpy(predictions[POINTS]).to(device=self.device)
 
         WPTS_m = rotate_points(predictions[POINTS], R_w2m, t_w2m)
-        Rmw, tmw, info = align_pointcloud_torch_fast(WPTS_m, inlier_dist=self.voxel_size*0.75)
+        Rmw, tmw, info = align_pointcloud_torch_fast(WPTS_m, inlier_dist=self.voxel_size*0.75, ransac_iters=200, point_chunk=5_000_000, cand_chunk=4096)
         WPTS_m = rotate_points(WPTS_m, Rmw, tmw)
         predictions[POINTS] = WPTS_m
 
@@ -370,12 +371,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
         #     return_flat=True
 
         # )   
-        feats = torch.from_numpy(to_numpy(predictions["view_feats"]))
-        feats = feats.to(device=self.device, dtype=torch.float32)  # (S, H, W,)
-        
-        predictions["view_feats"] = self.projector(feats)
-        
-        del feats
+
 
         end = time.time()
         length = end - start
@@ -628,18 +624,20 @@ class VoxelUpdaterSystem(pl.LightningModule):
         """
         cfg = self.cfg
         device = self.device
+        
         self.vox = LatentVoxelGrid(
             origin_xyz=np.zeros(3, dtype=np.float32),
             params=VoxelParams(voxel_size=self.voxel_size, promote_hits=2),
-            device=self.device, dtype=torch.float32
+            device=self.device, feature_dim=self.feature_dim
         )
+        
         
         self.vox = self.vox.to(self.device)
         
         self.vox_gt = TorchSparseVoxelGrid(
             origin_xyz=np.zeros(3, dtype=np.float32),
             params=VoxelParams(voxel_size=self.voxel_size, promote_hits=2),
-            device=self.device, dtype=torch.float32
+            device=self.device 
         )
         
 
