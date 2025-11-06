@@ -20,7 +20,7 @@ from voxel.covisibility import *
 from voxel.viz_utils import *
 from preprocess_images.filter_images import changed_images
 import os, shutil, json
-
+from voxel.latent_voxel import *
 
 
 GA_CACHE = {
@@ -192,6 +192,7 @@ def inference_with_features(
     device,
     batch_size: int = 8,
     verbose: bool = True,
+    projector=None
 ):
     """
     Run stock DUSt3R inference AND return per-image feature maps.
@@ -211,6 +212,7 @@ def inference_with_features(
     with _TapLastDecoder(model) as tap:
         out = dust3r_inference(pairs, model, device, batch_size=batch_size, verbose=verbose)
     dec1_all, dec2_all = tap.pop()  # [K,S,D] each
+
 
     # Safety: ensure we captured something
     if dec1_all is None or dec2_all is None:
@@ -250,6 +252,7 @@ def inference_with_features(
     feat_sums: List[Optional[torch.Tensor]] = [None] * N
     feat_cnts: List[int] = [0] * N
 
+
     # iterate pairs and accumulate per-image maps
     for k in range(K):
         # network input H,W from the actual tensor fed into the model
@@ -274,6 +277,20 @@ def inference_with_features(
         # build feat maps for both views
         fm1 = _tokens_to_featmap(dec1_all[k], (H1net, W1net), (ph, pw), target_hw=(H1t, W1t))  # [D,H1t,W1t]
         fm2 = _tokens_to_featmap(dec2_all[k], (H2net, W2net), (ph, pw), target_hw=(H2t, W2t))  # [D,H2t,W2t]
+
+
+
+
+        if projector is not None:
+            # project tokens first (much smaller)
+            tok1_small = projector(dec1_all[k])   # dec1_all[k]: [S,768] -> [S,64]
+            tok2_small = projector(dec2_all[k])   # [S,64]
+
+            # now reshape to spatial maps (64 channels)
+            fm1 = _tokens_to_featmap(tok1_small, (H1net, W1net), (ph, pw), target_hw=(H1t, W1t))
+            fm2 = _tokens_to_featmap(tok2_small, (H2net, W2net), (ph, pw), target_hw=(H2t, W2t))
+
+
 
         i = v1_idx[k]
         j = v2_idx[k]
@@ -2137,7 +2154,7 @@ def get_reconstructed_scene(
 def get_reconstructed_scene_no_opt(
     itr, outdir, imgs, model, device, silent, image_size, filelist, schedule, niter, min_conf_thr,
     as_pointcloud, mask_sky, clean_depth, transparent_cams, cam_size,
-    scenegraph_type, winsize, refid, changed_gids=None, tau=0.45
+    scenegraph_type, winsize, refid, changed_gids=None, tau=0.45, projector=None
 ):
     """
     Iter 0: pass ALL images, each with d['gid'] = its global index (0..N-1).
@@ -2177,7 +2194,7 @@ def get_reconstructed_scene_no_opt(
         # pairs = [(imgs_clean[0], imgs_clean[1]), (imgs_clean[0], imgs_clean[2])]
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
             output, view_feats = inference_with_features(
-                        pairs, model, device, batch_size=4, verbose=not silent
+                        pairs, model, device, batch_size=4, verbose=not silent, projector=projector
                     )
 
         mode = GlobalAlignerMode.PointCloudOptimizer if len(imgs) > 2 else GlobalAlignerMode.PairViewer
@@ -2354,7 +2371,7 @@ def get_reconstructed_scene_no_opt(
     if len(pairs_to_run):
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
             out_delta, view_feats = inference_with_features(
-                pairs_to_run, model, device, batch_size=4, verbose=not silent
+                pairs_to_run, model, device, batch_size=4, verbose=not silent, projector=projector
             )        
     else:
         # fabricate an empty structure with lists

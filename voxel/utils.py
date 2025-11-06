@@ -1869,6 +1869,7 @@ def build_maps_from_latent_features(
 
     batch_chunk_points: int | None = None,  # e.g., 2_000_000 to limit RAM
     frame_ids: Optional[torch.Tensor] = None,  # NEW
+    radius=0.25,
 
 ):
 
@@ -1894,7 +1895,6 @@ def build_maps_from_latent_features(
         tvox.initialize_latents_from_full_cloud(
             pts_world=pts, f_pts=fts)
     else:
-        radius = 0.25
         if batch_chunk_points is None or pts.shape[0] <= batch_chunk_points:
             tvox.update_with_features(
                                 pts,  # (N,3)
@@ -2054,7 +2054,7 @@ def save_bev(bev: np.ndarray, meta: dict, png_path="bev.png", npy_path="bev.npy"
     pathlib.Path(meta_path).write_text(json.dumps(meta, indent=2))
 
 
-def export_occupied_voxels_as_ply(vox: SparseVoxelGrid, path: str = "voxels.ply", z_band: Tuple[float,float] = (0.0, 3.0)):
+def export_occupied_voxels_as_ply(vox, path: str = "voxels.ply", z_band: Tuple[float,float] = (0.0, 3.0)):
     """Write occupied voxel centers to an ASCII PLY (for MeshLab/CloudCompare)."""
     occ = vox.occupied_voxels(zmin=z_band[0], zmax=z_band[1])
     centers = np.array([vox.ijk_to_center(ijk) for ijk in occ], dtype=np.float32)
@@ -2105,7 +2105,7 @@ def export_occupied_voxels(vox, ply_path="voxels.ply", npy_path="voxels_ijk.npy"
         centers = np.array([vox.ijk_to_center(tuple(ijk)) for ijk in occ_ijk], dtype=np.float32)
     else:
         # fallback: center = origin + (ijk + 0.5) * voxel_size
-        origin = np.asarray(vox.origin.detach().cpu().numpy(), dtype=np.float32).reshape(3)
+        origin = np.asarray(vox.origin.detach().float().cpu().numpy(), dtype=np.float32).reshape(3)
         sx, sy, sz = _to_tuple3(getattr(vox.p, "voxel_size"))
         centers = origin[None, :] + (occ_ijk.astype(np.float32) + 0.5) * np.array([sx, sy, sz], dtype=np.float32)
 
@@ -2123,7 +2123,7 @@ def export_occupied_voxels(vox, ply_path="voxels.ply", npy_path="voxels_ijk.npy"
     np.save(npy_path, occ_ijk)
 
     # --- write JSON meta for alignment/eval ---
-    origin_xyz = np.asarray(vox.origin.detach().cpu().numpy(), dtype=float).tolist()
+    origin_xyz = np.asarray(vox.origin.detach().float().cpu().numpy(), dtype=float).tolist()
     voxel_size_xyz = _to_tuple3(getattr(vox.p, "voxel_size"))
     meta = {
         "origin_xyz": tuple(origin_xyz),
