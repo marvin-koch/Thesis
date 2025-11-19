@@ -798,7 +798,9 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
         for t in range(T):
             imgs = batch["imgs_t"][t]
-            bev_gt = self.inference_gt(t, imgs)
+            
+            with torch.enable_grad():
+                bev_gt = self.inference_gt(t, imgs)
 
             with torch.no_grad():
                 bev    = self.inference(t, imgs)
