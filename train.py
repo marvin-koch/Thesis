@@ -738,6 +738,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
             # --- per-timestep backward + step ---
             opt.zero_grad(set_to_none=True)
             self.manual_backward(loss_t)
+            torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
+
             opt.step()
             
             
@@ -1101,7 +1103,7 @@ def main():
     trainer = pl.Trainer(
         max_epochs=cfg.max_epochs,
         precision=cfg.precision,
-        gradient_clip_val=1.0,
+        #gradient_clip_val=1.0,
         log_every_n_steps=1,
         callbacks=[ckpt_cb, lr_cb],
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
