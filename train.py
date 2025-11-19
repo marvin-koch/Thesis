@@ -187,6 +187,9 @@ class VoxelUpdaterSystem(pl.LightningModule):
         
         self.projector = FeatureProjector(out_dim=self.feature_dim)
 
+
+        self.automatic_optimization = False   # <<< add this
+
     def configure_optimizers(self):
         params = list(self.vox.sim_net.parameters()) + \
                  list(self.vox.gru_cell.parameters()) + \
@@ -634,7 +637,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
         """
         cfg = self.cfg
         device = self.device
-        
+        opt = self.optimizers()
+
         self.vox = LatentVoxelGrid(
             origin_xyz=np.zeros(3, dtype=np.float32),
             params=VoxelParams(voxel_size=self.voxel_size, promote_hits=2),
@@ -729,8 +733,17 @@ class VoxelUpdaterSystem(pl.LightningModule):
             loss_t = cfg.lambda_occ * loss_occ + cfg.lambda_temp * loss_temp \
                      + cfg.lambda_ent * loss_ent + cfg.lambda_tv * loss_tv
 
-            loss_total = loss_total + loss_t
+
+
+            # --- per-timestep backward + step ---
+            opt.zero_grad(set_to_none=True)
+            self.manual_backward(loss_t)
+            opt.step()
             
+            
+            loss_total = loss_total + loss_t.detach()
+            
+            print(loss_t.detach())
             print(loss_total)
 
             # logging
@@ -742,8 +755,6 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 "stats/num_voxels": float(self.vox.keys.numel())
             }, prog_bar=(t == T-1), on_step=True, on_epoch=True, sync_dist=False)
                     
-            self.vox.z_latent = self.vox.z_latent.detach()
-            self.vox.z_latent.requires_grad_(True)
             
             
             torch.cuda.empty_cache()
