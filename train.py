@@ -442,7 +442,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
         del predictions  # drops images, view_feats, etc. all at once
 
         # after build_maps_from_latent_features(...)
-        del frames_map, conf_map, images_map, features_map
+        del frames_map, conf_map, images_map, features_map, image_tensors
         gc.collect()
 
         return bev
@@ -577,7 +577,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
         del predictions  # drops images, view_feats, etc. all at once
 
         # after build_maps_from_latent_features(...)
-        del frames_map, cam_centers_map, conf_map, images_map
+        del frames_map, cam_centers_map, conf_map, images_map, image_tensors
         gc.collect()
 
         return bev
