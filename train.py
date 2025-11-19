@@ -801,9 +801,9 @@ class VoxelUpdaterSystem(pl.LightningModule):
             
             with torch.enable_grad():
                 bev_gt = self.inference_gt(t, imgs)
+                bev    = self.inference(t, imgs)
 
             with torch.no_grad():
-                bev    = self.inference(t, imgs)
 
                 p_occ_tgt = self.vox_gt.vals_st
                 p_occ_pred = self.vox.decode_occupancy()
