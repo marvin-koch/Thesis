@@ -1035,7 +1035,7 @@ def main():
     cfg = TrainConfig(
         # dataset_root="/Users/marvin/Documents/Thesis/repo/dataset_generation/habitat/",
         #dataset_root="/home/mpk40/Documents/data/",
-        dataset_root="/cluster/scratch/kochmar/renders/",
+        dataset_root="/cluster/scratch/kochmar/renders2/",
         voxel_size=0.10,
         radius_m=0.25,
         topk=8,

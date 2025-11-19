@@ -859,6 +859,7 @@ class LatentVoxelGrid(nn.Module):
             # z_new = out[:, 0, :]     # (U, D)
 
             # z_new = self.ema_upd(x_in, z_sel)
+        z_new = z_new.to(self.z_latent.dtype)
 
 
         self.z_latent.index_copy_(0, idx_upd, z_new)
