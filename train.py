@@ -303,7 +303,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
             # stacked_predictions = []
             # for input_frames in [imgs]:
-            
+            print("inference pred")
             predictions = get_reconstructed_scene_no_opt(i, ".", imgs, self.model, self.device, False, 512, "", "linear", 100, 1, True, False, True, False, 0.05, "oneref", 1, 0, changed_gids=changed_idx, projector=self.projector)
             
             
@@ -657,6 +657,15 @@ class VoxelUpdaterSystem(pl.LightningModule):
        
         loss_total = torch.zeros([], device=device)
 
+        all_imgs = batch["imgs_t"]
+        numel = all_imgs.numel()
+        bytes_per_element = all_imgs.element_size()
+        total = numel * bytes_per_element
+        print(f"Tensor: shape={tuple(all_imgs.shape)}, dtype={all_imgs.dtype}")
+        print(f"  numel={numel:,}")
+        print(f"  element size={bytes_per_element} bytes")
+        print(f"  total={total/1024**2:.3f} MB ({total:,} bytes)")
+        
         # ---- iterate timesteps ----
         for t in range(T):
             
