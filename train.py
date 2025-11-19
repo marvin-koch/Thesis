@@ -758,7 +758,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
             }, prog_bar=(t == T-1), on_step=True, on_epoch=True, sync_dist=False)
                     
             
-            
+            self.vox.z_latent = self.vox.z_latent.detach()
+
             torch.cuda.empty_cache()
         
         self.log("loss/total", loss_total, prog_bar=True)
