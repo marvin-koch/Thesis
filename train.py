@@ -657,14 +657,14 @@ class VoxelUpdaterSystem(pl.LightningModule):
        
         loss_total = torch.zeros([], device=device)
 
-        all_imgs = batch["imgs_t"]
-        numel = all_imgs.numel()
-        bytes_per_element = all_imgs.element_size()
-        total = numel * bytes_per_element
-        print(f"Tensor: shape={tuple(all_imgs.shape)}, dtype={all_imgs.dtype}")
-        print(f"  numel={numel:,}")
-        print(f"  element size={bytes_per_element} bytes")
-        print(f"  total={total/1024**2:.3f} MB ({total:,} bytes)")
+        # all_imgs = batch["imgs_t"]
+        # numel = all_imgs.numel()
+        # bytes_per_element = all_imgs.element_size()
+        # total = numel * bytes_per_element
+        # print(f"Tensor: shape={tuple(all_imgs.shape)}, dtype={all_imgs.dtype}")
+        # print(f"  numel={numel:,}")
+        # print(f"  element size={bytes_per_element} bytes")
+        # print(f"  total={total/1024**2:.3f} MB ({total:,} bytes)")
         
         # ---- iterate timesteps ----
         for t in range(T):
@@ -742,6 +742,10 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 "stats/num_voxels": float(self.vox.keys.numel())
             }, prog_bar=(t == T-1), on_step=True, on_epoch=True, sync_dist=False)
                     
+            self.vox.z_latent = self.vox.z_latent.detach()
+            self.vox.z_latent.requires_grad_(True)
+            
+            
             torch.cuda.empty_cache()
         
         self.log("loss/total", loss_total, prog_bar=True)
