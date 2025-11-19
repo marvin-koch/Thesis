@@ -861,7 +861,7 @@ class LatentVoxelGrid(nn.Module):
             # z_new = self.ema_upd(x_in, z_sel)
 
 
-            self.z_latent.index_copy_(0, idx_upd, z_new)
+        self.z_latent.index_copy_(0, idx_upd, z_new)
             
             # self.z_latent = self.gru_cell(x_in, self.z_latent)
         torch.cuda.synchronize()
