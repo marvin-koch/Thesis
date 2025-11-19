@@ -770,6 +770,73 @@ class VoxelUpdaterSystem(pl.LightningModule):
         return loss_total
     
     
+    
+    def validation_step(self, batch: Dict, batch_idx: int):
+        device = self.device
+
+        cfg = self.cfg
+
+        self.vox = LatentVoxelGrid(
+            origin_xyz=np.zeros(3, dtype=np.float32),
+            params=VoxelParams(voxel_size=self.voxel_size, promote_hits=2),
+            device=self.device, feature_dim=self.feature_dim
+        )
+        
+        
+        self.vox = self.vox.to(self.device)
+        
+        self.vox_gt = TorchSparseVoxelGrid(
+            origin_xyz=np.zeros(3, dtype=np.float32),
+            params=VoxelParams(voxel_size=self.voxel_size, promote_hits=2),
+            device=self.device 
+        )
+        
+        # no optimizer / manual_backward here
+        T = batch["timesteps"]
+
+        val_loss_total = torch.zeros([], device=device)
+
+        for t in range(T):
+            imgs = batch["imgs_t"][t]
+            bev_gt = self.inference_gt(t, imgs)
+
+            with torch.no_grad():
+                bev    = self.inference(t, imgs)
+
+                p_occ_tgt = self.vox_gt.vals_st
+                p_occ_pred = self.vox.decode_occupancy()
+                p_occ_tgt  = self.align_probs_to_keys(
+                    self.vox_gt.keys, p_occ_tgt, self.vox.keys, default=0.5
+                )
+
+                loss_occ = F.binary_cross_entropy(
+                    p_occ_pred.clamp(1e-5, 1 - 1e-5),
+                    p_occ_tgt.clamp(1e-5, 1 - 1e-5),
+                )
+                
+                   
+                if (t == 0) or (self._prev_keys is None):
+                    loss_temp = torch.tensor(0.0, device=self.device)
+                else:
+                    prev_aligned = self.align_probs_to_keys(self._prev_keys, self._prev_probs,
+                                                    self.vox.keys, default=0.5)
+                    logit_now  = torch.logit(p_occ_pred.clamp(1e-5, 1-1e-5))
+                    logit_prev = torch.logit(prev_aligned.clamp(1e-5, 1-1e-5))
+                    loss_temp = F.smooth_l1_loss(logit_now, logit_prev, beta=0.1)
+
+                # update buffers for next step
+                self._prev_keys  = self.vox.keys.detach().clone()
+                self._prev_probs = p_occ_pred.detach().clone()
+                
+                
+                loss_t = cfg.lambda_occ * loss_occ + cfg.lambda_temp * loss_temp \
+
+            val_loss_total += loss_t
+
+        self.log("val/loss_total", val_loss_total, prog_bar=True)
+        return val_loss_total
+
+    
 # dataset_auto.py
 import os, re, random
 from typing import List, Dict, Optional, Tuple
@@ -1033,7 +1100,7 @@ class HabitatDataModule(pl.LightningDataModule):
         return DataLoader(
             self.train_set,
             batch_size=self.batch_size,              # keep 1 if your step assumes one sequence
-            shuffle=True,
+            shuffle=False,
             num_workers=self.num_workers,
             pin_memory=True,
             collate_fn=self._collate_one_seq
@@ -1084,7 +1151,7 @@ def main():
         num_workers=cfg.num_workers,
         size=512,
         verbose=False,
-        train_val_split=0.0,  # or whatever you want
+        train_val_split=0.1,  # or whatever you want
     )
 
     sys = VoxelUpdaterSystem(cfg)
@@ -1106,6 +1173,8 @@ def main():
         precision=cfg.precision,
         #gradient_clip_val=1.0,
         log_every_n_steps=1,
+        check_val_every_n_epoch=2,
+
         callbacks=[ckpt_cb, lr_cb],
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=1,
