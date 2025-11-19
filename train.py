@@ -41,6 +41,8 @@ import gc
 import torch.serialization as serialization
 import argparse
 
+import wandb
+from pytorch_lightning.loggers import WandbLogger
 
 serialization.add_safe_globals([argparse.Namespace])
 
@@ -1169,6 +1171,15 @@ def main():
  
     print(">>> before Trainer()", flush=True)
 
+
+    # --- Wandb logger ---
+    wandb_logger = WandbLogger(
+        project="voxel_dust3r",          # choose a project name
+        name="voxup-manualopt",          # optional run name
+        config=cfg.__dict__,             # logs all your hyperparams
+        save_dir="./wandb_logs",         # where to put local files
+    )
+
  
     trainer = pl.Trainer(
         max_epochs=cfg.max_epochs,
@@ -1181,6 +1192,8 @@ def main():
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=1,
         enable_progress_bar=True,
+        logger=wandb_logger,          # <<< add this
+
 
     )
     print(">>> before trainer.fit()", flush=True)
