@@ -662,7 +662,9 @@ class VoxelUpdaterSystem(pl.LightningModule):
             print(f"=============================timestep {t}=============================")
             imgs = batch["imgs_t"][t]          # <--- this is your old `imgs`
 
-            bev_gt = self.inference_gt(t, imgs)
+            with torch.no_grad():
+                bev_gt = self.inference_gt(t, imgs)
+                
             bev = self.inference(t, imgs)
         
 
