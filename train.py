@@ -510,67 +510,68 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
 
         start = time.time()
-        
-        WPTS_m = torch.from_numpy(predictions[POINTS]).to(device=self.device)
+        with torch.no_grad():
 
-        WPTS_m = rotate_points(predictions[POINTS], R_w2m, t_w2m)
-        Rmw, tmw, info = align_pointcloud_torch_fast(WPTS_m, inlier_dist=self.voxel_size*0.75)
-        WPTS_m = rotate_points(WPTS_m, Rmw, tmw)
-        predictions[POINTS] = WPTS_m
+            WPTS_m = torch.from_numpy(predictions[POINTS]).to(device=self.device)
+
+            WPTS_m = rotate_points(predictions[POINTS], R_w2m, t_w2m)
+            Rmw, tmw, info = align_pointcloud_torch_fast(WPTS_m, inlier_dist=self.voxel_size*0.75)
+            WPTS_m = rotate_points(WPTS_m, Rmw, tmw)
+            predictions[POINTS] = WPTS_m
 
 
-        camera_R = R_w2m @ Rmw
-        camera_t = t_w2m + tmw
-        frames_map, cam_centers_map, conf_map, images_map, _, (S,H,W), frame_ids = build_frames_and_centers_vectorized_torch(
-            predictions,
-            POINTS=POINTS,
-            CONF=CONF,
-            # IMG="images",
-            threshold=threshold,
-            Rmw=camera_R, tmw=camera_t,
-            z_clip_map=z_clip_map,   # or None
-            return_flat=True
+            camera_R = R_w2m @ Rmw
+            camera_t = t_w2m + tmw
+            frames_map, cam_centers_map, conf_map, images_map, _, (S,H,W), frame_ids = build_frames_and_centers_vectorized_torch(
+                predictions,
+                POINTS=POINTS,
+                CONF=CONF,
+                # IMG="images",
+                threshold=threshold,
+                Rmw=camera_R, tmw=camera_t,
+                z_clip_map=z_clip_map,   # or None
+                return_flat=True
 
-        )   
-        end = time.time()
-        length = end - start
+            )   
+            end = time.time()
+            length = end - start
 
-        print("Aligning and building frames/camera centers took", length, "seconds!")
+            print("Aligning and building frames/camera centers took", length, "seconds!")
 
-        start = time.time()
+            start = time.time()
 
-        align_to_voxel = False #(i > 0)
-    
-        
-        vox, bev, meta = build_maps_from_points_and_centers_torch(
-            frames_map,
-            cam_centers_map,
-            conf_map,
-            self.vox_gt,
-            align_to_voxel=align_to_voxel,
-            voxel_size=self.voxel_size,           # 10 cm
-            bev_window_m=(5.0, 5.0), # local 20x20 m
-            bev_origin_xy=(-2.0, -2.0),
-            z_clip_vox=(-np.inf, np.inf),
-            z_band_bev=(0.02, 0.5),
-            samples_per_voxel=0.7,#1,
-            ray_stride=6,#2,
-            max_free_rays=10000,
-            frame_ids=frame_ids
-        )
-
-        self.vox_gt = vox
-    
-            
-        end = time.time()
-        length = end - start
-
-        print("Building Voxel and BEV took", length, "seconds!")
-
+            align_to_voxel = False #(i > 0)
         
             
-        self.vox_gt.next_epoch()
+            vox, bev, meta = build_maps_from_points_and_centers_torch(
+                frames_map,
+                cam_centers_map,
+                conf_map,
+                self.vox_gt,
+                align_to_voxel=align_to_voxel,
+                voxel_size=self.voxel_size,           # 10 cm
+                bev_window_m=(5.0, 5.0), # local 20x20 m
+                bev_origin_xy=(-2.0, -2.0),
+                z_clip_vox=(-np.inf, np.inf),
+                z_band_bev=(0.02, 0.5),
+                samples_per_voxel=0.7,#1,
+                ray_stride=6,#2,
+                max_free_rays=10000,
+                frame_ids=frame_ids
+            )
+
+            self.vox_gt = vox
         
+                
+            end = time.time()
+            length = end - start
+
+            print("Building Voxel and BEV took", length, "seconds!")
+
+            
+                
+            self.vox_gt.next_epoch()
+            
         
           # after build_frames_and_centers_vectorized(...)
         del predictions  # drops images, view_feats, etc. all at once
@@ -662,8 +663,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
             print(f"=============================timestep {t}=============================")
             imgs = batch["imgs_t"][t]          # <--- this is your old `imgs`
 
-            with torch.no_grad():
-                bev_gt = self.inference_gt(t, imgs)
+            bev_gt = self.inference_gt(t, imgs)
                 
             bev = self.inference(t, imgs)
         
