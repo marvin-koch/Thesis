@@ -8,7 +8,6 @@ import torch.nn as nn
 import numpy as np
 import time
 
-import faiss
 from pytorch3d.ops import knn_points, ball_query
 torch.set_float32_matmul_precision("high")
 torch.backends.cuda.matmul.allow_tf32 = True

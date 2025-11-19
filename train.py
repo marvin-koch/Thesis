@@ -38,7 +38,15 @@ import os, shutil, json
 import traceback
 from torch.profiler import profile, ProfilerActivity
 import gc
+import torch.serialization as serialization
+import argparse
 
+
+serialization.add_safe_globals([argparse.Namespace])
+
+import logging
+
+logging.getLogger("pytorch_lightning").setLevel(logging.DEBUG)
 def _dump_prof(prof, tag="trace"):
     try:
         prof.export_chrome_trace(f"{tag}.json")
@@ -166,6 +174,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
         )
         
         weights_path = "naver/" + "DUSt3R_ViTLarge_BaseDecoder_512_dpt"
+        weights_path = "/cluster/home/kochmar/Thesis/" + "DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth"
         self.model = AsymmetricCroCo3DStereo.from_pretrained(weights_path)
 
         self.model.eval()
@@ -757,16 +766,128 @@ def _list_imgs(path: str, exts={".png",".jpg",".jpeg",".bmp",".tif",".tiff",".we
     files.sort(key=_natural_key)
     return files
 
+#def _sequence_dirs_from_root(root: str) -> List[str]:
+#    seqs = _list_dirs(root)
+#    # also support 'flat' root as one sequence if it directly has images
+#    if _list_imgs(root):
+#        seqs = [root] + seqs
+#    if not seqs:
+#        raise FileNotFoundError(f"No sequences found under: {root}")
+#    return seqs
+
+
+
+#def _sequence_dirs_from_root(root: str) -> List[str]:
+#    """
+#    Discover all 'sequence' folders under `root`, possibly nested.
+#
+#    A directory D is considered a sequence if:
+#      - it has at least one *immediate* subdirectory that directly contains images
+#        (those children will be timesteps), OR
+#      - it directly contains images itself AND is not inside such a 'parent sequence'
+#        (flat layout: one timestep per sequence).
+#
+#    Among all candidates we keep only the deepest relevant ones to avoid
+#    double-counting (i.e. no ancestor/descendant duplicates).
+#    """
+#    root = os.path.normpath(root)
+#
+#    # 1) candidates where *children* contain images -> "scene with timestep folders"
+#    parent_candidates = set()
+#
+#    for dirpath, dirnames, _ in os.walk(root):
+#        print(dirpath)
+#        dirpath = os.path.normpath(dirpath)
+#        # skip hidden dirs if you want:
+#        # dirnames[:] = [d for d in dirnames if not d.startswith('.')]
+#        for d in dirnames:
+#            child = os.path.join(dirpath, d)
+#            if _list_imgs(child):  # child directly has images => dirpath is a scene
+#                parent_candidates.add(dirpath)
+#                break
+#
+#    def _keep_deepest_only(paths: List[str]) -> List[str]:
+#        """Remove ancestors if a deeper descendant is also a sequence."""
+#        paths = [os.path.normpath(p) for p in paths]
+#        # sort by depth: deepest first
+#        paths.sort(key=lambda p: p.count(os.sep), reverse=True)
+#        kept: List[str] = []
+#        for p in paths:
+#            if not any(other != p and p.startswith(other + os.sep) for other in kept):
+#                kept.append(p)
+#        return kept
+#
+#    parent_candidates = set(_keep_deepest_only(list(parent_candidates)))
+#
+#    # 2) flat sequences: dirs that have images themselves and are NOT inside a parent_candidate
+#    flat_candidates = set()
+#    for dirpath, _, _ in os.walk(root):
+#        print(dirpath)
+#        dirpath = os.path.normpath(dirpath)
+#        if _list_imgs(dirpath):
+#            # skip if this dir is a parent sequence already or lies inside one
+#            if any(dirpath == p or dirpath.startswith(p + os.sep) for p in parent_candidates):
+#                continue
+#            flat_candidates.add(dirpath)
+#
+#    seqs = list(parent_candidates | flat_candidates)
+#    if not seqs:
+#        raise FileNotFoundError(f"No sequences found under: {root}")
+#
+#    # stable sort by basename using natural order (scene1, scene2, ..., scene10)
+#    seqs.sort(key=lambda p: _natural_key(os.path.basename(p)))
+#    return seqs
+#
+
+
+import os
+from typing import List
+
+IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"}
+
+
+def _has_image(filenames):
+    return any(os.path.splitext(f)[1].lower() in IMG_EXTS for f in filenames)
+
+
 def _sequence_dirs_from_root(root: str) -> List[str]:
-    """Each immediate subdir of root is a sequence. If root itself contains images,
-    treat root as a single sequence as well."""
-    seqs = _list_dirs(root)
-    # also support 'flat' root as one sequence if it directly has images
-    if _list_imgs(root):
-        seqs = [root] + seqs
-    if not seqs:
+    """
+    For layouts like:
+
+        root/
+          scene1/.../sub_scene_X/
+            time0/
+              img.*
+            time1/
+              img.*
+          scene2/.../sub_scene_Y/
+            time0/
+              img.*
+
+    A 'sequence' is defined as the *parent directory* of any `time*` folder
+    that actually contains images. There can be many sub-scenes and arbitrary
+    nesting above them.
+    """
+    root = os.path.normpath(root)
+    sequence_dirs = set()
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirpath = os.path.normpath(dirpath)
+        base = os.path.basename(dirpath)
+
+        # We only care about timestep folders like time0, time1, ...
+        if base.startswith("time"):
+            if _has_image(filenames):      # or skip this check if you fully trust structure
+                parent = os.path.dirname(dirpath)
+                sequence_dirs.add(parent)
+
+    if not sequence_dirs:
         raise FileNotFoundError(f"No sequences found under: {root}")
+
+    # Natural sort by basename: scene1_sub1, scene1_sub2, ..., scene10_sub3
+    seqs = sorted(sequence_dirs, key=lambda p: _natural_key(os.path.basename(p)))
     return seqs
+
 
 # ---------- dataset ----------
 class HabitatSeqDataset(Dataset):
@@ -809,6 +930,8 @@ class HabitatSeqDataset(Dataset):
         return li(img_paths, size=self.size, verbose=self.verbose)
 
     def __getitem__(self, idx: int) -> Dict:
+        print(">>> sample loaded", flush=True)
+
         seq_dir = self.seq_paths[idx]
         t_dirs = self._list_timesteps(seq_dir)
 
@@ -853,7 +976,9 @@ class HabitatDataModule(pl.LightningDataModule):
         self.val_set = None
 
     def setup(self, stage: Optional[str] = None):
+        print("getting seqs")
         all_seqs = _sequence_dirs_from_root(self.dataset_root)
+        print("got seqs")
         if self.train_val_split > 0.0:
             random.Random(self.seed).shuffle(all_seqs)
             n_val = max(1, int(len(all_seqs) * self.train_val_split))
@@ -909,7 +1034,8 @@ def main():
     # Fill your paths here or read from CLI/yaml
     cfg = TrainConfig(
         # dataset_root="/Users/marvin/Documents/Thesis/repo/dataset_generation/habitat/",
-        dataset_root="/home/mpk40/Documents/data/",
+        #dataset_root="/home/mpk40/Documents/data/",
+        dataset_root="/cluster/scratch/kochmar/renders/",
         voxel_size=0.10,
         radius_m=0.25,
         topk=8,
@@ -943,6 +1069,8 @@ def main():
     lr_cb = pl.callbacks.LearningRateMonitor(logging_interval="step")
 
  
+    print(">>> before Trainer()", flush=True)
+
  
     trainer = pl.Trainer(
         max_epochs=cfg.max_epochs,
@@ -952,7 +1080,11 @@ def main():
         callbacks=[ckpt_cb, lr_cb],
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=1,
+        enable_progress_bar=True,
+
     )
+    print(">>> before trainer.fit()", flush=True)
+
     trainer.fit(sys, dm)
 if __name__ == "__main__":
     main()
