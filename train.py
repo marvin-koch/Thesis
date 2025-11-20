@@ -798,7 +798,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
         val_loss_total = torch.zeros([], device=device)
 
-        for n, t in enumerate(T):
+        for t in range(T):
             
             print(f"=============================timestep {t}=============================")
 
