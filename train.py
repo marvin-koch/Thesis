@@ -798,7 +798,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
         val_loss_total = torch.zeros([], device=device)
 
-        for t in range(T):
+        for n, t in enumerate(T):
             
             print(f"=============================timestep {t}=============================")
 
@@ -808,6 +808,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
             with torch.enable_grad():
 
                 bev_gt = self.inference_gt(t, imgs)
+          
                 bev    = self.inference(t, imgs)
 
 
@@ -838,6 +839,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
             
             
             loss_t = cfg.lambda_occ * loss_occ + cfg.lambda_temp * loss_temp \
+
+            self.vox.z_latent = self.vox.z_latent.detach()
 
             val_loss_total += loss_t.detach()
 
