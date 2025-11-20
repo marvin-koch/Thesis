@@ -804,8 +804,11 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
             imgs = batch["imgs_t"][t]
         
-            bev_gt = self.inference_gt(t, imgs)
-            bev    = self.inference(t, imgs)
+        
+            with torch.enable_grad():
+
+                bev_gt = self.inference_gt(t, imgs)
+                bev    = self.inference(t, imgs)
 
 
             p_occ_tgt = self.vox_gt.vals_st
@@ -836,7 +839,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
             
             loss_t = cfg.lambda_occ * loss_occ + cfg.lambda_temp * loss_temp \
 
-            val_loss_total += loss_t
+            val_loss_total += loss_t.detach()
 
         self.log("val/loss_total", val_loss_total, prog_bar=True)
         return val_loss_total
@@ -1185,8 +1188,6 @@ def main():
     trainer = pl.Trainer(
         max_epochs=cfg.max_epochs,
         precision=cfg.precision,
-        inference_mode=False,   # <— IMPORTANT
-
         #gradient_clip_val=1.0,
         log_every_n_steps=1,
         check_val_every_n_epoch=2,
