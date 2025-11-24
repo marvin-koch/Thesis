@@ -843,6 +843,10 @@ class VoxelUpdaterSystem(pl.LightningModule):
             self.vox.z_latent = self.vox.z_latent.detach()
 
             val_loss_total += loss_t.detach()
+            
+            
+            torch.cuda.empty_cache()
+
 
         self.log("val/loss_total", val_loss_total, prog_bar=True)
         return val_loss_total
@@ -1142,7 +1146,7 @@ def main():
     cfg = TrainConfig(
         # dataset_root="/Users/marvin/Documents/Thesis/repo/dataset_generation/habitat/",
         #dataset_root="/home/mpk40/Documents/data/",
-        dataset_root="/cluster/scratch/kochmar/renders2/",
+        dataset_root="/cluster/scratch/kochmar/renders/",
         voxel_size=0.10,
         radius_m=0.25,
         topk=8,
