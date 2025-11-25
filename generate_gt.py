@@ -1,6 +1,12 @@
 import os
 import numpy as np
 import torch
+from train import HabitatSeqDataset
+import pow3r2.tools.path_to_dust3r
+from dust3r.model import AsymmetricCroCo3DStereo
+from dust3r.utils.image import load_images as li
+
+
 
 from voxel.voxel import TorchSparseVoxelGrid, VoxelParams
 from voxel.utils import *
@@ -9,11 +15,8 @@ from voxel.covisibility import *
 from voxel.viz_utils import *
 from preprocess_images.filter_images import changed_images
 
-from dust3r.model import AsymmetricCroCo3DStereo
-from dust3r.utils.image import load_images as li
-
 from tqdm import tqdm
-from train import HabitatSeqDataset
+
 from inference.utils import *
 
 
@@ -176,14 +179,13 @@ def build_gt_voxel_for_timestep(
     t_w2m = torch.from_numpy(t_w2m_np).to(device=device, dtype=torch.float32)
 
     # --- normalize images like in your inference_gt() ---
-    for d in imgs:
-        t = d["img"]  # (1,3,H,W) or (3,H,W)
-        if t.ndim == 4 and t.shape[0] == 1:
-            t = t[0]
-        t = t.float()
-        if t.max() > 1.0:
-            t = t / 255.0
-        d["img"] = t.clamp(0, 1)
+#    for d in imgs:
+#        t = d["img"]  # (1,3,H,W) or (3,H,W)
+
+#        t = t.float()
+#        if t.max() > 1.0:
+#            t = t / 255.0
+#        d["img"] = t.clamp(0, 1)
 
     # --- DUSt3R prediction ---
     predictions = get_reconstructed_scene_no_opt(0, ".", imgs, model, device, False, 512, "", "linear", 100, 1, True, False, True, False, 0.05, "oneref", 1, 0)
@@ -196,8 +198,8 @@ def build_gt_voxel_for_timestep(
             del predictions[k]
 
     # --- align points ---
-    WPTS_m = torch.from_numpy(predictions[POINTS]).to(device=device)
-    WPTS_m = rotate_points(WPTS_m, R_w2m, t_w2m)
+    WPTS_m = rotate_points(predictions[POINTS], R_w2m, t_w2m)
+
 
     Rmw, tmw, _ = align_pointcloud_torch_fast(
         WPTS_m,
@@ -291,7 +293,7 @@ def build_gt_voxel_for_timestep(
 
 
 def main():
-    dataset_root = "/cluster/scratch/kochmar/renders/"   # same as in your TrainConfig
+    dataset_root = "/cluster/scratch/kochmar/renders2/"   # same as in your TrainConfig
     voxel_size = 0.10
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -306,17 +308,15 @@ def main():
         dataset_root=dataset_root,
         size=512,
         verbose=False,
-        train_val_split=0.0,  # we just want all sequences
     )
-    dataset.setup()  # builds train_set and optional val_set
-    seqs = dataset.train_set
+    seqs = dataset.seq_paths
     print(f"[GT] Found {len(seqs)} sequences.")
 
     out_root = os.path.join(dataset_root, "gt_voxels_per_timestep")
     os.makedirs(out_root, exist_ok=True)
 
     for seq_idx in range(len(seqs)):
-        batch = seqs[seq_idx]        # __getitem__ returns dict with seq info
+        batch = dataset[seq_idx]        # __getitem__ returns dict with seq info
         seq_id = batch["seq_id"]
         imgs_t = batch["imgs_t"]
         T = batch["timesteps"]
