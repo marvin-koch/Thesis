@@ -47,6 +47,8 @@ from pytorch_lightning.loggers import WandbLogger
 serialization.add_safe_globals([argparse.Namespace])
 
 import logging
+from torch.cuda.amp import autocast
+
 
 logging.getLogger("pytorch_lightning").setLevel(logging.DEBUG)
 def _dump_prof(prof, tag="trace"):
@@ -180,7 +182,6 @@ class VoxelUpdaterSystem(pl.LightningModule):
         self.model = AsymmetricCroCo3DStereo.from_pretrained(weights_path)
 
         self.model.eval()
-        self.model.half()
 
         self.model = self.model.to(self.device)
         for p in self.model.parameters():
@@ -419,20 +420,20 @@ class VoxelUpdaterSystem(pl.LightningModule):
         #features_map = [vf_t[i] for i in range(vf.shape[0])]  # one vector per image
 
         # features_map = [pointnext_inference(preprocess_points(f,i)) for f, i in zip(frames_map, images_map)]
-
-        vox, bev, meta = build_maps_from_latent_features(
-            i,
-            frames_map,
-            conf_map,
-            features_map,
-            self.vox,
-            voxel_size=self.voxel_size,           # 10 cm
-            bev_window_m=(5.0, 5.0), # local 20x20 m
-            bev_origin_xy=(-2.0, -2.0),
-            z_clip_vox=(-np.inf, np.inf),
-            z_band_bev=(0.02, 0.5),
-            frame_ids=frame_ids
-        )
+        with autocast(enabled=False):
+            vox, bev, meta = build_maps_from_latent_features(
+                i,
+                frames_map,
+                conf_map,
+                features_map,
+                self.vox,
+                voxel_size=self.voxel_size,           # 10 cm
+                bev_window_m=(5.0, 5.0), # local 20x20 m
+                bev_origin_xy=(-2.0, -2.0),
+                z_clip_vox=(-np.inf, np.inf),
+                z_band_bev=(0.02, 0.5),
+                frame_ids=frame_ids
+            )
 
         self.vox = vox
     
@@ -549,23 +550,24 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
             align_to_voxel = False #(i > 0)
         
-            
-            vox, bev, meta = build_maps_from_points_and_centers_torch(
-                frames_map,
-                cam_centers_map,
-                conf_map,
-                self.vox_gt,
-                align_to_voxel=align_to_voxel,
-                voxel_size=self.voxel_size,           # 10 cm
-                bev_window_m=(5.0, 5.0), # local 20x20 m
-                bev_origin_xy=(-2.0, -2.0),
-                z_clip_vox=(-np.inf, np.inf),
-                z_band_bev=(0.02, 0.5),
-                samples_per_voxel=0.7,#1,
-                ray_stride=6,#2,
-                max_free_rays=10000,
-                frame_ids=frame_ids
-            )
+            with autocast(enabled=False):
+
+                vox, bev, meta = build_maps_from_points_and_centers_torch(
+                    frames_map,
+                    cam_centers_map,
+                    conf_map,
+                    self.vox_gt,
+                    align_to_voxel=align_to_voxel,
+                    voxel_size=self.voxel_size,           # 10 cm
+                    bev_window_m=(5.0, 5.0), # local 20x20 m
+                    bev_origin_xy=(-2.0, -2.0),
+                    z_clip_vox=(-np.inf, np.inf),
+                    z_band_bev=(0.02, 0.5),
+                    samples_per_voxel=0.7,#1,
+                    ray_stride=6,#2,
+                    max_free_rays=10000,
+                    frame_ids=frame_ids
+                 ) 
 
             self.vox_gt = vox
         
@@ -683,9 +685,9 @@ class VoxelUpdaterSystem(pl.LightningModule):
             print(f"=============================timestep {t}=============================")
             imgs = batch["imgs_t"][t]          # <--- this is your old `imgs`
 
-            bev_gt, R, t = self.inference_gt(t, imgs)
+            bev_gt, R, tw = self.inference_gt(t, imgs)
                 
-            bev = self.inference(t, imgs, Rmw=R, tmw=t)
+            bev = self.inference(t, imgs, Rmw=R, tmw=tw)
         
 
             p_occ_tgt = self.vox_gt.vals_st
@@ -812,35 +814,40 @@ class VoxelUpdaterSystem(pl.LightningModule):
         
             with torch.enable_grad():
 
-                bev_gt = self.inference_gt(t, imgs)
-          
-                bev    = self.inference(t, imgs)
+                bev_gt, R, tw = self.inference_gt(t, imgs)
+                
+                bev = self.inference(t, imgs, Rmw=R, tmw=tw)
+        
 
 
-            p_occ_tgt = self.vox_gt.vals_st
-            p_occ_pred = self.vox.decode_occupancy()
-            p_occ_tgt  = self.align_probs_to_keys(
-                self.vox_gt.keys, p_occ_tgt, self.vox.keys, default=0.5
-            )
+            with autocast(enabled=False):
+                p_occ_tgt = self.vox_gt.vals_st
+                p_occ_pred = self.vox.decode_occupancy()
+                p_occ_tgt  = self.align_probs_to_keys(
+                    self.vox_gt.keys, p_occ_tgt, self.vox.keys, default=0.5
+                )
 
-            loss_occ = F.binary_cross_entropy(
-                p_occ_pred.clamp(1e-5, 1 - 1e-5),
-                p_occ_tgt.clamp(1e-5, 1 - 1e-5),
-            )
+
+
+
+                loss_occ = F.binary_cross_entropy(
+                    p_occ_pred.clamp(1e-5, 1 - 1e-5),
+                    p_occ_tgt.clamp(1e-5, 1 - 1e-5),
+                )
             
             
-            if (t == 0) or (self._prev_keys is None):
-                loss_temp = torch.tensor(0.0, device=self.device)
-            else:
-                prev_aligned = self.align_probs_to_keys(self._prev_keys, self._prev_probs,
+                if (t == 0) or (self._prev_keys is None):
+                    loss_temp = torch.tensor(0.0, device=self.device)
+                else:
+                    prev_aligned = self.align_probs_to_keys(self._prev_keys, self._prev_probs,
                                                 self.vox.keys, default=0.5)
-                logit_now  = torch.logit(p_occ_pred.clamp(1e-5, 1-1e-5))
-                logit_prev = torch.logit(prev_aligned.clamp(1e-5, 1-1e-5))
-                loss_temp = F.smooth_l1_loss(logit_now, logit_prev, beta=0.1)
+                    logit_now  = torch.logit(p_occ_pred.clamp(1e-5, 1-1e-5))
+                    logit_prev = torch.logit(prev_aligned.clamp(1e-5, 1-1e-5))
+                    loss_temp = F.smooth_l1_loss(logit_now, logit_prev, beta=0.1)
 
-            # update buffers for next step
-            self._prev_keys  = self.vox.keys.detach().clone()
-            self._prev_probs = p_occ_pred.detach().clone()
+                # update buffers for next step
+                self._prev_keys  = self.vox.keys.detach().clone()
+                self._prev_probs = p_occ_pred.detach().clone()
             
             
             loss_t = cfg.lambda_occ * loss_occ + cfg.lambda_temp * loss_temp \
