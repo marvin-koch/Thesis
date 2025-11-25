@@ -51,6 +51,28 @@ from torch.cuda.amp import autocast
 
 
 logging.getLogger("pytorch_lightning").setLevel(logging.DEBUG)
+
+
+import numpy as np
+from voxel.voxel import TorchSparseVoxelGrid, VoxelParams
+
+def load_sparse_voxel_grid(path, device):
+    data = np.load(path)
+    origin = data["origin"].astype(np.float32)
+    voxel_size = float(data["voxel_size"][0])
+    keys = torch.from_numpy(data["keys"]).to(device)
+    vals = torch.from_numpy(data["vals"]).to(device, dtype=torch.float32)
+
+    vox_gt = TorchSparseVoxelGrid(
+        origin_xyz=origin,
+        params=VoxelParams(voxel_size=voxel_size, promote_hits=2),
+        device=device,
+    )
+    vox_gt.keys = keys
+    vox_gt.vals_st = vals
+    return vox_gt
+
+
 def _dump_prof(prof, tag="trace"):
     try:
         prof.export_chrome_trace(f"{tag}.json")
@@ -680,15 +702,35 @@ class VoxelUpdaterSystem(pl.LightningModule):
         # print(f"  total={total/1024**2:.3f} MB ({total:,} bytes)")
         
         # ---- iterate timesteps ----
+        seq_id = batch["seq_id"]
+
+        gt_root = os.path.join(self.cfg.dataset_root, "gt_voxels_per_timestep")
+        gt_seq = []
+        for t in range(T):
+            gt_path = os.path.join(gt_root, f"{seq_id}_t{t:04d}_gt.npz")
+            vox_gt_t = load_sparse_voxel_grid(gt_path, device)
+            gt_seq.append(vox_gt_t)
+            
         for t in range(T):
             
             print(f"=============================timestep {t}=============================")
             imgs = batch["imgs_t"][t]          # <--- this is your old `imgs`
 
-            bev_gt, R, tw = self.inference_gt(t, imgs)
+            # bev_gt, R, tw = self.inference_gt(t, imgs)
                 
-            bev = self.inference(t, imgs, Rmw=R, tmw=tw)
+                
+            # seq_id = batch["seq_id"]
+            # gt_path = os.path.join(
+            #     self.cfg.dataset_root,
+            #     "gt_voxels_per_timestep",
+            #     f"{seq_id}_t{t:04d}_gt.npz"
+            # )
+            # self.vox_gt = load_sparse_voxel_grid(gt_path, self.device)
+            
+            
+            bev = self.inference(t, imgs)
         
+            self.vox_gt = gt_seq[t]
 
             p_occ_tgt = self.vox_gt.vals_st
             # (D) decode current occupancy
@@ -805,6 +847,16 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
         val_loss_total = torch.zeros([], device=device)
 
+
+        seq_id = batch["seq_id"]
+
+        gt_root = os.path.join(self.cfg.dataset_root, "gt_voxels_per_timestep")
+        gt_seq = []
+        for t in range(T):
+            gt_path = os.path.join(gt_root, f"{seq_id}_t{t:04d}_gt.npz")
+            vox_gt_t = load_sparse_voxel_grid(gt_path, device)
+            gt_seq.append(vox_gt_t)
+            
         for t in range(T):
             
             print(f"=============================timestep {t}=============================")
@@ -812,11 +864,22 @@ class VoxelUpdaterSystem(pl.LightningModule):
             imgs = batch["imgs_t"][t]
         
         
+        
+            # seq_id = batch["seq_id"]
+            # gt_path = os.path.join(
+            #     self.cfg.dataset_root,
+            #     "gt_voxels_per_timestep",
+            #     f"{seq_id}_t{t:04d}_gt.npz"
+            # )
+            # self.vox_gt = load_sparse_voxel_grid(gt_path, self.device)
+            self.vox_gt = gt_seq[t]
+
+        
             with torch.enable_grad():
 
-                bev_gt, R, tw = self.inference_gt(t, imgs)
+                # bev_gt, R, tw = self.inference_gt(t, imgs)
                 
-                bev = self.inference(t, imgs, Rmw=R, tmw=tw)
+                bev = self.inference(t, imgs)
         
 
 
