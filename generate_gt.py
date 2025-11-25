@@ -9,6 +9,7 @@ from voxel.covisibility import *
 from voxel.viz_utils import *
 from preprocess_images.filter_images import changed_images
 
+import pow3r2.tools.path_to_dust3r
 from dust3r.model import AsymmetricCroCo3DStereo
 from dust3r.utils.image import load_images as li
 
