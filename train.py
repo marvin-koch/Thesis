@@ -1167,8 +1167,17 @@ class HabitatSeqDataset(Dataset):
         if not imgs_t:
             raise RuntimeError(f"No images found for sequence: {seq_dir}")
 
+        p = seq_dir.rstrip("/")
+
+        basis = os.path.basename(os.path.dirname(p))           # "kfPV7w3FaU5.basis"
+        basis = basis.replace(".basis", "")                    # "kfPV7w3FaU5"
+
+        final = os.path.basename(p)                            # "0"
+
+        seq_id = f"{basis}_{final}"
+
         return {
-            "seq_id": os.path.basename(seq_dir.rstrip("/")),
+            "seq_id": seq_id,
             "seq_path": seq_dir,
             "timesteps": len(imgs_t),
             "imgs_t": imgs_t,   # List[List[dict]]; each inner list is what your inference() expects

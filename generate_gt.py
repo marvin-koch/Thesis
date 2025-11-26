@@ -155,7 +155,6 @@ def save_sparse_voxel_grid(grid: TorchSparseVoxelGrid, path: str):
 
 
 
-@torch.no_grad()
 def build_gt_voxel_for_timestep(
     imgs,
     model: AsymmetricCroCo3DStereo,
@@ -189,7 +188,7 @@ def build_gt_voxel_for_timestep(
 #        d["img"] = t.clamp(0, 1)
 
     # --- DUSt3R prediction ---
-    predictions = get_reconstructed_scene_no_opt(0, ".", imgs, model, device, False, 512, "", "linear", 100, 1, True, False, True, False, 0.05, "oneref", 1, 0)
+    predictions = get_reconstructed_scene_no_opt(0, ".", imgs, model, device, False, 512, "", "linear", 50, 1, True, False, True, False, 0.05, "oneref", 1, 0)
 
 
     # keep only needed keys
@@ -294,7 +293,7 @@ def build_gt_voxel_for_timestep(
 
 
 def main():
-    dataset_root = "/cluster/scratch/kochmar/renders2/"   # same as in your TrainConfig
+    dataset_root = "/cluster/scratch/kochmar/renders/"   # same as in your TrainConfig
     voxel_size = 0.10
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -320,11 +319,17 @@ def main():
         batch = dataset[seq_idx]        # __getitem__ returns dict with seq info
         seq_id = batch["seq_id"]
         imgs_t = batch["imgs_t"]
+        print(seq_id)
+        print(batch["seq_path"])
         T = batch["timesteps"]
 
         print(f"\n[GT] Sequence {seq_idx+1}/{len(seqs)}: {seq_id} (T={T})")
 
+
         for t, imgs in enumerate(imgs_t):
+            if t % 10 != 0:
+                continue
+
             out_path = os.path.join(out_root, f"{seq_id}_t{t:04d}_gt.npz")
             if os.path.exists(out_path):
                 print(f"[GT]   skip t={t} (exists)")

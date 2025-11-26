@@ -2194,7 +2194,7 @@ def get_reconstructed_scene_no_opt(
         # pairs = [(imgs_clean[0], imgs_clean[1]), (imgs_clean[0], imgs_clean[2])]
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
             output, view_feats = inference_with_features(
-                        pairs, model, device, batch_size=4, verbose=not silent, projector=projector
+                        pairs, model, device, batch_size=16, verbose=not silent, projector=projector
                     )
 
         mode = GlobalAlignerMode.PointCloudOptimizer if len(imgs) > 2 else GlobalAlignerMode.PairViewer
