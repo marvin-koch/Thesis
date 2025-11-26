@@ -743,9 +743,21 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
         gt_root = os.path.join(self.cfg.dataset_root, "gt_voxels_per_timestep")
         gt_seq = []
+        
+        # for t in range(T):
+        #     gt_path = os.path.join(gt_root, f"{seq_id}_t{t:04d}_gt.npz")
+        #     vox_gt_t = load_sparse_voxel_grid(gt_path, device)
+        #     gt_seq.append(vox_gt_t)
+            
+        if not os.path.exists(os.path.join(gt_root, f"{seq_id}_t{0:04d}_gt.npz")):
+            return loss_total
+
         for t in range(T):
             gt_path = os.path.join(gt_root, f"{seq_id}_t{t:04d}_gt.npz")
-            vox_gt_t = load_sparse_voxel_grid(gt_path, device)
+            if os.path.exists(gt_path):
+                vox_gt_t = load_sparse_voxel_grid(gt_path, device, self.voxel_size)
+            else:
+                vox_gt_t = None
             gt_seq.append(vox_gt_t)
             
         for t in range(T):
@@ -763,11 +775,14 @@ class VoxelUpdaterSystem(pl.LightningModule):
             #     f"{seq_id}_t{t:04d}_gt.npz"
             # )
             # self.vox_gt = load_sparse_voxel_grid(gt_path, self.device)
-            
+            self.vox_gt = gt_seq[t]
+
+            if self.vox_gt is None:
+                print("No GT voxel grid for this timestep, skipping.")
+                continue
             
             bev = self.inference(t, imgs)
         
-            self.vox_gt = gt_seq[t]
 
             p_occ_tgt = self.vox_gt.vals_st
             # (D) decode current occupancy
