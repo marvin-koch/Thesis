@@ -620,40 +620,77 @@ class VoxelUpdaterSystem(pl.LightningModule):
     #     centers = self.grid.origin + (self.grid._unhash_keys(self.grid.keys).float() + 0.5) * self.grid.p.voxel_size
     #     return self.decoder(self.grid.z_latent.to(self.device), centers.to(self.device))
     
-    def align_probs_to_keys(self, src_keys: torch.Tensor, src_probs: torch.Tensor,
-                            dst_keys: torch.Tensor, default: float = 0.5) -> torch.Tensor:
-        """
-        Map probs from (src_keys, src_probs) onto dst_keys order.
-        Any dst_key not found in src-> default.
-        Assumes both key tensors are 1D torch.int64 and (roughly) sorted.
-        """
-        # sort dst once to use searchsorted
-        dst_sorted, inv = torch.sort(dst_keys)          # inv maps sorted -> original order
-        # find positions where each dst_sorted would appear in src_keys
-        src_sorted, _ = torch.sort(src_keys)
-        pos = torch.searchsorted(src_sorted, dst_sorted)
+    # def align_probs_to_keys(self, src_keys: torch.Tensor, src_probs: torch.Tensor,
+    #                         dst_keys: torch.Tensor, default: float = 0.5) -> torch.Tensor:
+    #     """
+    #     Map probs from (src_keys, src_probs) onto dst_keys order.
+    #     Any dst_key not found in src-> default.
+    #     Assumes both key tensors are 1D torch.int64 and (roughly) sorted.
+    #     """
+    #     # sort dst once to use searchsorted
+    #     dst_sorted, inv = torch.sort(dst_keys)          # inv maps sorted -> original order
+    #     # find positions where each dst_sorted would appear in src_keys
+    #     src_sorted, _ = torch.sort(src_keys)
+    #     pos = torch.searchsorted(src_sorted, dst_sorted)
 
-        # build a mask for exact matches
-        # need values at those positions; do a gather safely
-        pos_clamped = torch.clamp(pos, max=src_sorted.numel()-1)
+    #     # build a mask for exact matches
+    #     # need values at those positions; do a gather safely
+    #     pos_clamped = torch.clamp(pos, max=src_sorted.numel()-1)
+    #     match_vals = src_sorted[pos_clamped]
+    #     is_match = (pos < src_sorted.numel()) & (match_vals == dst_sorted)
+
+    #     # map dst_sorted matches back to src indices:
+    #     # get a dict from key->index for src_keys
+    #     # (cheap-ish because it’s sparse and done on GPU)
+    #     # Build hash map via sorting once:
+    #     _, src_inv = torch.sort(src_keys)
+    #     src_keys_sorted = src_keys[src_inv]
+    #     where_in_src = torch.searchsorted(src_keys_sorted, dst_sorted[is_match])
+    #     src_idx_for_match = src_inv[where_in_src]
+
+    #     out_sorted = torch.full((dst_sorted.numel(),), default,
+    #                             device=dst_keys.device, dtype=src_probs.dtype)
+    #     out_sorted[is_match] = src_probs[src_idx_for_match]
+
+    #     # return in original dst_keys order
+    #     return out_sorted[inv]
+
+
+    def align_probs_to_keys(src_keys, src_probs, dst_keys, default=0.5):
+        # handle degenerate case
+        if src_keys.numel() == 0:
+            return torch.full(
+                (dst_keys.numel(),), default,
+                device=dst_keys.device, dtype=src_probs.dtype
+            )
+
+        # 1) sort src once and carry probs with it
+        src_sorted, src_perm = torch.sort(src_keys)         # src_sorted[i] = src_keys[src_perm[i]]
+        src_probs_sorted = src_probs[src_perm]
+
+        # 2) sort dst (we’ll align in sorted space, then unsort)
+        dst_sorted, dst_sort_idx = torch.sort(dst_keys)     # dst_sorted[i] = dst_keys[dst_sort_idx[i]]
+
+        # 3) For each dst_sorted value, where would it be inserted in src_sorted?
+        pos = torch.searchsorted(src_sorted, dst_sorted)
+        # pos[i] = index where dst_sorted[i] would go in src_sorted to keep sorted order
+
+        # 4) Check if we actually have an exact match at that position
+        pos_clamped = torch.clamp(pos, max=src_sorted.numel() - 1)
         match_vals = src_sorted[pos_clamped]
         is_match = (pos < src_sorted.numel()) & (match_vals == dst_sorted)
 
-        # map dst_sorted matches back to src indices:
-        # get a dict from key->index for src_keys
-        # (cheap-ish because it’s sparse and done on GPU)
-        # Build hash map via sorting once:
-        _, src_inv = torch.sort(src_keys)
-        src_keys_sorted = src_keys[src_inv]
-        where_in_src = torch.searchsorted(src_keys_sorted, dst_sorted[is_match])
-        src_idx_for_match = src_inv[where_in_src]
+        # 5) Fill output in *sorted-dst* space
+        out_sorted = torch.full(
+            (dst_sorted.numel(),), default,
+            device=dst_keys.device, dtype=src_probs.dtype
+        )
+        # for matches: use the corresponding src_probs_sorted
+        out_sorted[is_match] = src_probs_sorted[pos_clamped[is_match]]
 
-        out_sorted = torch.full((dst_sorted.numel(),), default,
-                                device=dst_keys.device, dtype=src_probs.dtype)
-        out_sorted[is_match] = src_probs[src_idx_for_match]
-
-        # return in original dst_keys order
-        return out_sorted[inv]
+        # 6) Unscramble back to original dst_keys order
+        orig_to_sorted = torch.argsort(dst_sort_idx)   # original idx -> sorted idx
+        return out_sorted[orig_to_sorted]
 
     def training_step(self, batch: Dict, batch_idx: int):
         """
