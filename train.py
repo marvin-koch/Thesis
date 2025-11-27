@@ -1154,7 +1154,8 @@ class HabitatSeqDataset(Dataset):
             if not os.path.isdir(s):
                 raise FileNotFoundError(f"Sequence dir missing: {s}")
             
-            
+        gt_root = os.path.join(self.cfg.dataset_root, "gt_voxels_per_timestep")
+
         if skip:
             filtered = []
             for seq_dir in seqs:
@@ -1165,7 +1166,7 @@ class HabitatSeqDataset(Dataset):
                 seq_id = f"{basis}_{final}"
 
                 # we just check for t=0 GT; adjust if you need stricter checks
-                gt_path_t0 = os.path.join(self.gt_root, f"{seq_id}_t0000_gt.npz")
+                gt_path_t0 = os.path.join(gt_root, f"{seq_id}_t0000_gt.npz")
                 if os.path.exists(gt_path_t0):
                     filtered.append(seq_dir)
             seqs = filtered
