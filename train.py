@@ -1154,7 +1154,7 @@ class HabitatSeqDataset(Dataset):
             if not os.path.isdir(s):
                 raise FileNotFoundError(f"Sequence dir missing: {s}")
             
-        gt_root = os.path.join(self.cfg.dataset_root, "gt_voxels_per_timestep")
+        gt_root = os.path.join(self.dataset_root, "gt_voxels_per_timestep")
 
         if skip:
             filtered = []
