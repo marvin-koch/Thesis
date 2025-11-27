@@ -1139,7 +1139,6 @@ class HabitatSeqDataset(Dataset):
         verbose: bool = False,
         min_images_per_timestep: int = 1,
         sequences: Optional[List[str]] = None,   # pass a subset for train/val if you want
-        skip=False,
     ):
         self.root = dataset_root
         self.size = size
@@ -1154,22 +1153,6 @@ class HabitatSeqDataset(Dataset):
             if not os.path.isdir(s):
                 raise FileNotFoundError(f"Sequence dir missing: {s}")
             
-        gt_root = os.path.join(self.root, "gt_voxels_per_timestep")
-
-        if skip:
-            filtered = []
-            for seq_dir in seqs:
-                # reconstruct seq_id exactly like __getitem__
-                p = seq_dir.rstrip("/")
-                basis = os.path.basename(os.path.dirname(p)).replace(".basis", "")
-                final = os.path.basename(p)
-                seq_id = f"{basis}_{final}"
-
-                # we just check for t=0 GT; adjust if you need stricter checks
-                gt_path_t0 = os.path.join(gt_root, f"{seq_id}_t0000_gt.npz")
-                if os.path.exists(gt_path_t0):
-                    filtered.append(seq_dir)
-            seqs = filtered
             
         self.seq_paths = seqs
 
@@ -1223,6 +1206,7 @@ class HabitatDataModule(pl.LightningDataModule):
         verbose: bool = False,
         train_val_split: float = 0.0,  # 0 = all train, else fraction for val (e.g., 0.1)
         seed: int = 42,
+        skip=False,
     ):
         super().__init__()
         self.dataset_root = dataset_root
@@ -1235,10 +1219,29 @@ class HabitatDataModule(pl.LightningDataModule):
 
         self.train_set = None
         self.val_set = None
+        self.skip = skip
 
     def setup(self, stage: Optional[str] = None):
         print("getting seqs")
         all_seqs = _sequence_dirs_from_root(self.dataset_root)
+        
+        
+        gt_root = os.path.join(self.dataset_root, "gt_voxels_per_timestep")
+        if self.skip:
+            filtered = []
+            for seq_dir in all_seqs:
+                # reconstruct seq_id exactly like __getitem__
+                p = seq_dir.rstrip("/")
+                basis = os.path.basename(os.path.dirname(p)).replace(".basis", "")
+                final = os.path.basename(p)
+                seq_id = f"{basis}_{final}"
+
+                # we just check for t=0 GT; adjust if you need stricter checks
+                gt_path_t0 = os.path.join(gt_root, f"{seq_id}_t0000_gt.npz")
+                if os.path.exists(gt_path_t0):
+                    filtered.append(seq_dir)
+            all_seqs = filtered
+            
         print("got seqs")
         if self.train_val_split > 0.0:
             random.Random(self.seed).shuffle(all_seqs)
@@ -1253,15 +1256,13 @@ class HabitatDataModule(pl.LightningDataModule):
             size=self.size,
             verbose=self.verbose,
             sequences=train_seqs,
-            skip=True,
-
         )
+        
         self.val_set = HabitatSeqDataset(
             dataset_root=self.dataset_root,
             size=self.size,
             verbose=self.verbose,
             sequences=val_seqs,
-            skip=True,
         ) if val_seqs else None
 
     def train_dataloader(self):
@@ -1351,7 +1352,6 @@ def main():
         #gradient_clip_val=1.0,
         log_every_n_steps=1,
         check_val_every_n_epoch=2,
-
         callbacks=[ckpt_cb, lr_cb],
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=1,
