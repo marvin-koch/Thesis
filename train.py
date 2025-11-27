@@ -749,7 +749,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
         #     vox_gt_t = load_sparse_voxel_grid(gt_path, device)
         #     gt_seq.append(vox_gt_t)
             
-        if not os.path.exists(os.path.join(gt_root, f"{seq_id}_t{0:04d}_gt.npz")):
+        if not os.path.exists(os.path.join(gt_root, f"{seq_id}_t0000_gt.npz")):
             return loss_total
 
         for t in range(T):
@@ -1139,6 +1139,7 @@ class HabitatSeqDataset(Dataset):
         verbose: bool = False,
         min_images_per_timestep: int = 1,
         sequences: Optional[List[str]] = None,   # pass a subset for train/val if you want
+        skip=False,
     ):
         self.root = dataset_root
         self.size = size
@@ -1152,6 +1153,23 @@ class HabitatSeqDataset(Dataset):
         for s in seqs:
             if not os.path.isdir(s):
                 raise FileNotFoundError(f"Sequence dir missing: {s}")
+            
+            
+        if skip:
+            filtered = []
+            for seq_dir in seqs:
+                # reconstruct seq_id exactly like __getitem__
+                p = seq_dir.rstrip("/")
+                basis = os.path.basename(os.path.dirname(p)).replace(".basis", "")
+                final = os.path.basename(p)
+                seq_id = f"{basis}_{final}"
+
+                # we just check for t=0 GT; adjust if you need stricter checks
+                gt_path_t0 = os.path.join(self.gt_root, f"{seq_id}_t0000_gt.npz")
+                if os.path.exists(gt_path_t0):
+                    filtered.append(seq_dir)
+            seqs = filtered
+            
         self.seq_paths = seqs
 
     def __len__(self): return len(self.seq_paths)
@@ -1168,8 +1186,6 @@ class HabitatSeqDataset(Dataset):
         return li(img_paths, size=self.size, verbose=self.verbose)
 
     def __getitem__(self, idx: int) -> Dict:
-        print(">>> sample loaded", flush=True)
-
         seq_dir = self.seq_paths[idx]
         t_dirs = self._list_timesteps(seq_dir)
 
@@ -1182,13 +1198,10 @@ class HabitatSeqDataset(Dataset):
         if not imgs_t:
             raise RuntimeError(f"No images found for sequence: {seq_dir}")
 
-        p = seq_dir.rstrip("/")
-
-        basis = os.path.basename(os.path.dirname(p))           # "kfPV7w3FaU5.basis"
-        basis = basis.replace(".basis", "")                    # "kfPV7w3FaU5"
-
-        final = os.path.basename(p)                            # "0"
-
+        p = seq_dir.rstrip("/") 
+        basis = os.path.basename(os.path.dirname(p)) # "kfPV7w3FaU5.basis" 
+        basis = basis.replace(".basis", "") # "kfPV7w3FaU5" 
+        final = os.path.basename(p) # "0" 
         seq_id = f"{basis}_{final}"
 
         return {
@@ -1238,13 +1251,16 @@ class HabitatDataModule(pl.LightningDataModule):
             dataset_root=self.dataset_root,
             size=self.size,
             verbose=self.verbose,
-            sequences=train_seqs
+            sequences=train_seqs,
+            skip=True,
+
         )
         self.val_set = HabitatSeqDataset(
             dataset_root=self.dataset_root,
             size=self.size,
             verbose=self.verbose,
-            sequences=val_seqs
+            sequences=val_seqs,
+            skip=True,
         ) if val_seqs else None
 
     def train_dataloader(self):
