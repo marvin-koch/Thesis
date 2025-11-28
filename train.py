@@ -787,44 +787,45 @@ class VoxelUpdaterSystem(pl.LightningModule):
             
             bev = self.inference(t, imgs)
         
+            with autocast(enabled=False):
 
-            p_occ_tgt = self.vox_gt.vals_st
-            # (D) decode current occupancy
-            p_occ_pred = self.vox.decode_occupancy()
-            p_occ_tgt = self.align_probs_to_keys(self.vox_gt.keys, p_occ_tgt,
-                                self.vox.keys, default=0.5)      
+                p_occ_tgt = self.vox_gt.vals_st
+                # (D) decode current occupancy
+                p_occ_pred = self.vox.decode_occupancy()
+                p_occ_tgt = self.align_probs_to_keys(self.vox_gt.keys, p_occ_tgt,
+                                    self.vox.keys, default=0.5)      
 
 
-            # (F) losses
-            # Occupancy BCE
-            loss_occ = F.binary_cross_entropy(
-                p_occ_pred.clamp(1e-5, 1-1e-5),
-                p_occ_tgt.clamp(1e-5, 1-1e-5)
-            )
+                # (F) losses
+                # Occupancy BCE
+                loss_occ = F.binary_cross_entropy(
+                    p_occ_pred.clamp(1e-5, 1-1e-5),
+                    p_occ_tgt.clamp(1e-5, 1-1e-5)
+                )
 
-            # Temporal smoothness on logits (optional, encourages stability but not over-smoothing)
-            # keep a buffer of previous decoded occupancy
-            
-            # if t == 1:
-            #     self._prev_p_occ = p_occ_pred.detach()
-            # logit_now  = torch.logit(p_occ_pred.clamp(1e-5, 1-1e-5))
-            # logit_prev = torch.logit(self._prev_p_occ.clamp(1e-5, 1-1e-5)).to(device)
-            # loss_temp = F.smooth_l1_loss(logit_now, logit_prev, beta=0.1)
-            # self._prev_p_occ = p_occ_pred.detach()
-            
-            
-            if (t == 0) or (self._prev_keys is None):
-                loss_temp = torch.tensor(0.0, device=self.device)
-            else:
-                prev_aligned = self.align_probs_to_keys(self._prev_keys, self._prev_probs,
-                                                self.vox.keys, default=0.5)
-                logit_now  = torch.logit(p_occ_pred.clamp(1e-5, 1-1e-5))
-                logit_prev = torch.logit(prev_aligned.clamp(1e-5, 1-1e-5))
-                loss_temp = F.smooth_l1_loss(logit_now, logit_prev, beta=0.1)
+                # Temporal smoothness on logits (optional, encourages stability but not over-smoothing)
+                # keep a buffer of previous decoded occupancy
+                
+                # if t == 1:
+                #     self._prev_p_occ = p_occ_pred.detach()
+                # logit_now  = torch.logit(p_occ_pred.clamp(1e-5, 1-1e-5))
+                # logit_prev = torch.logit(self._prev_p_occ.clamp(1e-5, 1-1e-5)).to(device)
+                # loss_temp = F.smooth_l1_loss(logit_now, logit_prev, beta=0.1)
+                # self._prev_p_occ = p_occ_pred.detach()
+                
+                
+                if (t == 0) or (self._prev_keys is None):
+                    loss_temp = torch.tensor(0.0, device=self.device)
+                else:
+                    prev_aligned = self.align_probs_to_keys(self._prev_keys, self._prev_probs,
+                                                    self.vox.keys, default=0.5)
+                    logit_now  = torch.logit(p_occ_pred.clamp(1e-5, 1-1e-5))
+                    logit_prev = torch.logit(prev_aligned.clamp(1e-5, 1-1e-5))
+                    loss_temp = F.smooth_l1_loss(logit_now, logit_prev, beta=0.1)
 
-            # update buffers for next step
-            self._prev_keys  = self.vox.keys.detach().clone()
-            self._prev_probs = p_occ_pred.detach().clone()
+                # update buffers for next step
+                self._prev_keys  = self.vox.keys.detach().clone()
+                self._prev_probs = p_occ_pred.detach().clone()
 
             # Entropy regularizer on routing (OPTIONAL):
             # add a small penalty you compute inside update_with_features_learned (return avg entropy)
