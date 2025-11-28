@@ -758,7 +758,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 t = t*10
             gt_path = os.path.join(gt_root, f"{seq_id}_t{t:04d}_gt.npz")
             if os.path.exists(gt_path):
-                vox_gt_t = load_sparse_voxel_grid(gt_path, device, self.voxel_size)
+                vox_gt_t = load_sparse_voxel_grid(gt_path, device)
             else:
                 vox_gt_t = None
             gt_seq.append(vox_gt_t)
