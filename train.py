@@ -657,7 +657,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
     #     return out_sorted[inv]
 
 
-    def align_probs_to_keys(src_keys, src_probs, dst_keys, default=0.5):
+    def align_probs_to_keys(self, src_keys, src_probs, dst_keys, default=0.5):
         # handle degenerate case
         if src_keys.numel() == 0:
             return torch.full(
