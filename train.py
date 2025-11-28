@@ -1321,6 +1321,7 @@ def main():
         size=512,
         verbose=False,
         train_val_split=0.1,  # or whatever you want
+        skip=True
     )
 
     sys = VoxelUpdaterSystem(cfg)
