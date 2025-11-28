@@ -753,6 +753,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
             return loss_total
 
         for t in range(T):
+            if self.cfg.skip:
+                t = t*10
             gt_path = os.path.join(gt_root, f"{seq_id}_t{t:04d}_gt.npz")
             if os.path.exists(gt_path):
                 vox_gt_t = load_sparse_voxel_grid(gt_path, device, self.voxel_size)
@@ -765,6 +767,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
             print(f"=============================timestep {t}=============================")
             imgs = batch["imgs_t"][t]          # <--- this is your old `imgs`
 
+      
             # bev_gt, R, tw = self.inference_gt(t, imgs)
                 
                 
@@ -1139,12 +1142,14 @@ class HabitatSeqDataset(Dataset):
         verbose: bool = False,
         min_images_per_timestep: int = 1,
         sequences: Optional[List[str]] = None,   # pass a subset for train/val if you want
+        skip=False
     ):
         self.root = dataset_root
         self.size = size
         self.verbose = verbose
         self.min_images_per_timestep = min_images_per_timestep
-
+        self.skip = skip
+        
         if sequences is None:
             seqs = _sequence_dirs_from_root(dataset_root)
         else:
@@ -1174,7 +1179,9 @@ class HabitatSeqDataset(Dataset):
         t_dirs = self._list_timesteps(seq_dir)
 
         imgs_t: List[List[Dict]] = []
-        for td in t_dirs:
+        for t, td in enumerate(t_dirs):
+            if t % 10 != 0 and self.skip:
+                continue
             imgs = self._load_timestep(td)
             if imgs:
                 imgs_t.append(imgs)
@@ -1312,6 +1319,7 @@ def main():
         batch_size=1,
         num_workers=0,
         precision="16-mixed",
+        skip=True,
     )
 
     dm = HabitatDataModule(
