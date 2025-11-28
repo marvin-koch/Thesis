@@ -144,6 +144,7 @@ class TrainConfig:
 
     # teacher supervision
     teacher_beam_every_t: bool = True  # run teacher for every timestep (offline precomputed if possible)
+    skip: bool = False
 
 # --------------------------
 # 4) Dataset (sequence-level)
