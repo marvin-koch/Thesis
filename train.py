@@ -1263,6 +1263,7 @@ class HabitatDataModule(pl.LightningDataModule):
             size=self.size,
             verbose=self.verbose,
             sequences=train_seqs,
+            skip=self.skip
         )
         
         self.val_set = HabitatSeqDataset(
@@ -1270,6 +1271,8 @@ class HabitatDataModule(pl.LightningDataModule):
             size=self.size,
             verbose=self.verbose,
             sequences=val_seqs,
+            skip=self.skip
+
         ) if val_seqs else None
 
     def train_dataloader(self):
