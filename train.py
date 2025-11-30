@@ -862,15 +862,28 @@ class VoxelUpdaterSystem(pl.LightningModule):
             print(loss_t.detach())
             print(loss_total)
 
-            # logging
-            self.log_dict({
-                "loss/occ": loss_occ,
-                "loss/temp": loss_temp,
-                "loss/ent": loss_ent,
-                "loss/tv": loss_tv,
-                "stats/num_voxels": float(self.vox.keys.numel())
-            }, prog_bar=(t == T-1), on_step=True, on_epoch=True, sync_dist=False)
-                    
+            # # logging
+            # self.log_dict({
+            #     "loss/occ": loss_occ,
+            #     "loss/temp": loss_temp,
+            #     "loss/ent": loss_ent,
+            #     "loss/tv": loss_tv,
+            #     "stats/num_voxels": float(self.vox.keys.numel())
+            # }, prog_bar=(t == T-1), on_step=True, on_epoch=True, sync_dist=False)
+            if t == T - 1:
+                self.log_dict(
+                    {
+                        "loss/occ": loss_occ,
+                        "loss/temp": loss_temp,
+                        "loss/ent": loss_ent,
+                        "loss/tv": loss_tv,
+                        "stats/num_voxels": float(self.vox.keys.numel()),
+                    },
+                    prog_bar=True,
+                    on_step=True,
+                    on_epoch=True,
+                    sync_dist=False,
+                )
             
             self.vox.z_latent = self.vox.z_latent.detach()
 
