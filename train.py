@@ -228,7 +228,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
         opt = torch.optim.AdamW(params, lr=self.cfg.lr, weight_decay=self.cfg.weight_decay)
         return opt
     
-    def inference(self, i, imgs, Rmw=None, tmw=None):
+    def inference(self, i, imgs, mst, Rmw=None, tmw=None):
 
 
         POINTS = "world_points"
@@ -316,7 +316,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
             if len(changed_idx) < 2:
                     # Advance epoch so the pipeline’s temporal bookkeeping stays aligned
                     self.vox.next_epoch()
-                    return None
+                    return None, None
  
             print("Finding changed images took", length, "seconds!")
 
@@ -335,6 +335,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
             # stacked_predictions = []
             # for input_frames in [imgs]:
             print("inference pred")
+            mst = True
             predictions = get_reconstructed_scene_no_opt(i, ".", imgs, self.model, self.device, False, 512, "", "linear", 100, 1, True, False, True, False, 0.05, "oneref", 1, 0, changed_gids=changed_idx, projector=self.projector)
             
             
@@ -476,7 +477,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
         # after build_maps_from_latent_features(...)
         del frames_map, conf_map, images_map, features_map, image_tensors
 
-        return bev
+        return bev, mst
     
     def inference_gt(self, i, imgs):
 
@@ -763,6 +764,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 vox_gt_t = None
             gt_seq.append(vox_gt_t)
             
+
+        mst = False
         for t in range(T):
             
             print(f"=============================timestep {t}=============================")
@@ -785,7 +788,10 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 print("No GT voxel grid for this timestep, skipping.")
                 continue
             
-            bev = self.inference(t, imgs)
+            if not mst and t != 0:
+                bev, mst = self.inference(1, imgs, mst)
+            else:
+                bev, mst = self.inference(t, imgs, mst)
         
             with autocast(enabled=False):
 
@@ -910,10 +916,13 @@ class VoxelUpdaterSystem(pl.LightningModule):
         gt_root = os.path.join(self.cfg.dataset_root, "gt_voxels_per_timestep")
         gt_seq = []
         for t in range(T):
+            if self.cfg.skip:
+                t = t*10
             gt_path = os.path.join(gt_root, f"{seq_id}_t{t:04d}_gt.npz")
             vox_gt_t = load_sparse_voxel_grid(gt_path, device)
             gt_seq.append(vox_gt_t)
             
+        mst = False
         for t in range(T):
             
             print(f"=============================timestep {t}=============================")
@@ -936,7 +945,12 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
                 # bev_gt, R, tw = self.inference_gt(t, imgs)
                 
-                bev = self.inference(t, imgs)
+                #bev = self.inference(t, imgs)
+                if not mst and t != 0:
+                    bev, mst = self.inference(1, imgs, mst)
+                else:
+                    bev, mst = self.inference(t, imgs, mst)
+        
         
 
 
@@ -1312,7 +1326,7 @@ def main():
     cfg = TrainConfig(
         # dataset_root="/Users/marvin/Documents/Thesis/repo/dataset_generation/habitat/",
         #dataset_root="/home/mpk40/Documents/data/",
-        dataset_root="/cluster/scratch/kochmar/renders2/",
+        dataset_root="/cluster/scratch/kochmar/renders/",
         voxel_size=0.10,
         radius_m=0.25,
         topk=8,
@@ -1323,7 +1337,7 @@ def main():
         max_epochs=20,
         batch_size=1,
         num_workers=0,
-        precision="16-mixed",
+        precision="32",
         skip=True,
     )
 
