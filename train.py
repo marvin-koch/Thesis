@@ -194,6 +194,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
             device=self.device, feature_dim=self.feature_dim
         )
         
+        self.vox = self.vox.to(self.device)
+        
         self.vox_gt = TorchSparseVoxelGrid(
             origin_xyz=np.zeros(3, dtype=np.float32),
             params=VoxelParams(voxel_size=self.voxel_size, promote_hits=2),
