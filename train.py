@@ -715,7 +715,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
         device = self.device
         opt = self.optimizers()
         
-        self.vox.reset_state(origin_xyz=np.zeros(3, dtype=np.float32))
+        self.vox.reset_state()
+        self.vox = self.vox.to(self.device)
 
         
         
@@ -914,7 +915,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
         cfg = self.cfg
 
-        self.vox.reset_state(origin_xyz=np.zeros(3, dtype=np.float32))
+        self.vox.reset_state()
+        self.vox = self.vox.to(self.device)
 
         self.vox_gt = TorchSparseVoxelGrid(
             origin_xyz=np.zeros(3, dtype=np.float32),
