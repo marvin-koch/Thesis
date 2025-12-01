@@ -300,6 +300,9 @@ class LatentVoxelGrid(nn.Module):
         
         self.decoder = LatentToOccupancyDecoder(feature_dim)
         
+        self.apply(self.kaiming_init)
+
+        
     def eb(self, name, shape, dtype_, persistent=True):
         self.register_buffer(name, torch.empty(shape, dtype=dtype_), persistent=persistent)
         
@@ -321,22 +324,42 @@ class LatentVoxelGrid(nn.Module):
 
     
 
-        self.eb("keys",           (0,),     torch.int64)
-        self.eb("vals_st",        (0,),     self.dtype)
-        self.eb("vals_lt",        (0,),     self.dtype)
-        self.eb("vals",           (0,),     self.dtype)
-        self.eb("hit_count",      (0,),     torch.int32)
-        self.eb("pos_occ_count",  (0,),     torch.int16)
-        self.eb("neg_free_count", (0,),     torch.int16)
-        self.eb("last_occ_epoch", (0,),     torch.int32)
-        self.eb("last_free_epoch",(0,),     torch.int32)
-        self.eb("view_bits",      (0,),     torch.int16)
-        self.eb("seen_occ_epoch", (0,),     torch.int32)
-        self.eb("seen_view_bits_e",(0,),    torch.int16)
-        self.eb("occ_epoch_count",(0,),     torch.int16)
-        self.eb("view_bits_cum",  (0,),     torch.int16)
-        self.eb("lt_promoted_flag",(0,),    torch.uint8)
+        # self.eb("keys",           (0,),     torch.int64)
+        # self.eb("vals_st",        (0,),     self.dtype)
+        # self.eb("vals_lt",        (0,),     self.dtype)
+        # self.eb("vals",           (0,),     self.dtype)
+        # self.eb("hit_count",      (0,),     torch.int32)
+        # self.eb("pos_occ_count",  (0,),     torch.int16)
+        # self.eb("neg_free_count", (0,),     torch.int16)
+        # self.eb("last_occ_epoch", (0,),     torch.int32)
+        # self.eb("last_free_epoch",(0,),     torch.int32)
+        # self.eb("view_bits",      (0,),     torch.int16)
+        # self.eb("seen_occ_epoch", (0,),     torch.int32)
+        # self.eb("seen_view_bits_e",(0,),    torch.int16)
+        # self.eb("occ_epoch_count",(0,),     torch.int16)
+        # self.eb("view_bits_cum",  (0,),     torch.int16)
+        # self.eb("lt_promoted_flag",(0,),    torch.uint8)
 
+        device = self.device
+
+        self.keys           = torch.empty(0, dtype=torch.int64,  device=device)
+
+        self.vals_st        = torch.empty(0, dtype=self.dtype,   device=device)
+        self.vals_lt        = torch.empty(0, dtype=self.dtype,   device=device)
+        self.vals           = torch.empty(0, dtype=self.dtype,   device=device)
+
+        self.hit_count      = torch.empty(0, dtype=torch.int32,  device=device)
+        self.pos_occ_count  = torch.empty(0, dtype=torch.int16,  device=device)
+        self.neg_free_count = torch.empty(0, dtype=torch.int16,  device=device)
+        self.last_occ_epoch = torch.empty(0, dtype=torch.int32,  device=device)
+        self.last_free_epoch= torch.empty(0, dtype=torch.int32,  device=device)
+        self.view_bits      = torch.empty(0, dtype=torch.int16,  device=device)
+        self.seen_occ_epoch = torch.empty(0, dtype=torch.int32,  device=device)
+        self.seen_view_bits_e = torch.empty(0, dtype=torch.int16, device=device)
+        self.occ_epoch_count  = torch.empty(0, dtype=torch.int16, device=device)
+        self.view_bits_cum    = torch.empty(0, dtype=torch.int16, device=device)
+        self.lt_promoted_flag = torch.empty(0, dtype=torch.uint8, device=device)
+        
         # ---- latent memory per voxel ----
         self.z_latent = torch.empty((0, self.feature_dim), dtype=self.dtype, device=self.device)
 
@@ -898,6 +921,25 @@ class LatentVoxelGrid(nn.Module):
                 z[:min(z.shape[0], self.z_latent.shape[0])] = self.z_latent[:min(z.shape[0], self.z_latent.shape[0])]
             self.z_latent = z
 
+
+    def kaiming_init(self, module):
+        if isinstance(module, torch.nn.Linear):
+            torch.nn.init.kaiming_normal_(module.weight, nonlinearity="relu")
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+
+        if isinstance(module, (torch.nn.Conv2d, torch.nn.Conv3d)):
+            torch.nn.init.kaiming_normal_(module.weight, nonlinearity="relu")
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+
+        if isinstance(module, torch.nn.GRUCell):
+            for name, param in module.named_parameters():
+                if "weight" in name:
+                    torch.nn.init.xavier_uniform_(param)  # safer for GRU
+                elif "bias" in name:
+                    torch.nn.init.zeros_(param)
+                    
     #@torch.no_grad()  # remove this decorator during training so gradients flow into sim_net & GRU
     def update_with_features_learned(
         self,
