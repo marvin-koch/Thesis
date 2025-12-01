@@ -59,35 +59,6 @@ class VoxelParams:
     lt_reset_promotion_on_demote: bool = True
 
 
-# # ----------------- Similarity (point->voxel) -----------------
-# class FeatureVoxelSimilarity(nn.Module):
-#     """
-#     Small MLP to score compatibility of a point feature f_i and a voxel latent z_j,
-#     conditioned on relative offset delta_xyz = p_i - center(v_j).
-#     """
-#     def __init__(self, feat_dim: int, hidden_dim: int = 32):
-#         super().__init__()
-#         in_dim = 2 * feat_dim + 3
-
-#         self.net = nn.Sequential(
-#             nn.Linear(in_dim, hidden_dim),
-#             nn.ReLU(inplace=True),
-#             nn.Linear(hidden_dim, 1)
-#         )
-
-#     def forward(self, f_pts_flat: torch.Tensor, z_vox_flat: torch.Tensor, delta_xyz_flat: torch.Tensor):
-#         """
-#         Flat/batched mode for efficiency.
-#         Args:
-#             f_pts_flat:   (R, D)
-#             z_vox_flat:   (R, D)
-#             delta_xyz_flat: (R, 3)
-#         Returns:
-#             sim_flat: (R,) unnormalized scores
-#         """
-#         x = torch.cat([f_pts_flat, z_vox_flat, delta_xyz_flat], dim=-1)  # (R, 2D+3)
-#         x = self.proj(x)
-#         return self.net(x).squeeze(-1)  # (R,)
 
 class FeatureVoxelSimilarity(nn.Module):
     """
@@ -250,37 +221,6 @@ class FeatureProjector(nn.Module):
         return x
 
 
-
-# class GatedEMAUpdate(nn.Module):
-#     """
-#     z_new = z + alpha * (h(u) - z)
-#     - alpha: gate in [0,1], can be per-dim or scalar per voxel
-#     - h(u): tiny MLP (or identity) that proposes the target state
-#     """
-#     def __init__(self, dim: int, hidden: int = 64, per_dim_gate: bool = True, use_bias: bool = True):
-#         super().__init__()
-#         # proposal head h(u)
-#         self.h = nn.Sequential(
-#             nn.Linear(dim, hidden, bias=use_bias),
-#             nn.SiLU(),
-#             nn.Linear(hidden, dim, bias=use_bias),
-#         )
-#         # gate on [u; z] → alpha
-#         g_out = dim if per_dim_gate else 1
-#         self.gate = nn.Sequential(
-#             nn.Linear(2 * dim, hidden // 2, bias=use_bias),
-#             nn.SiLU(),
-#             nn.Linear(hidden // 2, g_out, bias=True),
-#         )
-
-#     def forward(self, u: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
-#         # u, z: (U, D)
-#         alpha = torch.sigmoid(self.gate(torch.cat([u, z], dim=-1)))  # (U, D) or (U,1)
-#         h_u   = self.h(u)                                            # (U, D)
-#         # EMA-style update
-#         return z + alpha * (h_u - z)
-
-
 class GatedEMAUpdate(nn.Module):
     def __init__(self, dim: int, hidden: int = 64):
         super().__init__()
@@ -313,24 +253,23 @@ class LatentVoxelGrid(nn.Module):
         self.device = self.origin.device
         self.dtype = dtype
 
-        def eb(name, shape, dtype_, persistent=True):
-            self.register_buffer(name, torch.empty(shape, dtype=dtype_), persistent=persistent)
 
-        eb("keys",           (0,),     torch.int64)
-        eb("vals_st",        (0,),     dtype)
-        eb("vals_lt",        (0,),     dtype)
-        eb("vals",           (0,),     dtype)
-        eb("hit_count",      (0,),     torch.int32)
-        eb("pos_occ_count",  (0,),     torch.int16)
-        eb("neg_free_count", (0,),     torch.int16)
-        eb("last_occ_epoch", (0,),     torch.int32)
-        eb("last_free_epoch",(0,),     torch.int32)
-        eb("view_bits",      (0,),     torch.int16)
-        eb("seen_occ_epoch", (0,),     torch.int32)
-        eb("seen_view_bits_e",(0,),    torch.int16)
-        eb("occ_epoch_count",(0,),     torch.int16)
-        eb("view_bits_cum",  (0,),     torch.int16)
-        eb("lt_promoted_flag",(0,),    torch.uint8)
+
+        self.eb("keys",           (0,),     torch.int64)
+        self.eb("vals_st",        (0,),     dtype)
+        self.eb("vals_lt",        (0,),     dtype)
+        self.eb("vals",           (0,),     dtype)
+        self.eb("hit_count",      (0,),     torch.int32)
+        self.eb("pos_occ_count",  (0,),     torch.int16)
+        self.eb("neg_free_count", (0,),     torch.int16)
+        self.eb("last_occ_epoch", (0,),     torch.int32)
+        self.eb("last_free_epoch",(0,),     torch.int32)
+        self.eb("view_bits",      (0,),     torch.int16)
+        self.eb("seen_occ_epoch", (0,),     torch.int32)
+        self.eb("seen_view_bits_e",(0,),    torch.int16)
+        self.eb("occ_epoch_count",(0,),     torch.int16)
+        self.eb("view_bits_cum",  (0,),     torch.int16)
+        self.eb("lt_promoted_flag",(0,),    torch.uint8)
 
         self.epoch: int = 0
 
@@ -345,13 +284,6 @@ class LatentVoxelGrid(nn.Module):
         # update modules
         self.gru_cell = nn.GRUCell(input_size=feature_dim, hidden_size=feature_dim)
         
-        # self.gru_cell = nn.GRU(
-        #     input_size=self.feature_dim, hidden_size=self.feature_dim,
-        #     num_layers=1, batch_first=True, bias=True
-        # )
-        
-        # self.ema_upd = GatedEMAUpdate(dim=self.feature_dim, hidden=self.feature_dim)#, per_dim_gate=True)
-
         
         self.sim_net  = FeatureVoxelSimilarity(feature_dim)
         
@@ -367,7 +299,51 @@ class LatentVoxelGrid(nn.Module):
         self.routing_topk: int = 8      # voxels per point (after radius prefilter)
         
         self.decoder = LatentToOccupancyDecoder(feature_dim)
+        
+    def eb(self, name, shape, dtype_, persistent=True):
+        self.register_buffer(name, torch.empty(shape, dtype=dtype_), persistent=persistent)
+        
+    def reset_state(self, origin_xyz: Optional[np.ndarray] = None) -> None:
+            """
+            Reset all *map state* (keys, log-odds, counts, latent codes, epoch)
+            while keeping the learnable networks (sim_net, gru_cell, gate_mlp, ...)
+            and hyperparameters intact.
 
+            Call this at the start of a new sequence/scene instead of creating
+            a brand new LatentVoxelGrid, so the optimizer still sees the same params.
+            """
+            # If you want to change the map origin for a new scene
+            if origin_xyz is not None:
+                # keep dtype/device aligned with the module
+                self.origin = torch.as_tensor(
+                    origin_xyz, dtype=self.dtype, device=self.device
+                ).reshape(3)
+
+        
+
+            self.eb("keys",           (0,),     torch.int64)
+            self.eb("vals_st",        (0,),     self.dtype)
+            self.eb("vals_lt",        (0,),     self.dtype)
+            self.eb("vals",           (0,),     self.dtype)
+            self.eb("hit_count",      (0,),     torch.int32)
+            self.eb("pos_occ_count",  (0,),     torch.int16)
+            self.eb("neg_free_count", (0,),     torch.int16)
+            self.eb("last_occ_epoch", (0,),     torch.int32)
+            self.eb("last_free_epoch",(0,),     torch.int32)
+            self.eb("view_bits",      (0,),     torch.int16)
+            self.eb("seen_occ_epoch", (0,),     torch.int32)
+            self.eb("seen_view_bits_e",(0,),    torch.int16)
+            self.eb("occ_epoch_count",(0,),     torch.int16)
+            self.eb("view_bits_cum",  (0,),     torch.int16)
+            self.eb("lt_promoted_flag",(0,),    torch.uint8)
+
+            # ---- latent memory per voxel ----
+            self.z_latent = torch.empty((0, self.feature_dim), dtype=self.dtype, device=self.device)
+
+
+            # reset logical time
+            self.epoch = 0
+            
     # ---------- utilities ----------
     def _world_to_ijk(self, pts: torch.Tensor) -> torch.Tensor:
         rel = (pts - self.origin) / self.p.voxel_size
@@ -524,91 +500,6 @@ class LatentVoxelGrid(nn.Module):
             return torch.empty(0, dtype=torch.int64, device=self.device)
         return self.keys[self.occupied_mask()]
 
-
-    # # ---------- learned latent update (point features -> voxel latents) ----------
-    # def update_with_features(self,
-    #                          pts_world: torch.Tensor,  # (N,3)
-    #                          f_pts: torch.Tensor,      # (N,D)
-    #                          radius: float = 0.25):
-    #     """
-    #     Route point features to nearby voxels, then gated-GRU fuse into z_latent.
-    #     Uses radius prefilter + per-point top-K + temperatured softmax.
-    #     """
-    #     if pts_world.numel() == 0 or self.keys.numel() == 0:
-    #         return
-
-    #     dev = self.device
-    #     N = pts_world.shape[0]
-    #     M = self.keys.shape[0]
-    #     D = self.feature_dim
-
-    #     # voxel centers
-    #     ijk_all   = self._unhash_keys(self.keys).to(torch.float32)  # (M,3)
-    #     voxel_xyz = self.origin + (ijk_all + 0.5) * self.p.voxel_size  # (M,3)
-
-    #     # candidate voxels per point: radius ∪ top-K nearest
-    #     with torch.no_grad():
-    #         dists = torch.cdist(pts_world.to(dev), voxel_xyz)       # (N,M)
-    #         mask  = dists <= radius                                 # (N,M)
-
-    #         K = min(self.routing_topk, M)
-    #         # nearest K even if outside radius
-    #         neg_d = -dists
-    #         topk_vals, topk_idx = torch.topk(neg_d, k=K, dim=1)     # (N,K)
-    #         cand_mask = mask.clone()
-    #         cand_mask.scatter_(1, topk_idx, True)
-
-    #         i_idx, j_idx = cand_mask.nonzero(as_tuple=True)         # (R,), (R,)
-
-    #     if i_idx.numel() == 0:
-    #         return
-
-    #     # gather flat tensors for selected pairs
-    #     p_sel = pts_world[i_idx]                  # (R,3)
-    #     f_sel = f_pts[i_idx]                      # (R,D)
-    #     v_sel = voxel_xyz[j_idx]                  # (R,3)
-    #     z_sel = self.z_latent[j_idx]              # (R,D)
-    #     delta = p_sel - v_sel                     # (R,3)
-
-    #     # similarity (flat)
-    #     sim_flat = self.sim_net(f_sel, z_sel, delta)   # (R,)
-
-    #     # per-point softmax with temperature: w = softmax_j( sim/τ )
-    #     # 1) segment-wise max for stability
-    #     #    (requires PyTorch 2.0+ scatter_reduce; else implement a custom segment-max)
-    #     max_per_i = torch.full((N,), -1e9, device=sim_flat.device, dtype=sim_flat.dtype)
-    #     max_per_i = max_per_i.scatter_reduce(0, i_idx, sim_flat, reduce="amax", include_self=True)
-    #     sim_shift = sim_flat - max_per_i[i_idx]
-    #     w_unnorm  = torch.exp(sim_shift / max(self.routing_tau, 1e-6))
-    #     sum_per_i = torch.zeros(N, device=sim_flat.device, dtype=sim_flat.dtype).scatter_add(0, i_idx, w_unnorm)
-    #     weights   = w_unnorm / (sum_per_i[i_idx] + 1e-8)           # (R,)
-
-    #     # fuse into voxel inputs via scatter-add
-    #     upd = torch.zeros(M, D, device=dev, dtype=f_sel.dtype)
-    #     upd.index_add_(0, j_idx, (weights.unsqueeze(-1) * f_sel))  # (M,D)
-
-    #     # only update voxels that received mass
-    #     got_mass = torch.zeros(M, dtype=torch.bool, device=dev)
-    #     got_mass[j_idx] = True
-    #     idx_upd = torch.nonzero(got_mass, as_tuple=False).squeeze(-1)  # (M_upd,)
-    #     if idx_upd.numel() == 0:
-    #         return
-
-    #     u = upd[idx_upd]                  # (M_upd,D)
-    #     z = self.z_latent[idx_upd]        # (M_upd,D)
-
-    #     # gate (scalar per voxel) to suppress noisy updates
-    #     gamma = torch.sigmoid(self.gate_mlp(torch.cat([u, z], dim=-1)))  # (M_upd,1)
-    #     x_in = gamma * u                                                 # broadcast to (M_upd,D)
-
-    #     # GRU fuse
-    #     z_new = self.gru_cell(x_in, z)                                   # (M_upd,D)
-    #     self.z_latent.index_copy_(0, idx_upd, z_new)
-    
-    
-    
-    
-    
 
     def _invalidate_faiss(self):
         self._faiss = None
@@ -869,472 +760,6 @@ class LatentVoxelGrid(nn.Module):
 
         print("Gru took", time.time() - start, "seconds!")
 
-        # start = time.time()
-
-        # dev = self.device
-        # N   = pts_world.shape[0]
-        # M   = self.keys.shape[0]
-        # D   = self.feature_dim
-        # K   = min(self.routing_topk, M)
-        # vox = float(self.p.voxel_size)
-
-        # # neighbor offsets
-        # r_vox = int(math.ceil(radius / max(vox, 1e-8))) + int(neighbor_pad)
-        # r_vox = min(r_vox, int(r_vox_cap))  # prevent T from blowing up
-        # rng   = torch.arange(-r_vox, r_vox + 1, device=dev, dtype=torch.int32)
-        # ox, oy, oz = torch.meshgrid(rng, rng, rng, indexing="ij")
-        # offsets = torch.stack([ox.reshape(-1), oy.reshape(-1), oz.reshape(-1)], dim=-1)  # (T,3)
-        # T = int(offsets.size(0))
-
-        # keys_sorted = self.keys  # should already be sorted
-
-        # all_i_parts, all_j_parts = [], []
-
-        # with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
-        #     # running global topK storage
-        #     topk_vals = torch.full((N, K), -float("inf"), device=dev) if K > 0 else None
-        #     topk_idx  = torch.zeros((N, K), dtype=torch.long, device=dev)          if K > 0 else None
-
-        #     origin_f32 = self.origin.to(torch.float32)
-        #     offsets = offsets.to(dev)  # ensure on device
-        #     keys_sorted = keys_sorted.to(dev)  # already was, keep explicit
-
-
-
-        #     for i0 in range(0, N, chunkN):
-        #         i1 = min(i0 + chunkN, N)
-        #         n  = i1 - i0
-
-        #         # --- point chunk ---
-        #         pts  = pts_world[i0:i1].to(dev, torch.float32)      # (n,3)
-        #         ijk0 = self._world_to_ijk(pts).to(torch.int32)      # (n,3)
-
-        #         # precompute per-point base vector once
-        #         base0 = (pts - origin_f32) - (ijk0.to(torch.float32) + 0.5) * vox  # (n,3)
-        #         a2 = (base0 ** 2).sum(dim=-1, keepdim=True)  # (n,1)
-
-        #         # per point-chunk (i0:i1)
-        #         pts  = pts_world[i0:i1].to(dev, torch.float32)         # (n,3)
-        #         ijk0 = self._world_to_ijk(pts).to(torch.int32)         # (n,3)
-
-        #         # base for GEMM distances
-        #         origin_f32 = self.origin.to(torch.float32)
-        #         base0 = (pts - origin_f32) - (ijk0.to(torch.float32) + 0.5) * vox    # (n,3)
-        #         a2 = (base0**2).sum(-1, keepdim=True)                                # (n,1)
-
-        #         # all offsets at once
-        #         off = offsets.to(dev)                                                # (T,3)
-        #         cand_ijk  = ijk0[:, None, :] + off[None, :, :]                       # (n,T,3)
-        #         cand_keys = self._hash_ijk(cand_ijk.reshape(-1, 3)).reshape(n, -1)   # (n,T)
-
-        #         pos   = torch.searchsorted(keys_sorted, cand_keys.reshape(-1)).reshape(n, -1)  # (n,T)
-        #         valid = (pos < M) & (keys_sorted[pos] == cand_keys)
-
-        #         # distances via single GEMM
-        #         Voff = off.to(torch.float32) * vox                                   # (T,3)
-        #         b2   = (Voff**2).sum(-1).unsqueeze(0)                                # (1,T)
-        #         ab   = base0 @ Voff.t()                                              # (n,T)
-        #         d2   = a2 + b2 - 2.0 * ab                                            # (n,T)
-
-        #         # radius hits
-        #         if radius > 0:
-        #             rad_hits = valid & (d2 <= (radius * radius))
-        #             if rad_hits.any():
-        #                 hi, ht = torch.where(rad_hits)
-        #                 all_i_parts.append(hi + i0)
-        #                 all_j_parts.append(pos[hi, ht])
-
-        #         # per-point topK once
-        #         if K > 0:
-        #             d2m = d2.masked_fill(~valid, float("inf"))
-        #             k_eff = min(K, d2m.size(1))
-        #             if k_eff > 0:
-        #                 vals, idx_local = torch.topk(-d2m, k=k_eff, dim=1)           # (n,k_eff)
-        #                 cand_idx  = pos.gather(1, idx_local)                          # (n,k_eff)
-
-        #                 # merge with global
-        #                 gv = torch.cat([topk_vals[i0:i1], vals], dim=1)               # (n, K + k_eff)
-        #                 gi = torch.cat([topk_idx[i0:i1],  cand_idx], dim=1)
-        #                 new_vals, sel = torch.topk(gv, k=K, dim=1)
-        #                 new_idx = gi.gather(1, sel)
-        #                 topk_vals[i0:i1] = new_vals
-        #                 topk_idx[i0:i1]  = new_idx
-        #         del pts, ijk0, base0, a2
-
-        
-        #     end = time.time()
-        #     length = end - start
-
-        #     print("Loop took", length, "seconds!")
-        #     start = time.time()
-
-        #     # union(radius hits, topK)
-        #     if all_i_parts:
-        #         i_hits = torch.cat(all_i_parts, dim=0)
-        #         j_hits = torch.cat(all_j_parts, dim=0)
-        #     else:
-        #         i_hits = torch.empty(0, dtype=torch.long, device=dev)
-        #         j_hits = torch.empty(0, dtype=torch.long, device=dev)
-
-        #     if K > 0:
-        #         i_topk = torch.arange(N, device=dev).unsqueeze(1).expand(-1, K).reshape(-1)
-        #         j_topk = topk_idx.reshape(-1)
-        #         i_idx = torch.cat([i_hits, i_topk], dim=0)
-        #         j_idx = torch.cat([j_hits, j_topk], dim=0)
-        #     else:
-        #         i_idx, j_idx = i_hits, j_hits
-
-        #     # dedup
-        #     if i_idx.numel() == 0:
-        #         return
-        #     pairs = torch.stack([i_idx, j_idx], dim=1)
-        #     pairs = torch.unique(pairs, dim=0)
-        #     i_idx, j_idx = pairs[:, 0], pairs[:, 1]
-
-
-        # vox_ijk = self._unhash_keys(self.keys).to(torch.int32)   # (M, 3)
-
-
-
-        # with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
-
-        #     dev = self.device
-        #     N   = int(pts_world.shape[0])
-        #     M   = int(self.keys.shape[0])
-        #     K   = min(int(self.routing_topk), M)
-            
-        #     D = self.feature_dim
-
-        #     vox = float(self.p.voxel_size)
-
-        #     # Precompute voxel centers on device
-        #     vox_xyz = self.origin.to(torch.float32) + (self._unhash_keys(self.keys).to(torch.float32) + 0.5) * vox
-        #     vox_xyz = vox_xyz.to(dev).contiguous()
-
-        #     # Query chunk size (tune). Keep memory safe.
-        #     CH = 256_000  # try 100k–300k depending on VRAM
-
-        #     # Cap for neighbors within radius (tune)
-        #     if radius > 0:
-        #         r_vox = int(math.ceil(radius / max(vox, 1e-8))) + int(neighbor_pad)
-        #         r_vox = min(r_vox, int(r_vox_cap))
-        #         # geometric upper bound, then clamp to a practical cap
-        #         K_ball_bound = (2 * r_vox + 1) ** 3
-        #         K_ball_cap   = 32  # try 256–1024
-        #         K_ball = min(M, K_ball_bound, K_ball_cap)
-        #     else:
-        #         K_ball = 0
-
-        #     all_i_parts, all_j_parts = [], []
-
-        #     # Process points in chunks to bound allocations
-        #     for i0 in range(0, N, CH):
-        #         i1 = min(i0 + CH, N)
-        #         pts_chunk = pts_world[i0:i1].to(dev, torch.float32).contiguous()
-
-        #         # reshape to (1, n, 3) / (1, M, 3)
-        #         pts_b = pts_chunk.unsqueeze(0)
-        #         vox_b = vox_xyz.unsqueeze(0)  # reuse, just add batch dim
-
-        #         # --- radius neighbors (indices only) ---
-                    
-        #         if K_ball > 0:
-        #             # IMPORTANT: return_nn=False so it doesn't gather neighbor coords (saves tons of VRAM)
-        #             res = ball_query(pts_b, vox_b, K=K_ball, radius=float(radius), return_nn=False)
-        #             idx_ball = res.idx  # (1, N, K_ball)  <-- KNN object → .idx
-        #             idx_ball = idx_ball.squeeze(0)  # (N, K_ball)
-
-        #             valid_mask = idx_ball >= 0
-        #             if valid_mask.any():
-        #                 ii_local, kk = torch.where(valid_mask)
-        #                 jj = idx_ball[ii_local, kk]
-        #                 all_i_parts.append(ii_local.to(torch.long) + i0)  # <-- ADD i0!
-        #                 all_j_parts.append(jj.to(torch.long))
-        #         # --- top-K neighbors (indices only) ---
-                
-                
-        #         # if K > 0:
-        #         #     # # return_nn=False avoids building (n,K,3)
-        #         #     # d2_k, idx_k, _ = knn_points(pts_b, vox_b, K=K, return_nn=False)
-        #         #     # # we only need indices; discard dists to save memory
-        #         #     # idx_k = idx_k.squeeze(0)  # (n, K)
-        #         #     # i_topk = torch.arange(i0, i1, device=dev).unsqueeze(1).expand(-1, K).reshape(-1)
-        #         #     # j_topk = idx_k.reshape(-1)
-        #         #     # all_i_parts.append(i_topk)
-        #         #     # all_j_parts.append(j_topk)
-                    
-                    
-        #         #     r_vox = int(math.ceil(radius / max(vox, 1e-8))) + int(neighbor_pad)
-        #         #     r_vox = min(r_vox, int(r_vox_cap))
-
-        #         #     # KNN
-        #         #     _, idx_k, _ = knn_points(pts_b, vox_b, K=K, return_nn=False)  # (1,n,K)
-        #         #     idx_k = idx_k.squeeze(0)                                      # (n,K)
-
-        #         #     # stencil filter
-        #         #     ijk0 = self._world_to_ijk(pts_chunk).to(torch.int32)          # (n,3)
-        #         #     nbr_ijk = vox_ijk[idx_k]                                      # (n,K,3) int32
-        #         #     dijk = (nbr_ijk - ijk0[:, None, :]).abs()                     # (n,K,3)
-        #         #     mask = (dijk <= r_vox).all(dim=-1)                            # (n,K)
-
-        #         #     ii_local, kk = torch.where(mask)
-        #         #     jj = idx_k[ii_local, kk]
-
-        #         #     all_i_parts.append(ii_local.to(torch.long) + i0)
-        #         #     all_j_parts.append(jj.to(torch.long))
-
-
-        #     # Union + dedup
-        #     if not all_i_parts:
-        #         return
-        #     i_idx = torch.cat(all_i_parts, dim=0)
-        #     j_idx = torch.cat(all_j_parts, dim=0)
-
-        #     # fast 1D-hash dedup
-        #     h = (i_idx.to(torch.int64) << 32) | j_idx.to(torch.int64)
-        #     h_u = torch.unique(h)
-        #     i_idx = (h_u >> 32).to(torch.long)
-        #     j_idx = (h_u & ((1 << 32) - 1)).to(torch.long)
-
-
-
-        #     # N = number of points
-        #     counts_per_point = torch.bincount(i_idx, minlength=N)   # (N,)
-
-        #     print("Mean neighbors:", float(counts_per_point.float().mean()))
-        #     print("Max neighbors:", int(counts_per_point.max()))
-        #     print("Min neighbors:", int(counts_per_point.min()))
-
-
-        #     unique_counts, freq = torch.unique(counts_per_point, return_counts=True)
-        #     for c, f in zip(unique_counts.tolist(), freq.tolist()):
-        #         print(f"{c} neighbors → {f} points")
-
-        #     end = time.time()
-        #     length = end - start
-
-        #     print("Pairs took", length, "seconds!")
-            
-        #     start = time.time()
-            
-            
-        #     # ---- unchanged fuse path below ----
-        #     vox_xyz = self.origin + (self._unhash_keys(self.keys).to(torch.float32) + 0.5) * vox
-        #     p_sel = pts_world[i_idx].to(dev)
-        #     f_sel = f_pts[i_idx].to(dev)
-        #     f_sel = self.z_proj(f_sel)               # (R,64)  <-- project to latent dim
-        #     v_sel = vox_xyz[j_idx]
-        #     z_sel = self.z_latent[j_idx]
-        #     delta = p_sel - v_sel
-
-        #     sim_flat = self.sim_net(f_sel, z_sel, delta)
-
-
-
-        #     end = time.time()
-        #     length = end - start
-
-        #     print("Sim took", length, "seconds!")
-        #     start = time.time()
-            
-        #     upd = torch.zeros(M, D, device=dev, dtype=torch.float32)
-        #     got_mass = torch.zeros(M, dtype=torch.bool, device=dev)
-
-        #     Nfull = int(N)
-        #     tau = max(float(self.routing_tau), 1e-6)
-        #     max_per_i = torch.full((Nfull,), -1e9, device=sim_flat.device, dtype=sim_flat.dtype)
-        #     max_per_i = max_per_i.scatter_reduce(0, i_idx, sim_flat, reduce="amax", include_self=True)
-        #     sim_shift = sim_flat - max_per_i[i_idx]
-        #     w_unnorm  = torch.exp(sim_shift / tau)
-        #     sum_per_i = torch.zeros(Nfull, device=sim_flat.device, dtype=sim_flat.dtype).scatter_add(0, i_idx, w_unnorm)
-        #     weights   = w_unnorm / (sum_per_i[i_idx] + 1e-8)
-        #     upd.index_add_(0, jj, weights.unsqueeze(-1) * f_sel)
-        #     got_mass[jj] = True
-
-
-
-
-        #     end = time.time()
-        #     length = end - start
-
-        #     print("Weights took", length, "seconds!")
-            
-        #     # start = time.time()
-            
-        #     # M = self.keys.shape[0]
-        #     # D = self.feature_dim
-        #     # upd = torch.zeros(M, D, device=dev, dtype=f_sel.dtype)
-        #     # upd.index_add_(0, j_idx, weights.unsqueeze(-1) * f_sel)
-
-        #     # got_mass = torch.zeros(M, dtype=torch.bool, device=dev); got_mass[j_idx] = True
-        #     # idx_upd = got_mass.nonzero(as_tuple=False).squeeze(-1)
-        #     # if idx_upd.numel() == 0:
-        #     #     return
-
-        #     # u = upd[idx_upd]
-        #     # z = self.z_latent[idx_upd]
-        #     # gamma = torch.sigmoid(self.gate_mlp(torch.cat([u, z], dim=-1)))
-        #     # x_in  = gamma * u
-        #     # z_new = self.gru_cell(x_in, z)
-        #     # self.z_latent.index_copy_(0, idx_upd, z_new)
-        #     # end = time.time()
-        #     # length = end - start
-
-        #     # print("Gru took", length, "seconds!")
-            
-            
-                        
-        #     start = time.time()
-
-                        
-        #     # PAIR_CH = 50_000_000  # tune to your VRAM (start with 0.5–2M)
-            
-        #     # # Helpful handles
-        #     # vox = float(self.p.voxel_size)
-        #     # if 'vox_xyz' not in locals():
-        #     #     vox_xyz = self.origin.to(torch.float32) + (self._unhash_keys(self.keys).to(torch.float32) + 0.5) * vox
-        #     #     vox_xyz = vox_xyz.to(dev)
-
-        #     # M = self.keys.shape[0]
-        #     # D = self.feature_dim
-        #     # tau = max(float(self.routing_tau), 1e-6)
-
-        #     # # Pass 1: max_per_i
-        #     # max_per_i = torch.full((int(N),), -1e30, device=dev, dtype=torch.float32)
-        #     # for p0 in range(0, i_idx.numel(), PAIR_CH):
-        #     #     p1 = min(p0 + PAIR_CH, i_idx.numel())
-        #     #     ii = i_idx[p0:p1]
-        #     #     jj = j_idx[p0:p1]
-
-        #     #     # gather inputs for sim
-        #     #     p_sel = pts_world[ii].to(dev, torch.float32)          # (r,3)
-        #     #     v_sel = vox_xyz[jj]                                   # (r,3)
-        #     #     z_sel = self.z_latent[jj]                             # (r, Z)
-        #     #     f_sel = f_pts[ii].to(dev)                             # (r, D_in)
-        #     #     f_sel = self.z_proj(f_sel)                            # (r, Z_lat)
-        #     #     delta = p_sel - v_sel
-        #     #     sim   = self.sim_net(f_sel, z_sel, delta).to(torch.float32)   # (r,)
-
-        #     #     # scatter amax
-        #     #     max_per_i = torch.scatter_reduce(
-        #     #         max_per_i, 0, ii, sim, reduce="amax", include_self=True
-        #     #     )
-        #     #     del p_sel, v_sel, z_sel, f_sel, delta, sim
-
-        #     # # Pass 2: sum_per_i
-        #     # sum_per_i = torch.zeros(int(N), device=dev, dtype=torch.float32)
-        #     # for p0 in range(0, i_idx.numel(), PAIR_CH):
-        #     #     p1 = min(p0 + PAIR_CH, i_idx.numel())
-        #     #     ii = i_idx[p0:p1]
-        #     #     jj = j_idx[p0:p1]
-
-        #     #     p_sel = pts_world[ii].to(dev, torch.float32)
-        #     #     v_sel = vox_xyz[jj]
-        #     #     z_sel = self.z_latent[jj]
-        #     #     f_sel = f_pts[ii].to(dev)
-        #     #     # f_sel = self.z_proj(f_sel)
-        #     #     delta = p_sel - v_sel
-        #     #     sim   = self.sim_net(f_sel, z_sel, delta).to(torch.float32)
-
-        #     #     w_unnorm = torch.exp((sim - max_per_i[ii]) / tau)
-        #     #     sum_per_i.scatter_add_(0, ii, w_unnorm)
-        #     #     del p_sel, v_sel, z_sel, f_sel, delta, sim, w_unnorm
-
-        #     # # Prevent division by zero for points with no mass
-        #     # sum_per_i = sum_per_i + 1e-8
-
-        #     # # # Pass 3: final accumulation into voxels
-        #     # # upd = torch.zeros(M, D, device=dev, dtype=torch.float32)
-        #     # # got_mass = torch.zeros(M, dtype=torch.bool, device=dev)
-
-        #     # # for p0 in range(0, i_idx.numel(), PAIR_CH):
-        #     # #     p1 = min(p0 + PAIR_CH, i_idx.numel())
-        #     # #     ii = i_idx[p0:p1]
-        #     # #     jj = j_idx[p0:p1]
-
-        #     # #     p_sel = pts_world[ii].to(dev, torch.float32)
-        #     # #     v_sel = vox_xyz[jj]
-        #     # #     z_sel = self.z_latent[jj]
-        #     # #     f_sel = f_pts[ii].to(dev)
-        #     # #     f_sel = self.z_proj(f_sel)
-        #     # #     delta = p_sel - v_sel
-        #     # #     sim   = self.sim_net(f_sel, z_sel, delta).to(torch.float32)
-
-        #     # #     w_unnorm = torch.exp((sim - max_per_i[ii]) / tau)
-        #     # #     weights  = w_unnorm / sum_per_i[ii]
-        #     # #     # accumulate features
-        #     # #     upd.index_add_(0, jj, weights.unsqueeze(-1) * f_sel)
-        #     # #     got_mass[jj] = True
-
-        #     # #     del p_sel, v_sel, z_sel, f_sel, delta, sim, w_unnorm, weights
-
-        #     # # idx_upd = got_mass.nonzero(as_tuple=False).squeeze(-1)
-        #     # # if idx_upd.numel() == 0:
-        #     # #     return
-
-        #     # # # GRU update (unchanged)
-        #     # # u = upd[idx_upd].to(self.z_latent.dtype)
-        #     # # z = self.z_latent[idx_upd]
-        #     # # gamma = torch.sigmoid(self.gate_mlp(torch.cat([u, z], dim=-1)))
-        #     # # x_in  = gamma * u
-        #     # # z_new = self.gru_cell(x_in, z)
-        #     # # self.z_latent.index_copy_(0, idx_upd, z_new)
-
-
-
-
-
-        #     # # Pass 3 (Final GRU update) adjusted for efficiency
-        #     # upd = torch.zeros(M, D, device=dev, dtype=torch.float32)
-        #     # got_mass = torch.zeros(M, dtype=torch.bool, device=dev)
-
-        #     # # Efficient accumulation and GRU update in batches
-        #     # for p0 in range(0, i_idx.numel(), PAIR_CH):  # PAIR_CH = e.g., 1M
-        #     #     p1 = min(p0 + PAIR_CH, i_idx.numel())
-        #     #     ii = i_idx[p0:p1]
-        #     #     jj = j_idx[p0:p1]
-
-        #     #     p_sel = pts_world[ii].to(dev, torch.float32)   # (r,3)
-        #     #     v_sel = vox_xyz[jj]                            # (r,3)
-        #     #     z_sel = self.z_latent[jj]                      # (r, Z)
-        #     #     f_sel = f_pts[ii].to(dev)                      # (r, D_in)
-        #     #     f_sel = self.z_proj(f_sel)                     # (r, Z_lat)
-        #     #     delta = p_sel - v_sel
-        #     #     sim = self.sim_net(f_sel, z_sel, delta).to(torch.float32)  # (r,)
-
-        #     #     w_unnorm = torch.exp((sim - max_per_i[ii]) / tau)
-        #     #     weights = w_unnorm / sum_per_i[ii]
-                
-        #     #     # Accumulate features
-        #     #     upd.index_add_(0, jj, weights.unsqueeze(-1) * f_sel)
-        #     #     got_mass[jj] = True
-
-        #     #     del p_sel, v_sel, z_sel, f_sel, delta, sim, w_unnorm, weights
-
-        #     # Indices that were updated
-        #     idx_upd = got_mass.nonzero(as_tuple=False).squeeze(-1)
-        #     if idx_upd.numel() == 0:
-        #         return
-
-        #     # Batch update with GRU
-        #     u = upd[idx_upd].to(self.z_latent.dtype)
-        #     z = self.z_latent[idx_upd]
-        #     gamma = torch.sigmoid(self.gate_mlp(torch.cat([u, z], dim=-1)))
-        #     x_in = gamma * u
-        #     z_new = self.gru_cell(x_in, z)
-
-        #     # Efficiently update the GRU state in place
-        #     self.z_latent.index_copy_(0, idx_upd, z_new)
-
-          
-
-
-
-
-        #     end = time.time()
-        #     length = end - start
-        #     print("Gru took", length, "seconds!")
-            
             
     # ---------- exports ----------
     def to_numpy(self):
@@ -1842,48 +1267,4 @@ class LatentVoxelGrid(nn.Module):
                 self.seen_occ_epoch[touched_idx] = now
 
 
-    def reset_state(self, origin_xyz: Optional[np.ndarray] = None) -> None:
-        """
-        Reset all *map state* (keys, log-odds, counts, latent codes, epoch)
-        while keeping the learnable networks (sim_net, gru_cell, gate_mlp, ...)
-        and hyperparameters intact.
-
-        Call this at the start of a new sequence/scene instead of creating
-        a brand new LatentVoxelGrid, so the optimizer still sees the same params.
-        """
-        # If you want to change the map origin for a new scene
-        if origin_xyz is not None:
-            # keep dtype/device aligned with the module
-            self.origin = torch.as_tensor(
-                origin_xyz, dtype=self.dtype, device=self.origin.device
-            ).reshape(3)
-
-        # use current device (handles .to("cuda") correctly)
-        device = self.origin.device
-        self.device = device
-
-        # ---- sparse grid / log-odds buffers ----
-        self.keys           = torch.empty(0, dtype=torch.int64,   device=device)
-        self.vals_st        = torch.empty(0, dtype=self.dtype,    device=device)
-        self.vals_lt        = torch.empty(0, dtype=self.dtype,    device=device)
-        self.vals           = torch.empty(0, dtype=self.dtype,    device=device)
-
-        self.hit_count      = torch.empty(0, dtype=torch.int32,   device=device)
-        self.pos_occ_count  = torch.empty(0, dtype=torch.int16,   device=device)
-        self.neg_free_count = torch.empty(0, dtype=torch.int16,   device=device)
-        self.last_occ_epoch = torch.empty(0, dtype=torch.int32,   device=device)
-        self.last_free_epoch= torch.empty(0, dtype=torch.int32,   device=device)
-        self.view_bits      = torch.empty(0, dtype=torch.int16,   device=device)
-        self.seen_occ_epoch = torch.empty(0, dtype=torch.int32,   device=device)
-        self.seen_view_bits_e = torch.empty(0, dtype=torch.int16, device=device)
-        self.occ_epoch_count  = torch.empty(0, dtype=torch.int16, device=device)
-        self.view_bits_cum    = torch.empty(0, dtype=torch.int16, device=device)
-        self.lt_promoted_flag = torch.empty(0, dtype=torch.uint8, device=device)
-
-        # ---- latent memory per voxel ----
-        self.z_latent = torch.empty(
-            (0, self.feature_dim), dtype=self.dtype, device=device
-        )
-
-        # reset logical time
-        self.epoch = 0
+   
