@@ -304,45 +304,45 @@ class LatentVoxelGrid(nn.Module):
         self.register_buffer(name, torch.empty(shape, dtype=dtype_), persistent=persistent)
         
     def reset_state(self, origin_xyz: Optional[np.ndarray] = None) -> None:
-            """
-            Reset all *map state* (keys, log-odds, counts, latent codes, epoch)
-            while keeping the learnable networks (sim_net, gru_cell, gate_mlp, ...)
-            and hyperparameters intact.
+        """
+        Reset all *map state* (keys, log-odds, counts, latent codes, epoch)
+        while keeping the learnable networks (sim_net, gru_cell, gate_mlp, ...)
+        and hyperparameters intact.
 
-            Call this at the start of a new sequence/scene instead of creating
-            a brand new LatentVoxelGrid, so the optimizer still sees the same params.
-            """
-            # If you want to change the map origin for a new scene
-            if origin_xyz is not None:
-                # keep dtype/device aligned with the module
-                self.origin = torch.as_tensor(
-                    origin_xyz, dtype=self.dtype, device=self.device
-                ).reshape(3)
+        Call this at the start of a new sequence/scene instead of creating
+        a brand new LatentVoxelGrid, so the optimizer still sees the same params.
+        """
+        # If you want to change the map origin for a new scene
+        if origin_xyz is not None:
+            # keep dtype/device aligned with the module
+            self.origin = torch.as_tensor(
+                origin_xyz, dtype=self.dtype, device=self.device
+            ).reshape(3)
 
-        
+    
 
-            self.eb("keys",           (0,),     torch.int64)
-            self.eb("vals_st",        (0,),     self.dtype)
-            self.eb("vals_lt",        (0,),     self.dtype)
-            self.eb("vals",           (0,),     self.dtype)
-            self.eb("hit_count",      (0,),     torch.int32)
-            self.eb("pos_occ_count",  (0,),     torch.int16)
-            self.eb("neg_free_count", (0,),     torch.int16)
-            self.eb("last_occ_epoch", (0,),     torch.int32)
-            self.eb("last_free_epoch",(0,),     torch.int32)
-            self.eb("view_bits",      (0,),     torch.int16)
-            self.eb("seen_occ_epoch", (0,),     torch.int32)
-            self.eb("seen_view_bits_e",(0,),    torch.int16)
-            self.eb("occ_epoch_count",(0,),     torch.int16)
-            self.eb("view_bits_cum",  (0,),     torch.int16)
-            self.eb("lt_promoted_flag",(0,),    torch.uint8)
+        self.eb("keys",           (0,),     torch.int64)
+        self.eb("vals_st",        (0,),     self.dtype)
+        self.eb("vals_lt",        (0,),     self.dtype)
+        self.eb("vals",           (0,),     self.dtype)
+        self.eb("hit_count",      (0,),     torch.int32)
+        self.eb("pos_occ_count",  (0,),     torch.int16)
+        self.eb("neg_free_count", (0,),     torch.int16)
+        self.eb("last_occ_epoch", (0,),     torch.int32)
+        self.eb("last_free_epoch",(0,),     torch.int32)
+        self.eb("view_bits",      (0,),     torch.int16)
+        self.eb("seen_occ_epoch", (0,),     torch.int32)
+        self.eb("seen_view_bits_e",(0,),    torch.int16)
+        self.eb("occ_epoch_count",(0,),     torch.int16)
+        self.eb("view_bits_cum",  (0,),     torch.int16)
+        self.eb("lt_promoted_flag",(0,),    torch.uint8)
 
-            # ---- latent memory per voxel ----
-            self.z_latent = torch.empty((0, self.feature_dim), dtype=self.dtype, device=self.device)
+        # ---- latent memory per voxel ----
+        self.z_latent = torch.empty((0, self.feature_dim), dtype=self.dtype, device=self.device)
 
 
-            # reset logical time
-            self.epoch = 0
+        # reset logical time
+        self.epoch = 0
             
     # ---------- utilities ----------
     def _world_to_ijk(self, pts: torch.Tensor) -> torch.Tensor:
