@@ -704,15 +704,10 @@ class VoxelUpdaterSystem(pl.LightningModule):
         cfg = self.cfg
         device = self.device
         opt = self.optimizers()
+        
+        self.vox.reset_state(origin_xyz=np.zeros(3, dtype=np.float32))
 
-        self.vox = LatentVoxelGrid(
-            origin_xyz=np.zeros(3, dtype=np.float32),
-            params=VoxelParams(voxel_size=self.voxel_size, promote_hits=2),
-            device=self.device, feature_dim=self.feature_dim
-        )
         
-        
-        self.vox = self.vox.to(self.device)
         
         self.vox_gt = TorchSparseVoxelGrid(
             origin_xyz=np.zeros(3, dtype=np.float32),
@@ -889,8 +884,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
             torch.cuda.empty_cache()
         
-        self.log("loss/total", loss_total, prog_bar=True)
-        
+        # Add on_epoch=True to smooth the loss curve and save based on the average
+        self.log("loss/total", loss_total, prog_bar=True, on_epoch=True)        
         
       
 
@@ -903,15 +898,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
         cfg = self.cfg
 
-        self.vox = LatentVoxelGrid(
-            origin_xyz=np.zeros(3, dtype=np.float32),
-            params=VoxelParams(voxel_size=self.voxel_size, promote_hits=2),
-            device=self.device, feature_dim=self.feature_dim
-        )
-        
-        
-        self.vox = self.vox.to(self.device)
-        
+        self.vox.reset_state(origin_xyz=np.zeros(3, dtype=np.float32))
+
         self.vox_gt = TorchSparseVoxelGrid(
             origin_xyz=np.zeros(3, dtype=np.float32),
             params=VoxelParams(voxel_size=self.voxel_size, promote_hits=2),
@@ -1007,7 +995,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
             torch.cuda.empty_cache()
 
 
-        self.log("val/loss_total", val_loss_total, prog_bar=True)
+        self.log("val/loss_total", val_loss_total, prog_bar=True, on_epoch=True)
         return val_loss_total
 
     
@@ -1367,10 +1355,11 @@ def main():
     sys = VoxelUpdaterSystem(cfg)
 
     ckpt_cb = pl.callbacks.ModelCheckpoint(
-        monitor="loss/total",
+        dirpath="checkpoints/",       # Explicitly set a folder so you can find them
+        monitor="val/loss_total",
         save_top_k=3,
         mode="min",
-        filename="voxup-{epoch:02d}-{loss_total:.4f}"
+        filename="voxup-{epoch:02d}-{val_loss_total:.4f}" # Match the key logged in validation_step
     )
     lr_cb = pl.callbacks.LearningRateMonitor(logging_interval="step")
 

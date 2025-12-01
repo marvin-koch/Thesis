@@ -1840,3 +1840,50 @@ class LatentVoxelGrid(nn.Module):
                     # grow aux arrays just in case
                     self._ensure_and_index(torch.empty(0, dtype=torch.int64, device=self.device))
                 self.seen_occ_epoch[touched_idx] = now
+
+
+    def reset_state(self, origin_xyz: Optional[np.ndarray] = None) -> None:
+        """
+        Reset all *map state* (keys, log-odds, counts, latent codes, epoch)
+        while keeping the learnable networks (sim_net, gru_cell, gate_mlp, ...)
+        and hyperparameters intact.
+
+        Call this at the start of a new sequence/scene instead of creating
+        a brand new LatentVoxelGrid, so the optimizer still sees the same params.
+        """
+        # If you want to change the map origin for a new scene
+        if origin_xyz is not None:
+            # keep dtype/device aligned with the module
+            self.origin = torch.as_tensor(
+                origin_xyz, dtype=self.dtype, device=self.origin.device
+            ).reshape(3)
+
+        # use current device (handles .to("cuda") correctly)
+        device = self.origin.device
+        self.device = device
+
+        # ---- sparse grid / log-odds buffers ----
+        self.keys           = torch.empty(0, dtype=torch.int64,   device=device)
+        self.vals_st        = torch.empty(0, dtype=self.dtype,    device=device)
+        self.vals_lt        = torch.empty(0, dtype=self.dtype,    device=device)
+        self.vals           = torch.empty(0, dtype=self.dtype,    device=device)
+
+        self.hit_count      = torch.empty(0, dtype=torch.int32,   device=device)
+        self.pos_occ_count  = torch.empty(0, dtype=torch.int16,   device=device)
+        self.neg_free_count = torch.empty(0, dtype=torch.int16,   device=device)
+        self.last_occ_epoch = torch.empty(0, dtype=torch.int32,   device=device)
+        self.last_free_epoch= torch.empty(0, dtype=torch.int32,   device=device)
+        self.view_bits      = torch.empty(0, dtype=torch.int16,   device=device)
+        self.seen_occ_epoch = torch.empty(0, dtype=torch.int32,   device=device)
+        self.seen_view_bits_e = torch.empty(0, dtype=torch.int16, device=device)
+        self.occ_epoch_count  = torch.empty(0, dtype=torch.int16, device=device)
+        self.view_bits_cum    = torch.empty(0, dtype=torch.int16, device=device)
+        self.lt_promoted_flag = torch.empty(0, dtype=torch.uint8, device=device)
+
+        # ---- latent memory per voxel ----
+        self.z_latent = torch.empty(
+            (0, self.feature_dim), dtype=self.dtype, device=device
+        )
+
+        # reset logical time
+        self.epoch = 0
