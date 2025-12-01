@@ -320,6 +320,8 @@ class LatentVoxelGrid(nn.Module):
         
         current_device = self.gate_mlp[0].weight.device
         
+        self.device = current_device
+        
         # 2. Update self.device so other methods (like _ensure_and_index) use the correct device
         
         # If you want to change the map origin for a new scene
