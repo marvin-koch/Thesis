@@ -696,6 +696,14 @@ class VoxelUpdaterSystem(pl.LightningModule):
         orig_to_sorted = torch.argsort(dst_sort_idx)   # original idx -> sorted idx
         return out_sorted[orig_to_sorted]
 
+
+    def compute_grad_norm(self):
+        total_norm = 0.0
+        for p in self.parameters():
+            if p.grad is not None:
+                total_norm += p.grad.detach().norm(2).item() ** 2
+        return total_norm ** 0.5
+    
     def training_step(self, batch: Dict, batch_idx: int):
         """
         One batch = one sequence.
@@ -848,12 +856,18 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
             # --- per-timestep backward + step ---
             opt.zero_grad(set_to_none=True)
+            
+            torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)            
+            
             self.manual_backward(loss_t)
-            torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
 
-            opt.step()
-            
-            
+            # add:
+            grad_norm = self.compute_grad_norm()
+            self.log("grad_norm", grad_norm, prog_bar=True, on_step=True, on_epoch=False)
+
+            # then:
+            opt.step()            
+
             loss_total = loss_total + loss_t.detach()
             
             print(loss_t.detach())
