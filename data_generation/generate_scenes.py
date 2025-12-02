@@ -4,6 +4,8 @@ import habitat_sim
 from habitat_sim.utils.common import quat_from_two_vectors, quat_from_magnum
 import magnum as mn
 import random
+from PIL import Image
+from PIL.PngImagePlugin import PngInfo
 
 def score_center(
     sim: habitat_sim.Simulator,
@@ -783,6 +785,30 @@ def run_for_scene(scene_path: str, args, root_for_rel = None):
                     #     D = obs["depth"].astype(np.float32)
                     #     depth_name = f"cam{i_cam}_depth.npy"
                     #     np.save(os.path.join(time_dir, depth_name), D)
+                    
+                    depth_name = None
+                    if "depth" in obs:
+                        D = obs["depth"].astype(np.float32)
+
+                        # Compute per-image depth range
+                        min_depth = float(np.nanmin(D))
+                        max_depth = float(np.nanmax(D))
+
+
+                        # Scale to 16-bit range [0, 65535]
+                        scaled = ((D - min_depth) * (65535.0 / (max_depth - min_depth))).astype(np.uint16)
+
+                        # Create 16-bit PNG
+                        img = Image.fromarray(scaled, mode="I;16")
+
+                        # Store min/max in PNG metadata (like in your reference script)
+                        meta = PngInfo()
+                        meta.add_text("min_depth", repr(min_depth))
+                        meta.add_text("max_depth", repr(max_depth))
+
+                        depth_name = f"cam{i_cam}_depth.png"
+                        img.save(os.path.join(time_dir, depth_name), format="PNG", pnginfo=meta)
+                            
 
                     astate = sim.get_agent(i_cam).get_state()
                     pos = np.array(astate.position, dtype=np.float64)
@@ -825,6 +851,16 @@ def run_for_scene(scene_path: str, args, root_for_rel = None):
         except Exception:
             pass
         del sim
+
+def load_depth_png(path):
+    img = Image.open(path)
+    meta = img.info
+    min_depth = float(meta["min_depth"])
+    max_depth = float(meta["max_depth"])
+    arr = np.array(img, dtype=np.uint16)
+
+    depth = (arr.astype(np.float32) / 65535.0) * (max_depth - min_depth) + min_depth
+    return depth
 
 
 # ----------------- MODIFY your argparse + main() -----------------
