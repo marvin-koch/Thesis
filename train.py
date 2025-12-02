@@ -1242,7 +1242,7 @@ class HabitatDataModule(pl.LightningDataModule):
 
         print("got seqs")
         if self.train_val_split > 0.0:
-            random.Random(self.seed).shuffle(all_seqs)
+            #random.Random(self.seed).shuffle(all_seqs)
             n_val = max(1, int(len(all_seqs) * self.train_val_split))
             val_seqs = all_seqs[:n_val]
             train_seqs = all_seqs[n_val:]
