@@ -778,11 +778,11 @@ def run_for_scene(scene_path: str, args, root_for_rel = None):
                     rgb_name = f"cam{i_cam}.jpg"
                     imageio.imwrite(os.path.join(time_dir, rgb_name), rgb)
 
-                    depth_name = None
-                    if "depth" in obs:
-                        D = obs["depth"].astype(np.float32)
-                        depth_name = f"cam{i_cam}_depth.npy"
-                        np.save(os.path.join(time_dir, depth_name), D)
+                    # depth_name = None
+                    # if "depth" in obs:
+                    #     D = obs["depth"].astype(np.float32)
+                    #     depth_name = f"cam{i_cam}_depth.npy"
+                    #     np.save(os.path.join(time_dir, depth_name), D)
 
                     astate = sim.get_agent(i_cam).get_state()
                     pos = np.array(astate.position, dtype=np.float64)
@@ -846,8 +846,8 @@ def main():
     ap.add_argument("--num_cams", type=int, default=10)
     ap.add_argument("--fps", type=int, default=20)
     ap.add_argument("--secs", type=int, default=15)
-    ap.add_argument("--width", type=int, default=1280)
-    ap.add_argument("--height", type=int, default=720)
+    ap.add_argument("--width", type=int, default=512)
+    ap.add_argument("--height", type=int, default=512)
     ap.add_argument("--obj_x", type=float, default=-5.0)
     ap.add_argument("--obj_y", type=float, default=0.2)
     ap.add_argument("--obj_z", type=float, default=-0.5)
