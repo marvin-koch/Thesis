@@ -1249,6 +1249,7 @@ class HabitatDataModule(pl.LightningDataModule):
         train_val_split: float = 0.0,  # 0 = all train, else fraction for val (e.g., 0.1)
         seed: int = 42,
         skip=False,
+        seq_list: str = "/cluster/scratch/kochmar/renders/seq_manifest.json"
     ):
         super().__init__()
         self.dataset_root = dataset_root
@@ -1262,28 +1263,34 @@ class HabitatDataModule(pl.LightningDataModule):
         self.train_set = None
         self.val_set = None
         self.skip = skip
-
+        self.seq_list = seq_list
     def setup(self, stage: Optional[str] = None):
         print("getting seqs")
-        all_seqs = _sequence_dirs_from_root(self.dataset_root)
+        # all_seqs = _sequence_dirs_from_root(self.dataset_root)
         
         
-        gt_root = os.path.join(self.dataset_root, "gt_voxels_per_timestep")
-        if self.skip:
-            filtered = []
-            for seq_dir in all_seqs:
-                # reconstruct seq_id exactly like __getitem__
-                p = seq_dir.rstrip("/")
-                basis = os.path.basename(os.path.dirname(p)).replace(".basis", "")
-                final = os.path.basename(p)
-                seq_id = f"{basis}_{final}"
+        # gt_root = os.path.join(self.dataset_root, "gt_voxels_per_timestep")
+        # if self.skip:
+        #     filtered = []
+        #     for seq_dir in all_seqs:
+        #         # reconstruct seq_id exactly like __getitem__
+        #         p = seq_dir.rstrip("/")
+        #         basis = os.path.basename(os.path.dirname(p)).replace(".basis", "")
+        #         final = os.path.basename(p)
+        #         seq_id = f"{basis}_{final}"
 
-                # we just check for t=0 GT; adjust if you need stricter checks
-                gt_path_t0 = os.path.join(gt_root, f"{seq_id}_t0000_gt.npz")
-                if os.path.exists(gt_path_t0):
-                    filtered.append(seq_dir)
-            all_seqs = filtered
+        #         # we just check for t=0 GT; adjust if you need stricter checks
+        #         gt_path_t0 = os.path.join(gt_root, f"{seq_id}_t0000_gt.npz")
+        #         if os.path.exists(gt_path_t0):
+        #             filtered.append(seq_dir)
+        #     all_seqs = filtered
             
+        with open(self.seq_list) as f:
+            all_entries = json.load(f)
+
+        all_seqs = [e["seq_path"] for e in all_entries if e["has_gt"]]
+        all_ids  = [e["seq_id"]  for e in all_entries if e["has_gt"]]
+
         print("got seqs")
         if self.train_val_split > 0.0:
             random.Random(self.seed).shuffle(all_seqs)
