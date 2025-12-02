@@ -1050,16 +1050,29 @@ class HabitatSeqDataset(Dataset):
         verbose: bool = False,
         min_images_per_timestep: int = 1,
         sequences: Optional[List[str]] = None,   # pass a subset for train/val if you want
-        skip=False
+        skip=False,
+        seq_list: str = "/cluster/scratch/kochmar/renders/seq_manifest.json"
+
     ):
         self.root = dataset_root
         self.size = size
         self.verbose = verbose
         self.min_images_per_timestep = min_images_per_timestep
         self.skip = skip
+        self.seq_list = seq_list
         
         if sequences is None:
-            seqs = _sequence_dirs_from_root(dataset_root)
+            # seqs = _sequence_dirs_from_root(dataset_root)
+            with open(self.seq_list) as f:
+                all_entries = json.load(f)
+
+            if self.skip:
+                seqs = [e["seq_path"] for e in all_entries if e["has_gt"]]
+                all_ids  = [e["seq_id"]  for e in all_entries if e["has_gt"]]
+            else:
+                seqs = [e["seq_path"] for e in all_entries]
+                all_ids  = [e["seq_id"]  for e in all_entries]
+                
         else:
             seqs = [p if os.path.isabs(p) else os.path.join(dataset_root, p) for p in sequences]
         for s in seqs:
