@@ -248,7 +248,12 @@ class LatentVoxelGrid(nn.Module):
         super().__init__()
 
         # ---- core state ----
-        self.origin = torch.as_tensor(origin_xyz, dtype=dtype, device=device).reshape(3)
+        #self.origin = torch.as_tensor(origin_xyz, dtype=dtype, device=device).reshape(3)
+        self.register_buffer(
+            "origin",
+            torch.as_tensor(origin_xyz, dtype=dtype, device=device).reshape(3),
+            persistent=True
+        )
         self.p = params
         self.device = self.origin.device
         self.dtype = dtype
@@ -330,8 +335,9 @@ class LatentVoxelGrid(nn.Module):
             self.origin = torch.as_tensor(
                 origin_xyz, dtype=self.dtype, device=self.device
             ).reshape(3)
+        #else:
+        #    self.origin.to(self.device)
 
-    
 
         # self.eb("keys",           (0,),     torch.int64)
         # self.eb("vals_st",        (0,),     self.dtype)
