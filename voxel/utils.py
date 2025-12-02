@@ -798,115 +798,6 @@ def cam_to_world_torch(P_cam_hw3: torch.Tensor, Twc_4x4: torch.Tensor) -> torch.
     return Xw.view(H, W, 3)
 
 
-def build_frames_and_centers_vectorized(
-    predictions: dict,
-    *,
-    POINTS: str = "world_points_from_depth",
-    CONF: str = "world_points_conf",
-    IMG: str = "images",
-    FEAT: str = None,
-    EXTR_KEY: str = "extrinsic",
-    threshold: float = 50.0,     # percentile in [0,100]
-    Rmw: np.ndarray = np.eye(3, dtype=np.float32),   # (optional) world->map rot (not applied to points here)
-    tmw: np.ndarray = np.zeros(3, dtype=np.float32), # (optional) world->map trans (not applied to points here)
-    z_clip_map: tuple[float,float] | None = None,    # apply on (possibly flipped) points
-) -> tuple[list[np.ndarray], list[np.ndarray], tuple[int,int,int]]:
-    """
-    Vectorized prep:
-      - computes camera centers for all frames in one shot
-      - builds a global confidence threshold (percentile) once
-      - builds per-pixel validity mask in batch
-      - splits into per-frame arrays without looping over points
-
-    Returns:
-      frames_map: [ (N_i,3) float32 ]
-      cam_centers_map: [ (3,) float32 ]
-      sh: (S,H,W)   # original grid shape of POINTS/CONF
-    """ 
-
-    # --- load arrays ---
-
-    P = to_numpy(predictions[POINTS]).astype(np.float32)   # (S,H,W,3)
-    
-    if FEAT is not None:
-        F = to_numpy(predictions[FEAT]).astype(np.float32)   # (S,H,W,3)
-        feat_dim = F.shape[-1]
-
-    C = to_numpy(predictions.get(CONF, np.ones_like(P[...,0], dtype=np.float32))).astype(np.float32)  # (S,H,W)
-    I = to_numpy(predictions[IMG]).astype(np.float32)
-    print(P.shape)
-    print(C.shape)
-    EXTR = to_numpy(predictions[EXTR_KEY])                 # (S,3,4) or (S,4,4)
-
-    S, H, W = P.shape[:3]
-    
-    
-    if threshold == 0.0:
-        conf_threshold = 0.0
-    else:
-        conf_threshold = np.percentile(C, threshold)
-        
-    # pad extrinsics if needed -> (S,4,4)
-    if EXTR.ndim == 3 and EXTR.shape[1:] == (3,4):
-        bottom = np.tile(np.array([[0,0,0,1]], EXTR.dtype), (EXTR.shape[0],1,1))
-        EXTR = np.concatenate([EXTR, bottom], axis=1)
-
-    # # --- camera centers: Cw = -R^T t (all frames at once) ---
-    # Rwc = EXTR[:, :3, :3]                  # (S,3,3)
-    # twc = EXTR[:, :3, 3]                   # (S,3)
-    # Cw = -np.einsum('sij,sj->si', Rwc.transpose(0,2,1), twc)  # (S,3)
-    # Cm = (Rmw @ Cw.T).T + tmw[None, :]      # (S,3)
-    # cam_centers_map = [Cm[f].astype(np.float32) for f in range(S)]
-
-    Cw = EXTR[:, :3, 3]  # (S,3)   <-- correct for Twc
-    cam_centers_map = [Cw[f].astype(np.float32) for f in range(S)]
-
-    C_flat = C.reshape(-1)
-    C_flat = C_flat[np.isfinite(C_flat)]
-
-    # --- validity mask (vectorized) ---
-    finite_xyz = np.isfinite(P).all(axis=-1)              # (S,H,W)
-    finite_conf = np.isfinite(C)                          # (S,H,W)
-    conf_ok = (C >= conf_threshold) & (C > 1e-5)          # (S,H,W)
-    valid = finite_xyz & finite_conf & conf_ok            # (S,H,W)
-
-    # --- optional z clip (apply to your current “map-consistent” frame; you’re NOT applying Rmw to points here) ---
-    # If you want the clip in Z-up coordinates, apply R_w2m to P (vectorized), compute mask_z on that,
-    # but still *return* the original P (to keep your current behavior). Uncomment if needed:
-    if z_clip_map is not None:
-        z0, z1 = z_clip_map
-        # z-clip in current coordinates of P (what you visualize/use)
-        z = P[..., 2]                     # (S,H,W)
-        valid &= (z >= z0) & (z <= z1)
-
-    # --- gather per-frame points (no per-point loops) ---
-    P_flat = P.reshape(S, -1, 3)         # (S, H*W, 3)
-    I_flat = I.reshape(S, -1, 3)
-    V_flat = valid.reshape(S, -1)        # (S, H*W)
-    C_flat = C.reshape(S,-1)
-    
-    if FEAT is not None:
-        F_flat = F.reshape(S, -1, feat_dim)
-
-    frames_map = []
-    conf_map = []
-    images_map = []
-    feat_map = []
-    
-    for f in range(S):
-        conf_map.append(C_flat[f][V_flat[f]].astype(np.float32))
-        if not np.any(V_flat[f]):
-            frames_map.append(np.empty((0,3), dtype=np.float32))
-            continue
-        frames_map.append(P_flat[f][V_flat[f]].astype(np.float32))
-        images_map.append(I_flat[f][V_flat[f]].astype(np.float32))
-        
-        if FEAT is not None:
-            feat_map.append(F_flat[f][V_flat[f]].astype(np.float32))
-        
-    return frames_map, cam_centers_map, conf_map, images_map, feat_map if (FEAT is not None) else None , (S, H, W)
-
-
 import torch
 from typing import Optional
 def build_frames_and_centers_vectorized_torch(
@@ -1158,6 +1049,14 @@ def build_frames_and_centers_vectorized_torch(
     # --- Camera centers ---
     Cw = EXTR[:, :3, 3]  # (S, 3)
     
+    if Rmw is not None and tmw is not None:
+        # Camera Center C_new = R * C_old + t
+        # Note: Rmw is usually rotation of points. 
+        # Ensure Rmw/tmw match the transform applied to P.
+        
+        # If P_new = P_old @ Rmw.T + tmw (standard point rotation)
+        Cw = Cw @ Rmw.T + tmw
+        
     # --- Validity mask (fully vectorized) ---
     finite_xyz = torch.isfinite(P).all(dim=-1)  # (S, H, W)
     finite_conf = torch.isfinite(C)

@@ -268,7 +268,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
             
             start = time.time()
 
-            predictions = get_reconstructed_scene_no_opt(i, ".", imgs, self.model, self.device, False, 512, "", "linear", 100, 1, True, False, True, False, 0.05, "oneref", 1, 0, projector=self.projector)
+            predictions = get_reconstructed_scene_no_opt(i, ".", imgs, self.model, self.device, False, 512, "", "linear", 50, 1, True, False, True, False, 0.05, "oneref", 1, 0, projector=self.projector)
 
             self.keyframes = image_tensors.clone()
             
@@ -310,7 +310,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
    
             print("inference pred")
             mst = True
-            predictions = get_reconstructed_scene_no_opt(i, ".", imgs, self.model, self.device, False, 512, "", "linear", 100, 1, True, False, True, False, 0.05, "oneref", 1, 0, changed_gids=changed_idx, projector=self.projector)
+            predictions = get_reconstructed_scene_no_opt(i, ".", imgs, self.model, self.device, False, 512, "", "linear", 50, 1, True, False, True, False, 0.05, "oneref", 1, 0, changed_gids=changed_idx, projector=self.projector)
                 
             end = time.time()
             length = end - start
@@ -333,7 +333,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
         
         WPTS_m = rotate_points(predictions[POINTS], R_w2m, t_w2m)
         if Rmw is None or tmw is None:
-            Rmw, tmw, info = align_pointcloud_torch_fast(WPTS_m, inlier_dist=self.voxel_size*0.75, ransac_iters=200, point_chunk=5_000_000, cand_chunk=4096)
+            Rmw, tmw, info = align_pointcloud_torch_fast(WPTS_m, inlier_dist=self.voxel_size*0.75, ransac_iters=500, point_chunk=5_000_000, cand_chunk=4096)
         WPTS_m = rotate_points(WPTS_m, Rmw, tmw)
         predictions[POINTS] = WPTS_m
 
@@ -452,7 +452,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
         
         start = time.time()
 
-        predictions = get_reconstructed_scene_no_opt(0, ".", imgs, self.model, self.device, False, 512, "", "linear", 100, 1, True, False, True, False, 0.05, "oneref", 1, 0)
+        predictions = get_reconstructed_scene_no_opt(0, ".", imgs, self.model, self.device, False, 512, "", "linear", 50, 1, True, False, True, False, 0.05, "oneref", 1, 0)
         
         # self.keyframes = image_tensors.clone()
         
