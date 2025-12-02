@@ -1288,8 +1288,12 @@ class HabitatDataModule(pl.LightningDataModule):
         with open(self.seq_list) as f:
             all_entries = json.load(f)
 
-        all_seqs = [e["seq_path"] for e in all_entries if e["has_gt"]]
-        all_ids  = [e["seq_id"]  for e in all_entries if e["has_gt"]]
+        if self.skip:
+            all_seqs = [e["seq_path"] for e in all_entries if e["has_gt"]]
+            all_ids  = [e["seq_id"]  for e in all_entries if e["has_gt"]]
+        else:
+            all_seqs = [e["seq_path"] for e in all_entries]
+            all_ids  = [e["seq_id"]  for e in all_entries]
 
         print("got seqs")
         if self.train_val_split > 0.0:
