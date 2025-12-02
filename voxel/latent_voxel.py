@@ -147,6 +147,8 @@ class LatentToOccupancyDecoder(nn.Module):
         self.fc2 = nn.Linear(hidden, hidden)
         self.fc3 = nn.Linear(hidden, 1)
 
+        nn.init.constant_(self.fc3.bias, -2.0) # Sigmoid(-2.0) ~= 0.12
+        
     def _fourier_pe(self, xyz: torch.Tensor) -> torch.Tensor:
         """
         xyz: (..., 3) in meters. Returns (..., 3*2*B).
@@ -379,33 +381,33 @@ class LatentVoxelGrid(nn.Module):
         reset_buf("view_bits_cum",  (0,),     torch.int16)
         reset_buf("lt_promoted_flag",(0,),    torch.uint8)
         
-        # device = self.device
 
-        # self.keys           = torch.empty(0, dtype=torch.int64,  device=device)
 
-        # self.vals_st        = torch.empty(0, dtype=self.dtype,   device=device)
-        # self.vals_lt        = torch.empty(0, dtype=self.dtype,   device=device)
-        # self.vals           = torch.empty(0, dtype=self.dtype,   device=device)
-
-        # self.hit_count      = torch.empty(0, dtype=torch.int32,  device=device)
-        # self.pos_occ_count  = torch.empty(0, dtype=torch.int16,  device=device)
-        # self.neg_free_count = torch.empty(0, dtype=torch.int16,  device=device)
-        # self.last_occ_epoch = torch.empty(0, dtype=torch.int32,  device=device)
-        # self.last_free_epoch= torch.empty(0, dtype=torch.int32,  device=device)
-        # self.view_bits      = torch.empty(0, dtype=torch.int16,  device=device)
-        # self.seen_occ_epoch = torch.empty(0, dtype=torch.int32,  device=device)
-        # self.seen_view_bits_e = torch.empty(0, dtype=torch.int16, device=device)
-        # self.occ_epoch_count  = torch.empty(0, dtype=torch.int16, device=device)
-        # self.view_bits_cum    = torch.empty(0, dtype=torch.int16, device=device)
-        # self.lt_promoted_flag = torch.empty(0, dtype=torch.uint8, device=device)
-        
         # ---- latent memory per voxel ----
         self.z_latent = torch.empty((0, self.feature_dim), dtype=self.dtype, device=current_device)
 
 
         # reset logical time
         self.epoch = 0
-            
+        
+    def kaiming_init(self, module):
+        if isinstance(module, torch.nn.Linear):
+            torch.nn.init.kaiming_normal_(module.weight, nonlinearity="relu")
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+
+        if isinstance(module, (torch.nn.Conv2d, torch.nn.Conv3d)):
+            torch.nn.init.kaiming_normal_(module.weight, nonlinearity="relu")
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+
+        if isinstance(module, torch.nn.GRUCell):
+            for name, param in module.named_parameters():
+                if "weight" in name:
+                    torch.nn.init.xavier_uniform_(param)  # safer for GRU
+                elif "bias" in name:
+                    torch.nn.init.zeros_(param) 
+                    
     # ---------- utilities ----------
     def _world_to_ijk(self, pts: torch.Tensor) -> torch.Tensor:
         rel = (pts - self.origin) / self.p.voxel_size
@@ -986,23 +988,7 @@ class LatentVoxelGrid(nn.Module):
             self.z_latent = z
 
 
-    def kaiming_init(self, module):
-        if isinstance(module, torch.nn.Linear):
-            torch.nn.init.kaiming_normal_(module.weight, nonlinearity="relu")
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
 
-        if isinstance(module, (torch.nn.Conv2d, torch.nn.Conv3d)):
-            torch.nn.init.kaiming_normal_(module.weight, nonlinearity="relu")
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-
-        if isinstance(module, torch.nn.GRUCell):
-            for name, param in module.named_parameters():
-                if "weight" in name:
-                    torch.nn.init.xavier_uniform_(param)  # safer for GRU
-                elif "bias" in name:
-                    torch.nn.init.zeros_(param)
                     
     #@torch.no_grad()  # remove this decorator during training so gradients flow into sim_net & GRU
     def update_with_features_learned(
@@ -1026,89 +1012,7 @@ class LatentVoxelGrid(nn.Module):
         - decoder: optional LatentToOccupancyDecoder to refresh vals_st after latent update
         - ema_to_st: if >0, write decoded occupancy to ST via logit-EMA
         """
-        # dev, dt = self.device, self.dtype
-        # if pts_world.numel() == 0:
-        #     return
-
-        # # 0) make sure latent storage matches current key set
-        # self._ensure_feature_storage_()
-
-        # # 1) candidate voxel keys for each point (small cube around point's voxel)
-        # vs = float(self.p.voxel_size)
-        # r_vox = max(1, int(math.ceil(radius_m / vs)))
-        # # voxel index of each point
-        # ijk_p = self._world_to_ijk(pts_world.to(dev, dt))     # (N,3)
-
-        # # precompute the integer offsets in the (2r+1)^3 cube
-        # ofs = torch.stack(torch.meshgrid(
-        #     torch.arange(-r_vox, r_vox+1, device=dev),
-        #     torch.arange(-r_vox, r_vox+1, device=dev),
-        #     torch.arange(-r_vox, r_vox+1, device=dev),
-        #     indexing='ij'), dim=-1).reshape(-1,3)             # (K,3)
-        # # points → candidate ijk → candidate keys
-        # ijk_cand = (ijk_p[:, None, :] + ofs[None, :, :]).to(torch.int64)   # (N,K,3)
-        # keys_cand = self._hash_ijk(ijk_cand)                               # (N,K)
-
-        # # 2) ensure all candidate voxels exist in the grid (grows keys/state/latents)
-        # idx_cand = self._ensure_and_index(keys_cand.reshape(-1)).reshape(keys_cand.shape)  # (N,K)
-        # self._ensure_feature_storage_()  # grew => reattach z_latent
-
-        # # centers for those candidates (for geometric conditioning)
-        # ijk_cand_float = self._unhash_keys(self.keys[idx_cand.reshape(-1)]).to(torch.float32).reshape_as(ijk_cand)
-        # centers_cand = self.origin + (ijk_cand_float + 0.5) * vs          # (N,K,3)
-        # delta = pts_world[:, None, :].to(dev, dt) - centers_cand          # (N,K,3)
-
-        # # gather candidate voxel latents
-        # z_cand = self.z_latent[idx_cand]                                  # (N,K,D)
-
-        # # 3) learned similarity per (point, voxel)
-        # # sim_net expects (N,K) point features and voxel latents + delta xyz
-        # # flatten to feed efficiently
-        # N, K = keys_cand.shape
-        # D = f_pts.shape[-1]
-        # f_rep = f_pts.to(dev, dt)[:, None, :].expand(N, K, D)             # (N,K,D)
-        # sim = self.sim_net(                                               # (N,K)
-        #     f_rep.reshape(-1, D),                                         # (N*K, D) point feats
-        #     z_cand.reshape(-1, D),                                        # (N*K, D) voxel latents
-        #     delta.reshape(-1, 3)                                          # (N*K, 3)
-        # ).reshape(N, K)
-
-        # # 4) geometric mask (exact radius) + top-k sparsification
-        # # keep only voxels whose center is within radius_m from the point
-        # keep_geom = (delta.square().sum(-1).sqrt() <= radius_m)           # (N,K)
-        # sim[~keep_geom] = -1e4
-
-        # if topk is not None and topk < K:
-        #     topv, topi = torch.topk(sim, k=topk, dim=1)                   # (N,topk)
-        #     mask = torch.full_like(sim, fill_value=-1e4)
-        #     mask.scatter_(1, topi, topv)
-        #     sim = mask
-
-        # # 5) softmax routing (temperature)
-        # weights = torch.softmax(sim / max(temp, 1e-6), dim=1)             # (N,K)
-
-        # # 6) fuse per-voxel input = Σ_i α_ij f_i  via scatter-add on flattened voxel indices
-        # flat_idx = idx_cand.reshape(-1)                                    # (N*K,)
-        # flat_w   = weights.reshape(-1, 1)                                  # (N*K,1)
-        # flat_f   = f_rep.reshape(-1, D)                                    # (N*K,D)
-
-        # fused = torch.zeros_like(self.z_latent)                            # (M,D) M=#voxels
-        # norm  = torch.zeros((self.keys.shape[0], 1), device=dev, dtype=dt)
-
-        # # fused: (M, D), norm: (M, 1)
-        # fused.index_add_(0, flat_idx, flat_w * flat_f)   # (N*K, D) added into rows flat_idx
-        # norm.index_add_(0,  flat_idx, flat_w)            # (N*K, 1)
-
-        # # avoid div-by-zero
-        # fused = torch.where(norm > 0, fused / norm.clamp_min(1e-6), torch.zeros_like(fused))
-
-
-
-
-
-
-
-
+     
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
 
 

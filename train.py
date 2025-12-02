@@ -269,32 +269,6 @@ class VoxelUpdaterSystem(pl.LightningModule):
             start = time.time()
 
             predictions = get_reconstructed_scene_no_opt(i, ".", imgs, self.model, self.device, False, 512, "", "linear", 100, 1, True, False, True, False, 0.05, "oneref", 1, 0, projector=self.projector)
-            
-            # predictions = _profile_block(
-            #     f"inference_t{i}_full",
-            #     get_reconstructed_scene,
-            #     i,                 # itr
-            #     ".",               # outdir
-            #     imgs,              # imgs
-            #     self.model,        # model
-            #     self.device,       # device
-            #     False,             # silent
-            #     512,               # image_size
-            #     "",                # filelist
-            #     "linear",          # schedule
-            #     100,               # niter
-            #     1,                 # min_conf_thr
-            #     True,              # as_pointcloud
-            #     False,             # mask_sky
-            #     True,              # clean_depth
-            #     False,             # transparent_cams
-            #     0.05,              # cam_size
-            #     "oneref",          # scenegraph_type
-            #     1,                 # winsize
-            #     0                  # refid
-            #     # changed_gids=None (implicit)
-            #     # tau=0.45 (default)
-            # )
 
             self.keyframes = image_tensors.clone()
             
@@ -333,41 +307,10 @@ class VoxelUpdaterSystem(pl.LightningModule):
             print("final changed idx:", changed_idx)
 
             start = time.time()
-
-            # stacked_predictions = []
-            # for input_frames in [imgs]:
+   
             print("inference pred")
             mst = True
             predictions = get_reconstructed_scene_no_opt(i, ".", imgs, self.model, self.device, False, 512, "", "linear", 100, 1, True, False, True, False, 0.05, "oneref", 1, 0, changed_gids=changed_idx, projector=self.projector)
-            
-            
-            # predictions = _profile_block(
-            #     f"inference_t{i}_changed",
-            #     get_reconstructed_scenet,
-            #     i,                 # itr
-            #     ".",               # outdir
-            #     imgs,              # imgs
-            #     self.model,        # model
-            #     self.device,       # device
-            #     False,             # silent
-            #     512,               # image_size
-            #     "",                # filelist
-            #     "linear",          # schedule
-            #     100,               # niter
-            #     1,                 # min_conf_thr
-            #     True,              # as_pointcloud
-            #     False,             # mask_sky
-            #     True,              # clean_depth
-            #     False,             # transparent_cams
-            #     0.05,              # cam_size
-            #     "oneref",          # scenegraph_type
-            #     1,                 # winsize
-            #     0,                 # refid
-            #     changed_idx        # changed_gids
-            #     # tau=0.45 (default)
-            # )
-
-            # predictions = run_model(model, vggt_input, attn_mask=adj)s
                 
             end = time.time()
             length = end - start
@@ -388,8 +331,6 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
         start = time.time()
         
-        # WPTS_m = torch.from_numpy(predictions[POINTS]).to(device=self.device)
-
         WPTS_m = rotate_points(predictions[POINTS], R_w2m, t_w2m)
         if Rmw is None or tmw is None:
             Rmw, tmw, info = align_pointcloud_torch_fast(WPTS_m, inlier_dist=self.voxel_size*0.75, ransac_iters=200, point_chunk=5_000_000, cand_chunk=4096)
@@ -402,19 +343,6 @@ class VoxelUpdaterSystem(pl.LightningModule):
         print("Aligning frames took", length, "seconds!")
         start = time.time()
 
-        # camera_R = R_w2m @ Rmw
-        # camera_t = t_w2m + tmw
-        # frames_map, cam_centers_map, conf_map, images_map, features_map, (S,H,W), frame_ids = build_frames_and_centers_vectorized_torch(
-        #     predictions,
-        #     POINTS=POINTS,
-        #     CONF=CONF,
-        #     FEAT="view_feats",
-        #     threshold=threshold,
-        #     Rmw=camera_R, tmw=camera_t,
-        #     z_clip_map=z_clip_map,   # or None
-        #     return_flat=True
-
-        # )   
 
 
         end = time.time()
@@ -432,6 +360,9 @@ class VoxelUpdaterSystem(pl.LightningModule):
             threshold=threshold,
             z_clip_map=z_clip_map,   # or None
         )  
+        
+        
+        print(f"Features require grad: {features_map[0].requires_grad}")
         
         end = time.time()
         length = end - start
@@ -660,7 +591,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
     #     return out_sorted[inv]
 
 
-    def align_probs_to_keys(self, src_keys, src_probs, dst_keys, default=0.5):
+    def align_probs_to_keys(self, src_keys, src_probs, dst_keys, default=0.0):
         # handle degenerate case
         if src_keys.numel() == 0:
             return torch.full(
@@ -801,12 +732,21 @@ class VoxelUpdaterSystem(pl.LightningModule):
         
             with autocast(enabled=False):
 
-                p_occ_tgt = self.vox_gt.vals_st
+                # p_occ_tgt = self.vox_gt.vals_st
+                
+                p_occ_tgt = torch.sigmoid(self.vox_gt.vals_st)
+                
                 # (D) decode current occupancy
                 p_occ_pred = self.vox.decode_occupancy()
                 p_occ_tgt = self.align_probs_to_keys(self.vox_gt.keys, p_occ_tgt,
-                                    self.vox.keys, default=0.5)      
+                                    self.vox.keys, default=0.0)      
 
+
+                # Visualize Overlap
+                intersection = torch.isin(self.vox.keys, self.vox_gt.keys).sum()
+                union = len(self.vox.keys) + len(self.vox_gt.keys) - intersection
+                iou = intersection / (union + 1e-8)
+                print(f"Voxel IoU: {iou:.4f} | Pred Voxels: {len(self.vox.keys)} | Overlap: {intersection}")
 
                 # (F) losses
                 # Occupancy BCE
@@ -830,7 +770,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                     loss_temp = torch.tensor(0.0, device=self.device)
                 else:
                     prev_aligned = self.align_probs_to_keys(self._prev_keys, self._prev_probs,
-                                                    self.vox.keys, default=0.5)
+                                                    self.vox.keys, default=0.0)
                     logit_now  = torch.logit(p_occ_pred.clamp(1e-5, 1-1e-5))
                     logit_prev = torch.logit(prev_aligned.clamp(1e-5, 1-1e-5))
                     loss_temp = F.smooth_l1_loss(logit_now, logit_prev, beta=0.1)
@@ -839,6 +779,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 self._prev_keys  = self.vox.keys.detach().clone()
                 self._prev_probs = p_occ_pred.detach().clone()
 
+
+            
             # Entropy regularizer on routing (OPTIONAL):
             # add a small penalty you compute inside update_with_features_learned (return avg entropy)
             # For simplicity, assume you store last entropy in self.grid._last_entropy
@@ -974,10 +916,13 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
 
             with autocast(enabled=False):
-                p_occ_tgt = self.vox_gt.vals_st
+                # p_occ_tgt = self.vox_gt.vals_st
+                
+                p_occ_tgt = torch.sigmoid(self.vox_gt.vals_st)
+
                 p_occ_pred = self.vox.decode_occupancy()
                 p_occ_tgt  = self.align_probs_to_keys(
-                    self.vox_gt.keys, p_occ_tgt, self.vox.keys, default=0.5
+                    self.vox_gt.keys, p_occ_tgt, self.vox.keys, default=0.0
                 )
 
 
@@ -993,7 +938,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                     loss_temp = torch.tensor(0.0, device=self.device)
                 else:
                     prev_aligned = self.align_probs_to_keys(self._prev_keys, self._prev_probs,
-                                                self.vox.keys, default=0.5)
+                                                self.vox.keys, default=0.0)
                     logit_now  = torch.logit(p_occ_pred.clamp(1e-5, 1-1e-5))
                     logit_prev = torch.logit(prev_aligned.clamp(1e-5, 1-1e-5))
                     loss_temp = F.smooth_l1_loss(logit_now, logit_prev, beta=0.1)
