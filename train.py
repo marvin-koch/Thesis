@@ -1026,7 +1026,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
             torch.cuda.empty_cache()
 
 
-        self.log("val/loss_total", val_loss_total, prog_bar=True, on_epoch=True)
+        self.log("val_loss_total", val_loss_total, prog_bar=True, on_epoch=True)
         return val_loss_total
 
     
@@ -1338,8 +1338,8 @@ def main():
     sys = VoxelUpdaterSystem(cfg)
 
     ckpt_cb = pl.callbacks.ModelCheckpoint(
-        dirpath="checkpoints/",       # Explicitly set a folder so you can find them
-        monitor="val/loss_total",
+        dirpath="/cluster/scratch/kochmar/checkpoints/",       # Explicitly set a folder so you can find them
+        monitor="val_loss_total",
         save_top_k=3,
         mode="min",
         filename="voxup-{epoch:02d}-{val_loss_total:.4f}" # Match the key logged in validation_step
