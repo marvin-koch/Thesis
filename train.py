@@ -797,20 +797,10 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
 
 
-            # --- per-timestep backward + step ---
-            opt.zero_grad(set_to_none=True)
-            
-            torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)            
             
             self.manual_backward(loss_t)
 
-            # add:
-            grad_norm = self.compute_grad_norm()
-            self.log("grad_norm", grad_norm, prog_bar=True, on_step=True, on_epoch=False)
-
-            # then:
-            opt.step()            
-
+       
             loss_total = loss_total + loss_t.detach()
             
             print(loss_t.detach())
@@ -839,10 +829,24 @@ class VoxelUpdaterSystem(pl.LightningModule):
                     sync_dist=False,
                 )
             
+
             self.vox.z_latent = self.vox.z_latent.detach()
+
 
             torch.cuda.empty_cache()
         
+        # add:
+        grad_norm = self.compute_grad_norm()
+        self.log("grad_norm", grad_norm, prog_bar=True, on_step=True, on_epoch=False)
+
+        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)            
+        # then:
+        opt.step()            
+        # --- per-timestep backward + step ---
+        opt.zero_grad(set_to_none=True)
+            
+
+
         # Add on_epoch=True to smooth the loss curve and save based on the average
         self.log("loss/total", loss_total, prog_bar=True, on_epoch=True)        
         
@@ -1253,7 +1257,7 @@ def main():
         max_epochs=20,
         batch_size=1,
         num_workers=0,
-        precision="32",
+        precision="bf16",
         skip=True,
     )
 

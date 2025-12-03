@@ -1895,9 +1895,9 @@ def rotate_points(points, R, t):
     if is_numpy:
         # Convert PyTorch to NumPy if needed
         if is_torch_R:
-            R = R.detach().cpu().numpy()
+            R = R.detach().float().cpu().numpy()
         if is_torch_t:
-            t = t.detach().cpu().numpy()
+            t = t.detach().float().cpu().numpy()
         
         # Ensure correct types
         R = np.asarray(R, dtype=np.float32)
