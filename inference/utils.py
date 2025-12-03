@@ -2151,7 +2151,7 @@ def get_reconstructed_scene(
 
     
 # ------------------- main -------------------
-def get_reconstructed_scene_no_opt(
+def get_reconstructed_scene_no_opt2(
     itr, outdir, imgs, model, device, silent, image_size, filelist, schedule, niter, min_conf_thr,
     as_pointcloud, mask_sky, clean_depth, transparent_cams, cam_size,
     scenegraph_type, winsize, refid, changed_gids=None, tau=0.45, projector=None
@@ -2442,8 +2442,8 @@ def get_reconstructed_scene_no_opt(
         #     output[j] = cam_to_world_torch(unproject_depth_torch((s * od_p2_p[k][:, :, 2]), K0[j]), Twc0[j])   # (H,W,3)
         #     conf[j]  = torch.as_tensor(od_p2_c[k], device=device)
 
-    pts  = [v.detach().cpu().numpy() if torch.is_tensor(v) else v for k,v in sorted(output.items())]
-    conf = [v.detach().cpu().numpy() if torch.is_tensor(v) else v for k,v in sorted(conf.items())]
+    pts  = [v.detach().float().cpu().numpy() if torch.is_tensor(v) else v for k,v in sorted(output.items())]
+    conf = [v.detach().float().cpu().numpy() if torch.is_tensor(v) else v for k,v in sorted(conf.items())]
     # scene_imgs = [v.detach().cpu().numpy() if torch.is_tensor(v) else v for k,v in imgs.items()]
     
     # If all same size, stack (nice for downstream)
@@ -2478,3 +2478,291 @@ def get_reconstructed_scene_no_opt(
     }
     return predictions
 
+
+
+import torch
+import numpy as np
+import time
+
+# ------------------- main -------------------
+def get_reconstructed_scene_no_opt(
+    itr, outdir, imgs, model, device, silent, image_size, filelist, schedule, niter, min_conf_thr,
+    as_pointcloud, mask_sky, clean_depth, transparent_cams, cam_size,
+    scenegraph_type, winsize, refid, changed_gids=None, tau=0.45, projector=None
+):
+    """
+    Returns a dictionary of PyTorch Tensors (on 'device').
+    """
+    # ---- helpers expected: _reindex_local, _require_gids, _sanitize_for_inference, _find_local_index_by_gid
+    imgs = _reindex_local(imgs)
+    _require_gids(imgs)
+    imgs_clean = _sanitize_for_inference(imgs)
+
+    # scene graph setup
+    if scenegraph_type == "swin":
+        scenegraph = f"swin-{winsize}"
+    elif scenegraph_type == "oneref":
+        scenegraph = "oneref"
+    else:
+        scenegraph = scenegraph_type
+
+    # =========================================================================
+    # ITER 0: FULL RUN
+    # =========================================================================
+    if itr == 0:
+        GA_CACHE["anchor"] = int(refid)
+
+        if scenegraph.startswith("oneref"):
+            anchor_local = _find_local_index_by_gid(imgs, GA_CACHE["anchor"])
+            if anchor_local is None:
+                raise ValueError(f"Anchor gid {GA_CACHE['anchor']} not present in imgs at iter 0.")
+            sg = f"oneref-{anchor_local}"
+        else:
+            sg = scenegraph
+
+        pairs = make_pairs(imgs_clean, scene_graph='complete', prefilter=None, symmetrize=True)
+
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            output, view_feats = inference_with_features(
+                        pairs, model, device, batch_size=16, verbose=not silent, projector=projector
+                    )
+
+        mode = GlobalAlignerMode.PointCloudOptimizer if len(imgs) > 2 else GlobalAlignerMode.PairViewer
+        scene = global_aligner(output, device=device, mode=mode, verbose=not silent)
+
+        if mode == GlobalAlignerMode.PointCloudOptimizer:
+            _ = scene.compute_global_alignment(init='mst', niter=niter, schedule=schedule, lr=1e-2)
+
+        # --- CACHING (KEEP AS TENSORS) ---
+        Twc = scene.get_im_poses() # Tensor
+        K   = scene.get_intrinsics() # Tensor
+        try:
+            pp = scene.get_principal_points() # Tensor
+        except Exception:
+            pp = None
+
+        # Cache per-image depths (Keep as list of Tensors)
+        depth_list = [d for d in scene.get_depthmaps()]
+
+        GA_CACHE["Twc"]   = Twc
+        GA_CACHE["K"]     = K
+        GA_CACHE["pp"]    = pp
+        GA_CACHE["depth"] = depth_list
+        GA_CACHE["pw_poses"]    = scene.pw_poses       # Tensor
+        GA_CACHE["pw_adaptors"] = scene.pw_adaptors    # Tensor
+        GA_CACHE["conf_i"]      = scene.conf_i
+        GA_CACHE["conf_j"]      = scene.conf_j
+
+        GA_CACHE["base_scale"] = scene.base_scale
+        GA_CACHE["pw_break"]   = scene.pw_break
+        GA_CACHE["norm_pw"]    = scene.norm_pw_scale
+
+        edges = scene.edges
+        conf_i = scene.conf_i
+        conf_j = scene.conf_j
+
+        edge_scores = compute_edge_scores(map(i_j_ij, edges), conf_i, conf_j)
+        GA_CACHE["edge_scores"] = robust_scores(edge_scores, squash=True)
+        GA_CACHE["edge_update_counter"] = {edge: 0 for edge in GA_CACHE["edge_scores"]}
+
+        # --- PREPARE OUTPUT (Return Tensors) ---
+        pts = [d for d in scene.get_pts3d()] # List of tensors
+        confs_raw = [c for c in scene.im_conf] # List of tensors
+
+        # Calculate Tcw (World -> Cam)
+        Tcw = torch.linalg.inv(Twc)
+
+        # Stack Tensors
+        if len(pts) > 0:
+            h0, w0 = pts[0].shape[:2]
+            if all(p.shape[:2] == (h0, w0) for p in pts):
+                P = torch.stack(pts, dim=0) # (N, H, W, 3)
+                C = torch.stack(confs_raw, dim=0)
+            else:
+                # Cannot stack different sizes, keep as list or object array?
+                # Usually standard practice in torch return is to fail or pad,
+                # but if shapes differ, we might have to return a list.
+                # Assuming shapes are consistent for this pipeline:
+                P = pts
+                C = confs_raw
+        else:
+            P, C = torch.empty(0, device=device), torch.empty(0, device=device)
+
+        # Handle images (convert list of numpy/PIL to tensor if needed, or keep as list if variable size)
+        # Assuming scene.imgs is list of numpy arrays
+        try:
+            imgs_tensor = torch.as_tensor(np.array(scene.imgs), device=device)
+        except:
+            imgs_tensor = scene.imgs # Fallback if sizes differ
+
+        predictions = {
+            "world_points":       P,            # Tensor (N, H, W, 3)
+            "world_points_conf":  C,            # Tensor (N, H, W)
+            "images":             imgs_tensor,  # Tensor (N, H, W, 3)
+            "extrinsic":          Tcw,          # Tensor (N, 4, 4)
+            "intrinsic_K":        K,            # Tensor (N, 3, 3)
+            "gids":               torch.tensor([d["gid"] for d in imgs], device=device),
+            "view_feats":         view_feats    # List or Tensor depending on upstream
+        }
+        return predictions
+
+    # =========================================================================
+    # ITER > 0: SUBSET RUN
+    # =========================================================================
+    if GA_CACHE.get("Twc") is None:
+        raise RuntimeError("GA_CACHE is empty—run itr=0 with the full set first.")
+
+    anchor_gid = GA_CACHE["anchor"]
+    anchor_local = _find_local_index_by_gid(imgs, anchor_gid)
+    if anchor_local is None:
+        raise ValueError(f"Subset must include the anchor image (gid={anchor_gid}).")
+
+    sg = f"oneref-{anchor_local}" if scenegraph.startswith("oneref") else scenegraph
+    pairs = make_pairs(imgs_clean, scene_graph='complete', prefilter=None, symmetrize=True)
+
+    # --- RETRIEVE FROM CACHE (TENSORS) ---
+    Twc_all   = GA_CACHE["Twc"]
+    K_all     = GA_CACHE["K"]
+    pw_poses  = GA_CACHE["pw_poses"]
+
+    local2gid = {d["idx"]: d["gid"] for d in imgs}
+    start = time.time()
+
+    if itr == 1:
+        mst_edges = build_mst_from_edge_scores(GA_CACHE["edge_scores"])
+        GA_CACHE["mst_edges"] = mst_edges
+
+        from collections import defaultdict, deque
+        incident_mst   = defaultdict(list)
+        incident_extra = defaultdict(list)
+
+        for (vi, vj) in pairs:
+            i = vi["idx"]; j = vj["idx"]
+            if (i, j) in mst_edges:
+                incident_mst[i].append((i, j))
+                incident_mst[j].append((i, j))
+            else:
+                incident_extra[i].append((i, j))
+                incident_extra[j].append((i, j))
+
+        def sort_by_score(lst):
+            return sorted(lst, key=lambda e: GA_CACHE["edge_scores"][i_j_ij(e)[1]], reverse=True)
+
+        GA_CACHE["incident_mst"]   = {i: deque(sort_by_score(v)) for i, v in incident_mst.items()}
+        GA_CACHE["incident_extra"] = {i: deque(sort_by_score(v)) for i, v in incident_extra.items()}
+
+    print("ONLY MST", time.time() - start)
+    start = time.time()
+
+    B = max(1, len(imgs))
+    pairs_to_run, run_mask, edge_lut = schedule_pairs(
+        changed_gids=changed_gids, local2gid=local2gid, pairs=pairs, budget=B,
+        tau_mst=0.0, tau_extra=0.5, max_count=4, refresh_one_stale_mst=True
+    )
+
+    print("ONLY SCHEDULE PAIRS", time.time() - start)
+    start = time.time()
+
+    # --- INFERENCE ---
+    if len(pairs_to_run):
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            out_delta, view_feats = inference_with_features(
+                pairs_to_run, model, device, batch_size=4, verbose=not silent, projector=projector
+            )
+    else:
+        out_delta = {"view1":{"idx":[],"true_shape":[]}, "view2":{"idx":[],"true_shape":[]},
+                     "pred1":{"pts3d":[],"conf":[]}, "pred2":{"pts3d_in_other_view":[],"conf":[]}}
+
+    print("ONLY INFERENCE", time.time() - start)
+    start = time.time()
+
+    # --- PROCESS UPDATES (ALL TORCH) ---
+    run_mask_t = torch.as_tensor(run_mask, dtype=torch.bool, device=device)
+
+    od_p1_p  = out_delta["pred1"]["pts3d"].to(device)
+    od_p1_c  = out_delta["pred1"]["conf"].to(device)
+
+    # Grab cached tensors (ensure device consistency)
+    Twc0, K0 = GA_CACHE["Twc"].to(device), GA_CACHE["K"].to(device)
+    base_scale    = GA_CACHE["base_scale"]
+    norm_pw_scale = GA_CACHE["norm_pw"]
+    pw_poses = pw_poses.to(device)
+
+    # Calculate scales using TORCH
+    if norm_pw_scale:
+        pw_norm_scale_factor = torch.exp(torch.log(torch.tensor(base_scale, device=device)) - pw_poses[:, -1].mean())
+    else:
+        pw_norm_scale_factor = 1.0
+
+    all_scales = torch.exp(pw_poses[:, -1])
+    scales = all_scales[run_mask_t]
+
+    output = {}
+    conf = {}
+    final_changed = set()
+
+    for e, (vi, vj) in enumerate(pairs_to_run):
+        i = vi["idx"]; j = vj["idx"]
+        print(i,j)
+
+        # Scalar tensor multiply
+        s = scales[e] * pw_norm_scale_factor
+
+        # Tensor comparison (using torch.tensor for safety on empty confs)
+        current_max_conf = conf.get(i, torch.tensor(-10000.0, device=device)).mean()
+
+        if od_p1_c[e].mean() > current_max_conf:
+            # Keep everything in Torch
+            pts_3d = unproject_depth_torch((s * od_p1_p[e][:, :, 2]), K0[i])
+            output[i] = cam_to_world_torch(pts_3d, Twc0[i])
+            conf[i]   = od_p1_c[e]
+            final_changed.add(i)
+
+    # Sort and collect into lists (Still Tensors)
+    pts  = [v for k,v in sorted(output.items())]
+    conf_list = [v for k,v in sorted(conf.items())]
+
+    # --- STACKING (Using TORCH) ---
+    if len(pts) > 0:
+        h0, w0 = pts[0].shape[:2]
+        if all(p.shape[:2] == (h0, w0) for p in pts):
+            P = torch.stack(pts, dim=0)
+            C = torch.stack(conf_list, dim=0)
+        else:
+            # If shapes differ, we cannot stack into a tensor.
+            # We return list of tensors.
+            P = pts
+            C = conf_list
+    else:
+        P, C = torch.empty(0, device=device), torch.empty(0, device=device)
+
+    final_changed = list(final_changed)
+
+    # Process images (keep as tensors if possible, else list)
+    # Assuming imgs_clean has numpy arrays, we convert to tensor here
+    scene_imgs_list = [im["img"] for im in imgs_clean if im["idx"] in final_changed]
+    # Try to stack images if they are same size
+    try:
+         # Assuming im["img"] is already a tensor or numpy compatible
+         # You might need torch.as_tensor(im["img"]) if it's numpy
+         scene_imgs = torch.stack([torch.as_tensor(x, device=device) for x in scene_imgs_list])
+         if scene_imgs.ndim == 5: # Handle if there was an extra dim
+             scene_imgs = scene_imgs.squeeze(1)
+    except:
+         scene_imgs = scene_imgs_list # Fallback to list
+
+    view_feats_filtered = [feat for l, feat in enumerate(view_feats) if l in final_changed]
+
+    print("global alignment", time.time() - start)
+
+    # --- FINAL RETURN (TENSORS) ---
+    predictions = {
+        "world_points":       P,
+        "world_points_conf":  C,
+        "images":             scene_imgs,
+        "extrinsic":          Twc0, # already (M,4,4) Tensor
+        "intrinsic_K":        K0,   # already Tensor
+        "gids":               torch.tensor([d["gid"] for d in imgs], device=device),
+        "view_feats":         view_feats_filtered
+    }
+    return predictions
