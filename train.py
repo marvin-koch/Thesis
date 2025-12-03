@@ -335,6 +335,50 @@ class VoxelUpdaterSystem(pl.LightningModule):
         if Rmw is None or tmw is None:
             Rmw, tmw, info = align_pointcloud_torch_fast(WPTS_m, inlier_dist=self.voxel_size*0.75, ransac_iters=500, point_chunk=5_000_000, cand_chunk=4096)
         WPTS_m = rotate_points(WPTS_m, Rmw, tmw)
+        if self.vox_gt is not None and self.vox_gt.keys.numel() > 0:
+            # 1. Get GT Points
+            gt_ijk = self.vox_gt._unhash_keys(self.vox_gt.keys)
+            gt_pts = self.vox_gt.origin + (gt_ijk.float() + 0.5) * self.vox_gt.p.voxel_size
+
+            # 2. Flatten Prediction
+            pred_flat = WPTS_m.reshape(-1, 3)
+            valid = torch.isfinite(pred_flat).all(dim=1)
+            pred_valid = pred_flat[valid]
+
+            if pred_valid.shape[0] > 0 and gt_pts.shape[0] > 0:
+                # --- A. Centering ---
+                pred_c = pred_valid.mean(dim=0)
+                gt_c = gt_pts.mean(dim=0)
+
+                pred_centered = pred_valid - pred_c
+                gt_centered = gt_pts - gt_c
+
+                # --- B. Scaling (Root Mean Square distance from center) ---
+                # How "spread out" are the points?
+                dist_pred = torch.norm(pred_centered, dim=1).mean()
+                dist_gt = torch.norm(gt_centered, dim=1).mean()
+
+                # Calculate scale factor
+                scale = dist_gt / (dist_pred + 1e-8)
+
+                print(f"[Align] Fixing Scale. GT_spread={dist_gt:.2f}, Pred_spread={dist_pred:.2f}, Scale={scale:.4f}")
+
+                # --- C. Apply Transform ---
+                # New_Pos = (Old_Pos - Old_Center) * Scale + New_Center
+
+                # Apply to the full (S, H, W, 3) tensor
+                # Broadcast center subtraction
+                WPTS_m = (WPTS_m - pred_c.view(1,1,1,3)) * scale + gt_c.view(1,1,1,3)
+
+                # Fix Camera Translation too (approximate)
+                if tmw is not None:
+                     # This is tricky for tmw alone, but sticking to point alignment is key for IoU
+                     pass
+
+            else:
+                 print("[Align] Warning: Empty clouds, skipping align.")
+
+
         predictions[POINTS] = WPTS_m
 
         end = time.time()
@@ -746,7 +790,27 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 intersection = torch.isin(self.vox.keys, self.vox_gt.keys).sum()
                 union = len(self.vox.keys) + len(self.vox_gt.keys) - intersection
                 iou = intersection / (union + 1e-8)
-                print(f"Voxel IoU: {iou:.4f} | Pred Voxels: {len(self.vox.keys)} | Overlap: {intersection}")
+                print(f"Voxel IoU: {iou:.4f} | Pred Voxels: {len(self.vox.keys)} | GT Voxels: {len(self.vox_gt.keys)}  | Overlap: {intersection}")
+
+                    # Inside training_step, before intersection calculation
+
+                # Debug: Compare Centroids
+                if self.vox.keys.numel() > 0 and self.vox_gt.keys.numel() > 0:
+                    # Get world centers of predicted voxels
+                    pred_centers = self.vox.voxel_centers() 
+                    # Get world centers of GT voxels
+                    gt_ijk = self.vox_gt._unhash_keys(self.vox_gt.keys).float()
+                    gt_centers = self.vox_gt.origin + (gt_ijk + 0.5) * self.vox_gt.p.voxel_size
+                    
+                    print(f"Pred Centroid: {pred_centers.mean(0).detach().cpu().numpy()}")
+                    print(f"GT   Centroid: {gt_centers.mean(0).detach().cpu().numpy()}")
+                    
+                    # Check if they are close
+                    dist = torch.norm(pred_centers.mean(0) - gt_centers.mean(0))
+                    print(f"Centroid Distance: {dist.item()} (should be < voxel_size)")
+
+                assert len(torch.unique(self.vox.keys)) == len(self.vox.keys)
+                assert len(torch.unique(self.vox_gt.keys)) == len(self.vox_gt.keys)
 
                 # (F) losses
                 # Occupancy BCE
