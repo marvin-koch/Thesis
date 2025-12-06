@@ -642,41 +642,92 @@ class VoxelUpdaterSystem(pl.LightningModule):
     #     return out_sorted[inv]
 
 
-    def align_probs_to_keys(self, src_keys, src_probs, dst_keys, default=0.0):
-        # handle degenerate case
-        if src_keys.numel() == 0:
-            return torch.full(
-                (dst_keys.numel(),), default,
-                device=dst_keys.device, dtype=src_probs.dtype
-            )
+    # def align_probs_to_keys(self, src_keys, src_probs, dst_keys, default=0.0):
+    #     # handle degenerate case
+    #     if src_keys.numel() == 0:
+    #         return torch.full(
+    #             (dst_keys.numel(),), default,
+    #             device=dst_keys.device, dtype=src_probs.dtype
+    #         )
 
-        # 1) sort src once and carry probs with it
-        src_sorted, src_perm = torch.sort(src_keys)         # src_sorted[i] = src_keys[src_perm[i]]
+    #     # 1) sort src once and carry probs with it
+    #     src_sorted, src_perm = torch.sort(src_keys)         # src_sorted[i] = src_keys[src_perm[i]]
+    #     src_probs_sorted = src_probs[src_perm]
+
+    #     # 2) sort dst (we’ll align in sorted space, then unsort)
+    #     dst_sorted, dst_sort_idx = torch.sort(dst_keys)     # dst_sorted[i] = dst_keys[dst_sort_idx[i]]
+
+    #     # 3) For each dst_sorted value, where would it be inserted in src_sorted?
+    #     pos = torch.searchsorted(src_sorted, dst_sorted)
+    #     # pos[i] = index where dst_sorted[i] would go in src_sorted to keep sorted order
+
+    #     # 4) Check if we actually have an exact match at that position
+    #     pos_clamped = torch.clamp(pos, max=src_sorted.numel() - 1)
+    #     match_vals = src_sorted[pos_clamped]
+    #     is_match = (pos < src_sorted.numel()) & (match_vals == dst_sorted)
+
+    #     # 5) Fill output in *sorted-dst* space
+    #     out_sorted = torch.full(
+    #         (dst_sorted.numel(),), default,
+    #         device=dst_keys.device, dtype=src_probs.dtype
+    #     )
+    #     # for matches: use the corresponding src_probs_sorted
+    #     out_sorted[is_match] = src_probs_sorted[pos_clamped[is_match]]
+
+    #     # 6) Unscramble back to original dst_keys order
+    #     orig_to_sorted = torch.argsort(dst_sort_idx)   # original idx -> sorted idx
+    #     return out_sorted[orig_to_sorted]
+
+
+    def align_probs_to_keys(self, src_keys, src_probs, dst_keys, default=0.5):
+        """
+        Align (src_keys, src_probs) to dst_keys.
+
+        Returns:
+            out_probs: (len(dst_keys),) aligned probs (default for unknowns)
+            valid_mask: bool (len(dst_keys),) True where dst_keys[i] exists in src_keys
+        """
+        # handle degenerate case: no GT keys
+        if src_keys.numel() == 0:
+            out = torch.full(
+                (dst_keys.numel(),),
+                default,
+                device=dst_keys.device,
+                dtype=src_probs.dtype,
+            )
+            valid = torch.zeros(dst_keys.numel(), dtype=torch.bool, device=dst_keys.device)
+            return out, valid
+
+        # 1) sort src and carry probs
+        src_sorted, src_perm = torch.sort(src_keys)
         src_probs_sorted = src_probs[src_perm]
 
-        # 2) sort dst (we’ll align in sorted space, then unsort)
-        dst_sorted, dst_sort_idx = torch.sort(dst_keys)     # dst_sorted[i] = dst_keys[dst_sort_idx[i]]
+        # 2) sort dst
+        dst_sorted, dst_sort_idx = torch.sort(dst_keys)
 
-        # 3) For each dst_sorted value, where would it be inserted in src_sorted?
+        # 3) positions where dst_sorted would be inserted in src_sorted
         pos = torch.searchsorted(src_sorted, dst_sorted)
-        # pos[i] = index where dst_sorted[i] would go in src_sorted to keep sorted order
 
-        # 4) Check if we actually have an exact match at that position
+        # 4) determine matches in sorted-dst space
         pos_clamped = torch.clamp(pos, max=src_sorted.numel() - 1)
         match_vals = src_sorted[pos_clamped]
-        is_match = (pos < src_sorted.numel()) & (match_vals == dst_sorted)
+        is_match_sorted = (pos < src_sorted.numel()) & (match_vals == dst_sorted)
 
-        # 5) Fill output in *sorted-dst* space
+        # 5) fill output in sorted-dst space
         out_sorted = torch.full(
-            (dst_sorted.numel(),), default,
-            device=dst_keys.device, dtype=src_probs.dtype
+            (dst_sorted.numel(),),
+            default,
+            device=dst_keys.device,
+            dtype=src_probs.dtype,
         )
-        # for matches: use the corresponding src_probs_sorted
-        out_sorted[is_match] = src_probs_sorted[pos_clamped[is_match]]
+        out_sorted[is_match_sorted] = src_probs_sorted[pos_clamped[is_match_sorted]]
 
-        # 6) Unscramble back to original dst_keys order
-        orig_to_sorted = torch.argsort(dst_sort_idx)   # original idx -> sorted idx
-        return out_sorted[orig_to_sorted]
+        # 6) map back to original dst order
+        orig_to_sorted = torch.argsort(dst_sort_idx)
+        out = out_sorted[orig_to_sorted]
+        valid_mask = is_match_sorted[orig_to_sorted]
+
+        return out, valid_mask
 
 
     def compute_grad_norm(self):
@@ -793,10 +844,15 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 
                 # (D) decode current occupancy
                 p_occ_pred = self.vox.decode_occupancy()
-                p_occ_tgt = self.align_probs_to_keys(self.vox_gt.keys, p_occ_tgt,
-                                    self.vox.keys, default=0.0)      
+                p_occ_tgt, valid_mask = self.align_probs_to_keys(self.vox_gt.keys, p_occ_tgt,
+                                    self.vox.keys, default=0.5)      
 
 
+
+                p_occ_pred = p_occ_pred[valid_mask]
+                p_occ_tgt  = p_occ_tgt[valid_mask]
+                
+                
                 # Visualize Overlap
                 intersection = torch.isin(self.vox.keys, self.vox_gt.keys).sum()
                 union = len(self.vox.keys) + len(self.vox_gt.keys) - intersection
@@ -861,10 +917,16 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 if (t == 0) or (self._prev_keys is None):
                     loss_temp = torch.tensor(0.0, device=self.device)
                 else:
-                    prev_aligned = self.align_probs_to_keys(self._prev_keys, self._prev_probs,
-                                                    self.vox.keys, default=0.0)
+                    prev_aligned, valid_mask = self.align_probs_to_keys(self._prev_keys, self._prev_probs,
+                                                    self.vox.keys, default=0.5)
+                    
+                    
                     logit_now  = torch.logit(p_occ_pred.clamp(1e-5, 1-1e-5))
                     logit_prev = torch.logit(prev_aligned.clamp(1e-5, 1-1e-5))
+                    
+                    logit_now  = logit_now[valid_mask]
+                    logit_prev = logit_prev[valid_mask]
+                    
                     loss_temp = F.smooth_l1_loss(logit_now, logit_prev, beta=0.1)
 
                 # update buffers for next step
@@ -1065,11 +1127,15 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 
                 p_occ_tgt = torch.sigmoid(self.vox_gt.vals_st)
 
-                p_occ_pred = self.vox.decode_occupancy()
-                p_occ_tgt  = self.align_probs_to_keys(
-                    self.vox_gt.keys, p_occ_tgt, self.vox.keys, default=0.0
-                )
 
+                p_occ_pred = self.vox.decode_occupancy()
+                p_occ_tgt, valid_mask = self.align_probs_to_keys(self.vox_gt.keys, p_occ_tgt,
+                                    self.vox.keys, default=0.5)      
+
+                p_occ_pred = p_occ_pred[valid_mask]
+                p_occ_tgt  = p_occ_tgt[valid_mask]
+                
+                
 
 
                 # Visualize Overlap
@@ -1109,10 +1175,22 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 if (t == 0) or (self._prev_keys is None):
                     loss_temp = torch.tensor(0.0, device=self.device)
                 else:
-                    prev_aligned = self.align_probs_to_keys(self._prev_keys, self._prev_probs,
-                                                self.vox.keys, default=0.0)
+                    # prev_aligned = self.align_probs_to_keys(self._prev_keys, self._prev_probs,
+                    #                             self.vox.keys, default=0.0)
+                    # logit_now  = torch.logit(p_occ_pred.clamp(1e-5, 1-1e-5))
+                    # logit_prev = torch.logit(prev_aligned.clamp(1e-5, 1-1e-5))
+                    
+                    
+                    prev_aligned, valid_mask = self.align_probs_to_keys(self._prev_keys, self._prev_probs,
+                                                    self.vox.keys, default=0.5)
+                    
+                    
                     logit_now  = torch.logit(p_occ_pred.clamp(1e-5, 1-1e-5))
                     logit_prev = torch.logit(prev_aligned.clamp(1e-5, 1-1e-5))
+                    
+                    logit_now  = logit_now[valid_mask]
+                    logit_prev = logit_prev[valid_mask]
+                    
                     loss_temp = F.smooth_l1_loss(logit_now, logit_prev, beta=0.1)
 
                 # update buffers for next step
