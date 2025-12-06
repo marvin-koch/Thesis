@@ -158,7 +158,7 @@ def build_gt_voxel_for_timestep(
 
 def main():
     dataset_root = "/cluster/scratch/kochmar/renders/"   # same as in your TrainConfig
-    voxel_size = 0.10
+    voxel_size = 0.05
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # DUSt3R weights path – same as in your VoxelUpdaterSystem __init__
@@ -176,10 +176,11 @@ def main():
     seqs = dataset.seq_paths
     print(f"[GT] Found {len(seqs)} sequences.")
 
-    out_root = os.path.join(dataset_root, "gt_voxels_per_timestep")
+    out_root = os.path.join(dataset_root, "gt_voxels_per_timestep_005")
     os.makedirs(out_root, exist_ok=True)
 
-    for seq_idx in reversed(range(len(seqs))):
+    #for seq_idx in range(len(seqs)):
+    for seq_idx in range(10, len(seqs)):
         batch = dataset[seq_idx]        # __getitem__ returns dict with seq info
         seq_id = batch["seq_id"]
         imgs_t = batch["imgs_t"]

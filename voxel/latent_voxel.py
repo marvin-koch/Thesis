@@ -797,23 +797,21 @@ class LatentVoxelGrid(nn.Module):
 
 
         u = torch.zeros(idx_upd.numel(), D, device=dev, dtype=torch.float32)
-        chunk_size = 50_000 
+        chunk_size = 20_000 
         num_pairs = weights.shape[0]
 
         for chunk_start in range(0, num_pairs, chunk_size):
             end = min(chunk_start + chunk_size, num_pairs)
 
             # Slice the inputs
-            # Only promote to float32 for the current small chunk
-            w_chunk = weights[chunk_start:end].to(torch.float32).unsqueeze(-1)
-            f_chunk = f_sel[chunk_start:end].to(torch.float32)
+            w_chunk = weights[chunk_start:end].unsqueeze(-1)
+            f_chunk = f_sel[chunk_start:end]
             inv_chunk = inv[chunk_start:end]
 
-            # Compute contribution (Allocates ~150MB instead of 5GB)
             contrib_chunk = w_chunk * f_chunk
 
             # Accumulate into the main buffer
-            u.index_add_(0, inv_chunk, contrib_chunk)
+            u.index_add_(0, inv_chunk, contrib_chunk.to(torch.float32))
             
             # Explicitly free memory (optional but safe)
             del contrib_chunk, w_chunk, f_chunk

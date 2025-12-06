@@ -187,7 +187,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
         self.cfg = cfg
         self.feature_dim = 32
         # ---- core components (replace with your actual imports) ----
-        self.voxel_size = 0.01
+        #self.voxel_size = 0.01
+        self.voxel_size = self.cfg.voxel_size
         self.vox = LatentVoxelGrid(
             origin_xyz=np.zeros(3, dtype=np.float32),
             params=VoxelParams(voxel_size=self.voxel_size, promote_hits=2),
@@ -292,7 +293,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
             if len(changed_idx) < 2:
                     # Advance epoch so the pipeline’s temporal bookkeeping stays aligned
                     self.vox.next_epoch()
-                    return None, None
+                    return None, None, None, None
  
             print("Finding changed images took", length, "seconds!")
 
@@ -335,6 +336,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
         if Rmw is None or tmw is None:
             Rmw, tmw, info = align_pointcloud_torch_fast(WPTS_m, inlier_dist=self.voxel_size*0.75, ransac_iters=500, point_chunk=5_000_000, cand_chunk=4096)
         WPTS_m = rotate_points(WPTS_m, Rmw, tmw)
+
+        """
         if self.vox_gt is not None and self.vox_gt.keys.numel() > 0:
             # 1. Get GT Points
             gt_ijk = self.vox_gt._unhash_keys(self.vox_gt.keys)
@@ -377,6 +380,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
             else:
                  print("[Align] Warning: Empty clouds, skipping align.")
+            """
 
 
         predictions[POINTS] = WPTS_m
@@ -454,7 +458,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
         # after build_maps_from_latent_features(...)
         del frames_map, conf_map, images_map, features_map, image_tensors
 
-        return bev, mst
+        return bev, mst, Rmw, tmw
     
     def inference_gt(self, i, imgs):
 
@@ -524,7 +528,10 @@ class VoxelUpdaterSystem(pl.LightningModule):
             # WPTS_m = torch.from_numpy(predictions[POINTS]).to(device=self.device)
 
             WPTS_m = rotate_points(predictions[POINTS], R_w2m, t_w2m)
-            Rmw, tmw, info = align_pointcloud_torch_fast(WPTS_m, inlier_dist=self.voxel_size*0.75)
+            if Rmw is None and tmw is None:
+                print("aligning floor")
+                Rmw, tmw, info = align_pointcloud_torch_fast(WPTS_m, inlier_dist=self.voxel_size*0.75)
+
             WPTS_m = rotate_points(WPTS_m, Rmw, tmw)
             predictions[POINTS] = WPTS_m
 
@@ -724,7 +731,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
         # ---- iterate timesteps ----
         seq_id = batch["seq_id"]
 
-        gt_root = os.path.join(self.cfg.dataset_root, "gt_voxels_per_timestep")
+        gt_root = os.path.join(self.cfg.dataset_root, "gt_voxels_per_timestep_005")
         gt_seq = []
         
         # for t in range(T):
@@ -747,6 +754,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
             
 
         mst = False
+        Rmw = None
+        tmw = None
         for t in range(T):
             
             print(f"=============================timestep {t}=============================")
@@ -770,15 +779,17 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 continue
             
             if not mst and t != 0:
-                bev, mst = self.inference(1, imgs, mst)
+                bev, mst, _, _ = self.inference(1, imgs, mst, Rmw, tmw)
             else:
-                bev, mst = self.inference(t, imgs, mst)
+                bev, mst, _, _ = self.inference(t, imgs, mst, Rmw,tmw)
         
             with autocast(enabled=False):
 
                 # p_occ_tgt = self.vox_gt.vals_st
                 
-                p_occ_tgt = torch.sigmoid(self.vox_gt.vals_st)
+                logit_gt   = self.vox_gt.vals_st.clamp(-8.0, 8.0)   # optional but recommended
+                p_occ_tgt  = torch.sigmoid(logit_gt)
+                #p_occ_tgt = torch.sigmoid(self.vox_gt.vals_st)
                 
                 # (D) decode current occupancy
                 p_occ_pred = self.vox.decode_occupancy()
@@ -812,11 +823,28 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 assert len(torch.unique(self.vox.keys)) == len(self.vox.keys)
                 assert len(torch.unique(self.vox_gt.keys)) == len(self.vox_gt.keys)
 
+                # ---- compute positive class weight (same ratio as before) ----
+                pos_mask = (p_occ_tgt > 0.5)
+                num_pos = pos_mask.sum()
+                num_neg = (~pos_mask).sum()
+
+                if num_pos > 0:
+                    pos_weight = (num_neg.float() / (num_pos.float() + 1e-8)).to(self.device)
+                else:
+                    pos_weight = torch.tensor(1.0, device=self.device)
+
+                # ---- build per-voxel weights for BCE ----
+                # defaults: negatives weight = 1, positives weight = pos_weight
+                weights = torch.ones_like(p_occ_tgt, device=self.device)
+                weights[pos_mask] = pos_weight
+
                 # (F) losses
                 # Occupancy BCE
                 loss_occ = F.binary_cross_entropy(
                     p_occ_pred.clamp(1e-5, 1-1e-5),
-                    p_occ_tgt.clamp(1e-5, 1-1e-5)
+                    p_occ_tgt.clamp(1e-5, 1-1e-5),
+                    weight=weights,
+                    reduction="mean"
                 )
 
                 # Temporal smoothness on logits (optional, encourages stability but not over-smoothing)
@@ -918,6 +946,52 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
         return loss_total
     
+    # -----------------------------------------------------------
+    # ===> PASTE THIS FUNCTION HERE inside VoxelUpdaterSystem <===
+    # -----------------------------------------------------------
+    def on_load_checkpoint(self, checkpoint):
+        state_dict = checkpoint["state_dict"]
+        # Check if the checkpoint contains voxel keys
+        if "vox.keys" in state_dict:
+            saved_keys = state_dict["vox.keys"]
+            target_size = saved_keys.shape[0]
+            current_size = self.vox.keys.shape[0]
+
+            if target_size != current_size:
+                print(f"[Checkpoint Load] Resizing voxel grid buffers from {current_size} to {target_size}...")
+
+                # List of all sparse buffers in your VoxelGrid
+                buffer_names = [
+                    "keys", "vals_st", "vals_lt", "vals",
+                    "hit_count", "pos_occ_count", "neg_free_count",
+                    "last_occ_epoch", "last_free_epoch", "view_bits",
+                    "seen_occ_epoch", "seen_view_bits_e", "occ_epoch_count",
+                    "view_bits_cum", "lt_promoted_flag"
+                ]
+
+                # Resize every buffer to match the checkpoint shape
+                for name in buffer_names:
+                    full_key = f"vox.{name}"
+                    if full_key in state_dict:
+                        saved_tensor = state_dict[full_key]
+                        current_buffer = getattr(self.vox, name)
+
+                        # Create a new zero-tensor with the shape from checkpoint
+                        new_buffer = torch.zeros(
+                            saved_tensor.shape,
+                            dtype=current_buffer.dtype,
+                            device=self.device
+                        )
+                        setattr(self.vox, name, new_buffer)
+
+                # Resize Latents
+                if "vox.z_latent" in state_dict:
+                    saved_z = state_dict["vox.z_latent"]
+                    self.vox.z_latent = torch.zeros(
+                        saved_z.shape,
+                        dtype=self.vox.z_latent.dtype,
+                        device=self.device
+                    )
     
     
     def validation_step(self, batch: Dict, batch_idx: int):
@@ -942,7 +1016,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
         seq_id = batch["seq_id"]
 
-        gt_root = os.path.join(self.cfg.dataset_root, "gt_voxels_per_timestep")
+        gt_root = os.path.join(self.cfg.dataset_root, "gt_voxels_per_timestep_005")
         gt_seq = []
         for t in range(T):
             if self.cfg.skip:
@@ -952,6 +1026,9 @@ class VoxelUpdaterSystem(pl.LightningModule):
             gt_seq.append(vox_gt_t)
             
         mst = False
+
+        Rmw = None
+        tmw = None
         for t in range(T):
             
             print(f"=============================timestep {t}=============================")
@@ -976,9 +1053,9 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 
                 #bev = self.inference(t, imgs)
                 if not mst and t != 0:
-                    bev, mst = self.inference(1, imgs, mst)
+                    bev, mst, _, _  = self.inference(1, imgs, mst, Rmw, tmw)
                 else:
-                    bev, mst = self.inference(t, imgs, mst)
+                    bev, mst, _, _  = self.inference(t, imgs, mst, Rmw, tmw)
         
         
 
@@ -993,6 +1070,33 @@ class VoxelUpdaterSystem(pl.LightningModule):
                     self.vox_gt.keys, p_occ_tgt, self.vox.keys, default=0.0
                 )
 
+
+
+                # Visualize Overlap
+                intersection = torch.isin(self.vox.keys, self.vox_gt.keys).sum()
+                union = len(self.vox.keys) + len(self.vox_gt.keys) - intersection
+                iou = intersection / (union + 1e-8)
+                print(f"Voxel IoU: {iou:.4f} | Pred Voxels: {len(self.vox.keys)} | GT Voxels: {len(self.vox_gt.keys)}  | Overlap: {intersection}")
+
+                    # Inside training_step, before intersection calculation
+
+                # Debug: Compare Centroids
+                if self.vox.keys.numel() > 0 and self.vox_gt.keys.numel() > 0:
+                    # Get world centers of predicted voxels
+                    pred_centers = self.vox.voxel_centers() 
+                    # Get world centers of GT voxels
+                    gt_ijk = self.vox_gt._unhash_keys(self.vox_gt.keys).float()
+                    gt_centers = self.vox_gt.origin + (gt_ijk + 0.5) * self.vox_gt.p.voxel_size
+                    
+                    print(f"Pred Centroid: {pred_centers.mean(0).detach().cpu().numpy()}")
+                    print(f"GT   Centroid: {gt_centers.mean(0).detach().cpu().numpy()}")
+                    
+                    # Check if they are close
+                    dist = torch.norm(pred_centers.mean(0) - gt_centers.mean(0))
+                    print(f"Centroid Distance: {dist.item()} (should be < voxel_size)")
+
+                assert len(torch.unique(self.vox.keys)) == len(self.vox.keys)
+                assert len(torch.unique(self.vox_gt.keys)) == len(self.vox_gt.keys)
 
 
 
@@ -1311,7 +1415,7 @@ def main():
         # dataset_root="/Users/marvin/Documents/Thesis/repo/dataset_generation/habitat/",
         #dataset_root="/home/mpk40/Documents/data/",
         dataset_root="/cluster/scratch/kochmar/renders/",
-        voxel_size=0.10,
+        voxel_size=0.05,
         radius_m=0.25,
         topk=8,
         temp=0.5,
@@ -1331,7 +1435,7 @@ def main():
         num_workers=cfg.num_workers,
         size=512,
         verbose=False,
-        train_val_split=0.1,  # or whatever you want
+        train_val_split=0.05,  # or whatever you want
         skip=True
     )
 
@@ -1374,6 +1478,7 @@ def main():
 
     )
     print(">>> before trainer.fit()", flush=True)
+    ckpt_path = "/cluster/scratch/kochmar/checkpoints/voxup-epoch=09-val_loss_total=19.5780.ckpt"
 
     trainer.fit(sys, dm)
 if __name__ == "__main__":
