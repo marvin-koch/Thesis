@@ -934,6 +934,26 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 p_occ_tgt  = p_occ_tgt[valid_mask]
                 
                 
+                
+                if p_occ_pred.numel() > 0:
+                    pred_bin = (p_occ_pred > 0.5)
+                    tgt_bin  = (p_occ_tgt  > 0.5)
+
+                    tp = (pred_bin & tgt_bin).sum()
+                    fp = (pred_bin & ~tgt_bin).sum()
+                    fn = (~pred_bin & tgt_bin).sum()
+
+                    occ_iou = tp / (tp + fp + fn + 1e-8)
+                    self.log("metric/occ_iou", occ_iou)
+
+                    self.log("debug/frac_pos_gt", tgt_bin.float().mean())
+                    self.log("debug/frac_pos_pred", pred_bin.float().mean())
+                else:
+                    self.log("metric/occ_iou", 0.0)
+                    self.log("debug/frac_pos_gt", 0.0)
+                    self.log("debug/frac_pos_pred", 0.0)
+
+
                 # Visualize Overlap
                 intersection = torch.isin(self.vox.keys, self.vox_gt.keys).sum()
                 union = len(self.vox.keys) + len(self.vox_gt.keys) - intersection
