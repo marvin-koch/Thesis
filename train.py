@@ -228,9 +228,18 @@ class VoxelUpdaterSystem(pl.LightningModule):
                  list(self.projector.parameters()) + \
                  list(self.vox.gate_mlp.parameters())
         # if your feature extractor is finetuned, extend params with extractor params
-        opt = torch.optim.AdamW(params, lr=self.cfg.lr, weight_decay=self.cfg.weight_decay)
-        return opt
+        
+        # opt = torch.optim.AdamW(params, lr=self.cfg.lr, weight_decay=self.cfg.weight_decay)
+        # return opt
     
+        opt = torch.optim.AdamW(params, lr=self.cfg.lr, weight_decay=self.cfg.weight_decay)
+
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt, T_max=self.cfg.max_epochs, eta_min=self.cfg.lr * 0.1
+        )
+
+        return [opt], [{"scheduler": scheduler, "interval": "epoch"}]
+
     def inference(self, i, imgs, mst, Rmw=None, tmw=None):
 
 
@@ -931,7 +940,6 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 iou = intersection / (union + 1e-8)
                 print(f"Voxel IoU: {iou:.4f} | Pred Voxels: {len(self.vox.keys)} | GT Voxels: {len(self.vox_gt.keys)}  | Overlap: {intersection}")
 
-                    # Inside training_step, before intersection calculation
 
                 # Debug: Compare Centroids
                 if self.vox.keys.numel() > 0 and self.vox_gt.keys.numel() > 0:
@@ -951,29 +959,33 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 assert len(torch.unique(self.vox.keys)) == len(self.vox.keys)
                 assert len(torch.unique(self.vox_gt.keys)) == len(self.vox_gt.keys)
 
-                # ---- compute positive class weight (same ratio as before) ----
-                pos_mask = (p_occ_tgt > 0.5)
-                num_pos = pos_mask.sum()
-                num_neg = (~pos_mask).sum()
 
-                if num_pos > 0:
-                    pos_weight = (num_neg.float() / (num_pos.float() + 1e-8)).to(self.device)
+         
+
+                if p_occ_pred.numel() == 0:
+                    # Nothing to supervise this step
+                    loss_occ = torch.tensor(0.0, device=self.device)
                 else:
-                    pos_weight = torch.tensor(1.0, device=self.device)
+                    # ---- compute positive class weight (same ratio as before) ----
+                    pos_mask = (p_occ_tgt > 0.5)
+                    num_pos  = pos_mask.sum()
+                    num_neg  = (~pos_mask).sum()
 
-                # ---- build per-voxel weights for BCE ----
-                # defaults: negatives weight = 1, positives weight = pos_weight
-                weights = torch.ones_like(p_occ_tgt, device=self.device)
-                weights[pos_mask] = pos_weight
+                    if num_pos > 0:
+                        pos_weight = (num_neg.float() / (num_pos.float() + 1e-8)).to(self.device)
+                    else:
+                        pos_weight = torch.tensor(1.0, device=self.device)
 
-                # (F) losses
-                # Occupancy BCE
-                loss_occ = F.binary_cross_entropy(
-                    p_occ_pred.clamp(1e-5, 1-1e-5),
-                    p_occ_tgt.clamp(1e-5, 1-1e-5),
-                    weight=weights,
-                    reduction="mean"
-                )
+                    weights = torch.ones_like(p_occ_tgt, device=self.device)
+                    weights[pos_mask] = pos_weight
+
+                    loss_occ = F.binary_cross_entropy(
+                        p_occ_pred.clamp(1e-5, 1-1e-5),
+                        p_occ_tgt.clamp(1e-5, 1-1e-5),
+                        weight=weights,
+                        reduction="mean"
+                    )
+
 
                 # Temporal smoothness on logits (optional, encourages stability but not over-smoothing)
                 # keep a buffer of previous decoded occupancy
@@ -999,7 +1011,11 @@ class VoxelUpdaterSystem(pl.LightningModule):
                     logit_now  = logit_now[valid_mask]
                     logit_prev = logit_prev[valid_mask]
                     
-                    loss_temp = F.smooth_l1_loss(logit_now, logit_prev, beta=0.1)
+                    
+                    if logit_now.numel() == 0:
+                        loss_temp = torch.tensor(0.0, device=self.device)
+                    else:
+                        loss_temp = F.smooth_l1_loss(logit_now, logit_prev, beta=0.1)
 
                 # update buffers for next step
                 self._prev_keys  = self.vox.keys.detach().clone()
@@ -1238,10 +1254,16 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
 
 
-                loss_occ = F.binary_cross_entropy(
-                    p_occ_pred.clamp(1e-5, 1 - 1e-5),
-                    p_occ_tgt.clamp(1e-5, 1 - 1e-5),
-                )
+
+                if p_occ_pred.numel() == 0:
+                    # Nothing to supervise this step
+                    loss_occ = torch.tensor(0.0, device=self.device)
+                else:
+
+                    loss_occ = F.binary_cross_entropy(
+                        p_occ_pred.clamp(1e-5, 1 - 1e-5),
+                        p_occ_tgt.clamp(1e-5, 1 - 1e-5),
+                    )
             
             
                 if (t == 0) or (self._prev_keys is None):
@@ -1263,7 +1285,11 @@ class VoxelUpdaterSystem(pl.LightningModule):
                     logit_now  = logit_now[valid_mask]
                     logit_prev = logit_prev[valid_mask]
                     
-                    loss_temp = F.smooth_l1_loss(logit_now, logit_prev, beta=0.1)
+                    
+                    if logit_now.numel() == 0:
+                        loss_temp = torch.tensor(0.0, device=self.device)
+                    else:
+                        loss_temp = F.smooth_l1_loss(logit_now, logit_prev, beta=0.1)
 
                 # update buffers for next step
                 self._prev_keys  = self.vox.keys.detach().clone()
