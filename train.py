@@ -982,30 +982,73 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
          
 
+                # if p_occ_pred.numel() == 0:
+                #     # Nothing to supervise this step
+                #     loss_occ = torch.tensor(0.0, device=self.device)
+                # else:
+                #     # ---- compute positive class weight (same ratio as before) ----
+                #     pos_mask = (p_occ_tgt > 0.5)
+                #     num_pos  = pos_mask.sum()
+                #     num_neg  = (~pos_mask).sum()
+
+                #     if num_pos > 0:
+                #         pos_weight = (num_neg.float() / (num_pos.float() + 1e-8)).to(self.device)
+                #     else:
+                #         pos_weight = torch.tensor(1.0, device=self.device)
+
+                #     weights = torch.ones_like(p_occ_tgt, device=self.device)
+                #     weights[pos_mask] = pos_weight
+
+                #     loss_occ = F.binary_cross_entropy(
+                #         p_occ_pred.clamp(1e-5, 1-1e-5),
+                #         p_occ_tgt.clamp(1e-5, 1-1e-5),
+                #         weight=weights,
+                #         reduction="mean"
+                #     )
+
+                logit_gt = self.vox_gt.vals_st
+                p_gt = torch.sigmoid(logit_gt)
+                frac_gt_all = (p_gt > 0.5).float().mean()
+                print("GT fraction occupied over all gt voxels:", float(frac_gt_all))
+
+                # p_occ_pred, p_occ_tgt already masked with valid_mask
                 if p_occ_pred.numel() == 0:
-                    # Nothing to supervise this step
                     loss_occ = torch.tensor(0.0, device=self.device)
                 else:
-                    # ---- compute positive class weight (same ratio as before) ----
-                    pos_mask = (p_occ_tgt > 0.5)
-                    num_pos  = pos_mask.sum()
-                    num_neg  = (~pos_mask).sum()
+                    tgt_bin = (p_occ_tgt > 0.5)
+                    pos_idx = tgt_bin.nonzero(as_tuple=True)[0]
+                    neg_idx = (~tgt_bin).nonzero(as_tuple=True)[0]
 
-                    if num_pos > 0:
-                        pos_weight = (num_neg.float() / (num_pos.float() + 1e-8)).to(self.device)
+                    num_pos = pos_idx.numel()
+                    num_neg = neg_idx.numel()
+
+                    if num_pos == 0:
+                        # nothing occupied in this step → only learn from negatives, small loss
+                        loss_occ = F.binary_cross_entropy(
+                            p_occ_pred.clamp(1e-5, 1-1e-5),
+                            p_occ_tgt.clamp(1e-5, 1-1e-5),
+                            reduction="mean",
+                        )
                     else:
-                        pos_weight = torch.tensor(1.0, device=self.device)
+                        # keep all positives
+                        k = 5  # try k in [3, 10]
+                        max_neg = min(num_neg, k * num_pos)
 
-                    weights = torch.ones_like(p_occ_tgt, device=self.device)
-                    weights[pos_mask] = pos_weight
+                        if max_neg > 0:
+                            perm = torch.randperm(num_neg, device=self.device)
+                            neg_idx_sample = neg_idx[perm[:max_neg]]
+                            idx = torch.cat([pos_idx, neg_idx_sample], dim=0)
+                        else:
+                            idx = pos_idx
 
-                    loss_occ = F.binary_cross_entropy(
-                        p_occ_pred.clamp(1e-5, 1-1e-5),
-                        p_occ_tgt.clamp(1e-5, 1-1e-5),
-                        weight=weights,
-                        reduction="mean"
-                    )
+                        p_sub = p_occ_pred[idx]
+                        t_sub = p_occ_tgt[idx]
 
+                        loss_occ = F.binary_cross_entropy(
+                            p_sub.clamp(1e-5, 1-1e-5),
+                            t_sub.clamp(1e-5, 1-1e-5),
+                            reduction="mean",
+                        )
 
                 # Temporal smoothness on logits (optional, encourages stability but not over-smoothing)
                 # keep a buffer of previous decoded occupancy
