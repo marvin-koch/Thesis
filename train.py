@@ -918,7 +918,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
             with autocast(enabled=False):
 
                 # p_occ_tgt = self.vox_gt.vals_st
-                
+                print("gt voxels: ", (self.vox_gt.vals_st))
                 logit_gt   = self.vox_gt.vals_st.clamp(-8.0, 8.0)   # optional but recommended
                 p_occ_tgt  = torch.sigmoid(logit_gt)
                 #p_occ_tgt = torch.sigmoid(self.vox_gt.vals_st)
