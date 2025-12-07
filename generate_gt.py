@@ -180,7 +180,7 @@ def main():
     os.makedirs(out_root, exist_ok=True)
 
     #for seq_idx in range(len(seqs)):
-    for seq_idx in range(10, len(seqs)):
+    for seq_idx in reversed(range(len(seqs))):
         batch = dataset[seq_idx]        # __getitem__ returns dict with seq info
         seq_id = batch["seq_id"]
         imgs_t = batch["imgs_t"]
@@ -192,7 +192,7 @@ def main():
 
 
         for t, imgs in enumerate(imgs_t):
-            if t % 10 != 0:
+            if t % 5 != 0:
                 continue
 
             out_path = os.path.join(out_root, f"{seq_id}_t{t:04d}_gt.npz")

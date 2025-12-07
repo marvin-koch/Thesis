@@ -679,7 +679,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
     #     return out_sorted[orig_to_sorted]
 
 
-    def align_probs_to_keys(self, src_keys, src_probs, dst_keys, default=0.5):
+    def align_probs_to_keys2(self, src_keys, src_probs, dst_keys, default=0.5):
         """
         Align (src_keys, src_probs) to dst_keys.
 
@@ -729,6 +729,78 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
         return out, valid_mask
 
+
+    def align_probs_to_keys(self, src_keys, src_probs, dst_keys, default=0.5):
+        """
+        Align (src_keys, src_probs) to dst_keys.
+
+        Returns:
+            out_probs:  (len(dst_keys),)  aligned probs (default for unknowns)
+            valid_mask: (len(dst_keys),)  bool, True where dst_keys[i] exists in src_keys
+        """
+
+        # --- handle degenerate case: no src keys at all ---
+        if src_keys.numel() == 0:
+            out = torch.full(
+                (dst_keys.numel(),),
+                default,
+                device=dst_keys.device,
+                dtype=src_probs.dtype,
+            )
+            valid = torch.zeros(dst_keys.numel(), dtype=torch.bool, device=dst_keys.device)
+            return out, valid
+
+        # Force everything to 1D (defensive)
+        src_keys = src_keys.view(-1)
+        dst_keys = dst_keys.view(-1)
+        src_probs = src_probs.view(-1)
+
+        # Sanity check: they *must* correspond 1:1
+        assert src_keys.shape[0] == src_probs.shape[0], \
+            f"src_keys ({src_keys.shape}) and src_probs ({src_probs.shape}) length mismatch"
+
+        # 1) sort src and carry probs with it
+        src_sorted, src_perm = torch.sort(src_keys)
+        src_probs_sorted = src_probs[src_perm]
+
+        # 2) sort dst
+        dst_sorted, dst_sort_idx = torch.sort(dst_keys)
+
+        # 3) positions where dst_sorted would be inserted in src_sorted
+        pos = torch.searchsorted(src_sorted, dst_sorted)
+
+        n_src = src_sorted.shape[0]
+
+        # Candidate matches must be strictly within [0, n_src)
+        in_bounds = pos < n_src          # shape: (len(dst_sorted),)
+        pos_in   = pos[in_bounds]        # indices into src_sorted / src_probs_sorted
+        dst_in   = dst_sorted[in_bounds]
+
+        # Values at those positions in src
+        src_at_pos = src_sorted[pos_in]
+        is_eq      = (src_at_pos == dst_in)      # only these are true matches
+
+        # Build match mask in *sorted-dst* space
+        match_sorted = torch.zeros_like(dst_sorted, dtype=torch.bool, device=dst_keys.device)
+        match_sorted[in_bounds] = is_eq
+
+        # 4) fill out_sorted in sorted-dst space
+        out_sorted = torch.full(
+            (dst_sorted.numel(),),
+            default,
+            device=dst_keys.device,
+            dtype=src_probs.dtype,
+        )
+
+        # src_probs_sorted[pos_in[is_eq]] is guaranteed in-bounds because pos_in < n_src
+        out_sorted[match_sorted] = src_probs_sorted[pos_in[is_eq]]
+
+        # 5) map both out and mask back to original dst order
+        orig_to_sorted = torch.argsort(dst_sort_idx)
+        out        = out_sorted[orig_to_sorted]
+        valid_mask = match_sorted[orig_to_sorted]
+
+        return out, valid_mask
 
     def compute_grad_norm(self):
         total_norm = 0.0
@@ -843,13 +915,13 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 #p_occ_tgt = torch.sigmoid(self.vox_gt.vals_st)
                 
                 # (D) decode current occupancy
-                p_occ_pred = self.vox.decode_occupancy()
+                p_occ_pred_before = self.vox.decode_occupancy()
                 p_occ_tgt, valid_mask = self.align_probs_to_keys(self.vox_gt.keys, p_occ_tgt,
                                     self.vox.keys, default=0.5)      
 
 
 
-                p_occ_pred = p_occ_pred[valid_mask]
+                p_occ_pred = p_occ_pred_before[valid_mask]
                 p_occ_tgt  = p_occ_tgt[valid_mask]
                 
                 
@@ -921,7 +993,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                                                     self.vox.keys, default=0.5)
                     
                     
-                    logit_now  = torch.logit(p_occ_pred.clamp(1e-5, 1-1e-5))
+                    logit_now  = torch.logit(p_occ_pred_before.clamp(1e-5, 1-1e-5))
                     logit_prev = torch.logit(prev_aligned.clamp(1e-5, 1-1e-5))
                     
                     logit_now  = logit_now[valid_mask]
@@ -931,7 +1003,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
                 # update buffers for next step
                 self._prev_keys  = self.vox.keys.detach().clone()
-                self._prev_probs = p_occ_pred.detach().clone()
+                self._prev_probs = p_occ_pred_before.detach().clone()
 
 
             
@@ -1128,11 +1200,11 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 p_occ_tgt = torch.sigmoid(self.vox_gt.vals_st)
 
 
-                p_occ_pred = self.vox.decode_occupancy()
+                p_occ_pred_before = self.vox.decode_occupancy()
                 p_occ_tgt, valid_mask = self.align_probs_to_keys(self.vox_gt.keys, p_occ_tgt,
                                     self.vox.keys, default=0.5)      
 
-                p_occ_pred = p_occ_pred[valid_mask]
+                p_occ_pred = p_occ_pred_before[valid_mask]
                 p_occ_tgt  = p_occ_tgt[valid_mask]
                 
                 
@@ -1185,7 +1257,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                                                     self.vox.keys, default=0.5)
                     
                     
-                    logit_now  = torch.logit(p_occ_pred.clamp(1e-5, 1-1e-5))
+                    logit_now  = torch.logit(p_occ_pred_before.clamp(1e-5, 1-1e-5))
                     logit_prev = torch.logit(prev_aligned.clamp(1e-5, 1-1e-5))
                     
                     logit_now  = logit_now[valid_mask]
@@ -1195,7 +1267,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
                 # update buffers for next step
                 self._prev_keys  = self.vox.keys.detach().clone()
-                self._prev_probs = p_occ_pred.detach().clone()
+                self._prev_probs = p_occ_pred_before.detach().clone()
             
             
             loss_t = cfg.lambda_occ * loss_occ + cfg.lambda_temp * loss_temp \
