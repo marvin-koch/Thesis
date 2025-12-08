@@ -180,7 +180,7 @@ def main():
     os.makedirs(out_root, exist_ok=True)
 
     #for seq_idx in range(len(seqs)):
-    for seq_idx in reversed(range(len(seqs))):
+    for seq_idx in range(len(seqs)):
         batch = dataset[seq_idx]        # __getitem__ returns dict with seq info
         seq_id = batch["seq_id"]
         imgs_t = batch["imgs_t"]

@@ -863,7 +863,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
         # ---- iterate timesteps ----
         seq_id = batch["seq_id"]
 
-        gt_root = os.path.join(self.cfg.dataset_root, "gt_voxels_per_timestep_005")
+        gt_root = os.path.join(self.cfg.dataset_root, "gt_voxels_per_timestep_01")
         gt_seq = []
         
         # for t in range(T):
@@ -1229,7 +1229,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
         seq_id = batch["seq_id"]
 
-        gt_root = os.path.join(self.cfg.dataset_root, "gt_voxels_per_timestep_005")
+        gt_root = os.path.join(self.cfg.dataset_root, "gt_voxels_per_timestep_01")
         gt_seq = []
         for t in range(T):
             if self.cfg.skip:
@@ -1654,7 +1654,7 @@ def main():
         # dataset_root="/Users/marvin/Documents/Thesis/repo/dataset_generation/habitat/",
         #dataset_root="/home/mpk40/Documents/data/",
         dataset_root="/cluster/scratch/kochmar/renders/",
-        voxel_size=0.05,
+        voxel_size=0.1,
         radius_m=0.25,
         topk=8,
         temp=0.5,
