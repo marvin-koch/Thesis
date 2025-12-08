@@ -818,6 +818,349 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 total_norm += p.grad.detach().norm(2).item() ** 2
         return total_norm ** 0.5
     
+    # def training_step(self, batch: Dict, batch_idx: int):
+    #     """
+    #     One batch = one sequence.
+    #     Flow:
+    #       t=0: init latents from full cloud
+    #       t>0: extract point features, learned update, decode occupancy, compute loss vs teacher
+    #     """
+    #     cfg = self.cfg
+    #     device = self.device
+    #     opt = self.optimizers()
+        
+    #     self.vox.reset_state()
+    #     self.vox = self.vox.to(self.device)
+
+        
+        
+    #     self.vox_gt = TorchSparseVoxelGrid(
+    #         origin_xyz=np.zeros(3, dtype=np.float32),
+    #         params=VoxelParams(voxel_size=self.voxel_size, promote_hits=2),
+    #         device=self.device 
+    #     )
+        
+        
+    #     self._prev_keys = None
+    #     self._prev_probs = None
+
+
+    #     # ---- unpack sequence ----
+    #     T = batch["timesteps"]
+       
+       
+    #     loss_total = torch.zeros([], device=device)
+
+    #     # all_imgs = batch["imgs_t"]
+    #     # numel = all_imgs.numel()
+    #     # bytes_per_element = all_imgs.element_size()
+    #     # total = numel * bytes_per_element
+    #     # print(f"Tensor: shape={tuple(all_imgs.shape)}, dtype={all_imgs.dtype}")
+    #     # print(f"  numel={numel:,}")
+    #     # print(f"  element size={bytes_per_element} bytes")
+    #     # print(f"  total={total/1024**2:.3f} MB ({total:,} bytes)")
+        
+    #     # ---- iterate timesteps ----
+    #     seq_id = batch["seq_id"]
+
+    #     gt_root = os.path.join(self.cfg.dataset_root, "gt_voxels_per_timestep_01")
+    #     gt_seq = []
+        
+    #     # for t in range(T):
+    #     #     gt_path = os.path.join(gt_root, f"{seq_id}_t{t:04d}_gt.npz")
+    #     #     vox_gt_t = load_sparse_voxel_grid(gt_path, device)
+    #     #     gt_seq.append(vox_gt_t)
+            
+    #     if not os.path.exists(os.path.join(gt_root, f"{seq_id}_t0000_gt.npz")):
+    #         return loss_total
+
+    #     for t in range(T):
+    #         if self.cfg.skip:
+    #             t = t*10
+    #         gt_path = os.path.join(gt_root, f"{seq_id}_t{t:04d}_gt.npz")
+    #         if os.path.exists(gt_path):
+    #             vox_gt_t = load_sparse_voxel_grid(gt_path, device)
+    #         else:
+    #             vox_gt_t = None
+    #         gt_seq.append(vox_gt_t)
+            
+
+    #     mst = False
+    #     Rmw = None
+    #     tmw = None
+    #     for t in range(T):
+            
+    #         print(f"=============================timestep {t}=============================")
+    #         imgs = batch["imgs_t"][t]          # <--- this is your old `imgs`
+
+      
+    #         # bev_gt, R, tw = self.inference_gt(t, imgs)
+                
+                
+    #         # seq_id = batch["seq_id"]
+    #         # gt_path = os.path.join(
+    #         #     self.cfg.dataset_root,
+    #         #     "gt_voxels_per_timestep",
+    #         #     f"{seq_id}_t{t:04d}_gt.npz"
+    #         # )
+    #         # self.vox_gt = load_sparse_voxel_grid(gt_path, self.device)
+    #         self.vox_gt = gt_seq[t]
+
+    #         if self.vox_gt is None:
+    #             print("No GT voxel grid for this timestep, skipping.")
+    #             continue
+            
+    #         if not mst and t != 0:
+    #             bev, mst, _, _ = self.inference(1, imgs, mst, Rmw, tmw)
+    #         else:
+    #             bev, mst, _, _ = self.inference(t, imgs, mst, Rmw,tmw)
+        
+    #         with autocast(enabled=False):
+
+    #             # p_occ_tgt = self.vox_gt.vals_st
+    #             print("gt voxels: ", (self.vox_gt.vals_st))
+    #             logit_gt   = self.vox_gt.vals_st.clamp(-8.0, 8.0)   # optional but recommended
+    #             p_occ_tgt  = torch.sigmoid(logit_gt)
+    #             #p_occ_tgt = torch.sigmoid(self.vox_gt.vals_st)
+                
+    #             # (D) decode current occupancy
+    #             p_occ_pred_before = self.vox.decode_occupancy()
+    #             p_occ_tgt, valid_mask = self.align_probs_to_keys(self.vox_gt.keys, p_occ_tgt,
+    #                                 self.vox.keys, default=0.0)      
+
+
+
+    #             p_occ_pred = p_occ_pred_before[valid_mask]
+    #             p_occ_tgt  = p_occ_tgt[valid_mask]
+                
+                
+                
+    #             if p_occ_pred.numel() > 0:
+    #                 pred_bin = (p_occ_pred > 0.5)
+    #                 tgt_bin  = (p_occ_tgt  > 0.5)
+
+    #                 tp = (pred_bin & tgt_bin).sum()
+    #                 fp = (pred_bin & ~tgt_bin).sum()
+    #                 fn = (~pred_bin & tgt_bin).sum()
+
+    #                 occ_iou = tp / (tp + fp + fn + 1e-8)
+    #                 self.log("metric/occ_iou", occ_iou)
+
+    #                 self.log("debug/frac_pos_gt", tgt_bin.float().mean())
+    #                 self.log("debug/frac_pos_pred", pred_bin.float().mean())
+    #             else:
+    #                 self.log("metric/occ_iou", 0.0)
+    #                 self.log("debug/frac_pos_gt", 0.0)
+    #                 self.log("debug/frac_pos_pred", 0.0)
+
+
+    #             # Visualize Overlap
+    #             intersection = torch.isin(self.vox.keys, self.vox_gt.keys).sum()
+    #             union = len(self.vox.keys) + len(self.vox_gt.keys) - intersection
+    #             iou = intersection / (union + 1e-8)
+    #             print(f"Voxel IoU: {iou:.4f} | Pred Voxels: {len(self.vox.keys)} | GT Voxels: {len(self.vox_gt.keys)}  | Overlap: {intersection}")
+
+
+    #             # Debug: Compare Centroids
+    #             if self.vox.keys.numel() > 0 and self.vox_gt.keys.numel() > 0:
+    #                 # Get world centers of predicted voxels
+    #                 pred_centers = self.vox.voxel_centers() 
+    #                 # Get world centers of GT voxels
+    #                 gt_ijk = self.vox_gt._unhash_keys(self.vox_gt.keys).float()
+    #                 gt_centers = self.vox_gt.origin + (gt_ijk + 0.5) * self.vox_gt.p.voxel_size
+                    
+    #                 print(f"Pred Centroid: {pred_centers.mean(0).detach().cpu().numpy()}")
+    #                 print(f"GT   Centroid: {gt_centers.mean(0).detach().cpu().numpy()}")
+                    
+    #                 # Check if they are close
+    #                 dist = torch.norm(pred_centers.mean(0) - gt_centers.mean(0))
+    #                 print(f"Centroid Distance: {dist.item()} (should be < voxel_size)")
+
+    #             assert len(torch.unique(self.vox.keys)) == len(self.vox.keys)
+    #             assert len(torch.unique(self.vox_gt.keys)) == len(self.vox_gt.keys)
+
+
+         
+
+    #             if p_occ_pred.numel() == 0:
+    #                 # Nothing to supervise this step
+    #                 loss_occ = torch.tensor(0.0, device=self.device)
+    #             else:
+    #                 # ---- compute positive class weight (same ratio as before) ----
+    #                 pos_mask = (p_occ_tgt > 0.5)
+    #                 num_pos  = pos_mask.sum()
+    #                 num_neg  = (~pos_mask).sum()
+
+    #                 if num_pos > 0:
+    #                     pos_weight = (num_neg.float() / (num_pos.float() + 1e-8)).to(self.device)
+    #                 else:
+    #                     pos_weight = torch.tensor(1.0, device=self.device)
+
+    #                 weights = torch.ones_like(p_occ_tgt, device=self.device)
+    #                 weights[pos_mask] = pos_weight
+
+    #                 loss_occ = F.binary_cross_entropy(
+    #                     p_occ_pred.clamp(1e-5, 1-1e-5),
+    #                     p_occ_tgt.clamp(1e-5, 1-1e-5),
+    #                     weight=weights,
+    #                     reduction="mean"
+    #                 )
+
+    #             logit_gt = self.vox_gt.vals_st
+    #             p_gt = torch.sigmoid(logit_gt)
+    #             frac_gt_all = (p_gt > 0.5).float().mean()
+    #             print("GT fraction occupied over all gt voxels:", float(frac_gt_all))
+
+    #             # # p_occ_pred, p_occ_tgt already masked with valid_mask
+    #             # if p_occ_pred.numel() == 0:
+    #             #     loss_occ = torch.tensor(0.0, device=self.device)
+    #             # else:
+    #             #     tgt_bin = (p_occ_tgt > 0.5)
+    #             #     pos_idx = tgt_bin.nonzero(as_tuple=True)[0]
+    #             #     neg_idx = (~tgt_bin).nonzero(as_tuple=True)[0]
+
+    #             #     num_pos = pos_idx.numel()
+    #             #     num_neg = neg_idx.numel()
+
+    #             #     if num_pos == 0:
+    #             #         # nothing occupied in this step → only learn from negatives, small loss
+    #             #         loss_occ = F.binary_cross_entropy(
+    #             #             p_occ_pred.clamp(1e-5, 1-1e-5),
+    #             #             p_occ_tgt.clamp(1e-5, 1-1e-5),
+    #             #             reduction="mean",
+    #             #         )
+    #             #     else:
+    #             #         # keep all positives
+    #             #         k = 5  # try k in [3, 10]
+    #             #         max_neg = min(num_neg, k * num_pos)
+
+    #             #         if max_neg > 0:
+    #             #             perm = torch.randperm(num_neg, device=self.device)
+    #             #             neg_idx_sample = neg_idx[perm[:max_neg]]
+    #             #             idx = torch.cat([pos_idx, neg_idx_sample], dim=0)
+    #             #         else:
+    #             #             idx = pos_idx
+
+    #             #         p_sub = p_occ_pred[idx]
+    #             #         t_sub = p_occ_tgt[idx]
+
+    #             #         loss_occ = F.binary_cross_entropy(
+    #             #             p_sub.clamp(1e-5, 1-1e-5),
+    #             #             t_sub.clamp(1e-5, 1-1e-5),
+    #             #             reduction="mean",
+    #             #         )
+
+    #             # Temporal smoothness on logits (optional, encourages stability but not over-smoothing)
+    #             # keep a buffer of previous decoded occupancy
+                
+    #             # if t == 1:
+    #             #     self._prev_p_occ = p_occ_pred.detach()
+    #             # logit_now  = torch.logit(p_occ_pred.clamp(1e-5, 1-1e-5))
+    #             # logit_prev = torch.logit(self._prev_p_occ.clamp(1e-5, 1-1e-5)).to(device)
+    #             # loss_temp = F.smooth_l1_loss(logit_now, logit_prev, beta=0.1)
+    #             # self._prev_p_occ = p_occ_pred.detach()
+                
+                
+    #             if (t == 0) or (self._prev_keys is None):
+    #                 loss_temp = torch.tensor(0.0, device=self.device)
+    #             else:
+    #                 prev_aligned, valid_mask = self.align_probs_to_keys(self._prev_keys, self._prev_probs,
+    #                                                 self.vox.keys, default=0.0)
+                    
+                    
+    #                 logit_now  = torch.logit(p_occ_pred_before.clamp(1e-5, 1-1e-5))
+    #                 logit_prev = torch.logit(prev_aligned.clamp(1e-5, 1-1e-5))
+                    
+    #                 logit_now  = logit_now[valid_mask]
+    #                 logit_prev = logit_prev[valid_mask]
+                    
+                    
+    #                 if logit_now.numel() == 0:
+    #                     loss_temp = torch.tensor(0.0, device=self.device)
+    #                 else:
+    #                     loss_temp = F.smooth_l1_loss(logit_now, logit_prev, beta=0.1)
+
+    #             # update buffers for next step
+    #             self._prev_keys  = self.vox.keys.detach().clone()
+    #             self._prev_probs = p_occ_pred_before.detach().clone()
+
+
+            
+    #         # Entropy regularizer on routing (OPTIONAL):
+    #         # add a small penalty you compute inside update_with_features_learned (return avg entropy)
+    #         # For simplicity, assume you store last entropy in self.grid._last_entropy
+    #         loss_ent = torch.tensor(0.0, device=device)
+    #         if hasattr(self.vox, "_last_entropy") and self.vox._last_entropy is not None:
+    #             loss_ent = self.vox._last_entropy
+
+    #         # TV regularizer on occupancy map (soft smoothness)
+    #         # You can build a 3D TV using neighbor shifts (careful—sparse). Simple proxy:
+    #         loss_tv = torch.tensor(0.0, device=device)
+
+    #         loss_t = cfg.lambda_occ * loss_occ + cfg.lambda_temp * loss_temp \
+    #                  + cfg.lambda_ent * loss_ent + cfg.lambda_tv * loss_tv
+
+
+
+            
+    #         self.manual_backward(loss_t)
+
+       
+    #         loss_total = loss_total + loss_t.detach()
+            
+    #         print(loss_t.detach())
+    #         print(loss_total)
+
+    #         # # logging
+    #         # self.log_dict({
+    #         #     "loss/occ": loss_occ,
+    #         #     "loss/temp": loss_temp,
+    #         #     "loss/ent": loss_ent,
+    #         #     "loss/tv": loss_tv,
+    #         #     "stats/num_voxels": float(self.vox.keys.numel())
+    #         # }, prog_bar=(t == T-1), on_step=True, on_epoch=True, sync_dist=False)
+    #         if t == T - 1:
+    #             self.log_dict(
+    #                 {
+    #                     "loss/occ": loss_occ,
+    #                     "loss/temp": loss_temp,
+    #                     "loss/ent": loss_ent,
+    #                     "loss/tv": loss_tv,
+    #                     "stats/num_voxels": float(self.vox.keys.numel()),
+    #                 },
+    #                 prog_bar=True,
+    #                 on_step=True,
+    #                 on_epoch=True,
+    #                 sync_dist=False,
+    #             )
+            
+
+    #         self.vox.z_latent = self.vox.z_latent.detach()
+
+
+    #         torch.cuda.empty_cache()
+        
+    #     # add:
+    #     grad_norm = self.compute_grad_norm()
+    #     self.log("grad_norm", grad_norm, prog_bar=True, on_step=True, on_epoch=False)
+
+    #     torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)            
+    #     # then:
+    #     opt.step()            
+    #     # --- per-timestep backward + step ---
+    #     opt.zero_grad(set_to_none=True)
+            
+
+
+    #     # Add on_epoch=True to smooth the loss curve and save based on the average
+    #     self.log("loss/total", loss_total, prog_bar=True, on_epoch=True)        
+        
+      
+
+    #     return loss_total
+    
+
+    
     def training_step(self, batch: Dict, batch_idx: int):
         """
         One batch = one sequence.
@@ -832,248 +1175,170 @@ class VoxelUpdaterSystem(pl.LightningModule):
         self.vox.reset_state()
         self.vox = self.vox.to(self.device)
 
-        
-        
         self.vox_gt = TorchSparseVoxelGrid(
             origin_xyz=np.zeros(3, dtype=np.float32),
             params=VoxelParams(voxel_size=self.voxel_size, promote_hits=2),
             device=self.device 
         )
         
-        
         self._prev_keys = None
         self._prev_probs = None
 
-
         # ---- unpack sequence ----
         T = batch["timesteps"]
-       
-       
-        loss_total = torch.zeros([], device=device)
+        loss_total_seq = torch.zeros([], device=device) # Renamed to avoid confusion
 
-        # all_imgs = batch["imgs_t"]
-        # numel = all_imgs.numel()
-        # bytes_per_element = all_imgs.element_size()
-        # total = numel * bytes_per_element
-        # print(f"Tensor: shape={tuple(all_imgs.shape)}, dtype={all_imgs.dtype}")
-        # print(f"  numel={numel:,}")
-        # print(f"  element size={bytes_per_element} bytes")
-        # print(f"  total={total/1024**2:.3f} MB ({total:,} bytes)")
-        
+        # ---- Accumulators for averaging metrics over the sequence ----
+        metrics_buffer = {
+            "loss_occ": [],
+            "loss_temp": [],
+            "loss_ent": [],
+            "loss_tv": [],
+            "occ_iou": []
+        }
+
         # ---- iterate timesteps ----
         seq_id = batch["seq_id"]
-
         gt_root = os.path.join(self.cfg.dataset_root, "gt_voxels_per_timestep_01")
-        gt_seq = []
         
-        # for t in range(T):
-        #     gt_path = os.path.join(gt_root, f"{seq_id}_t{t:04d}_gt.npz")
-        #     vox_gt_t = load_sparse_voxel_grid(gt_path, device)
-        #     gt_seq.append(vox_gt_t)
-            
+        # Preload GT (optional optimization you had)
+        gt_seq = []
         if not os.path.exists(os.path.join(gt_root, f"{seq_id}_t0000_gt.npz")):
-            return loss_total
+            return loss_total_seq
 
         for t in range(T):
             if self.cfg.skip:
-                t = t*10
+                t = t*10 # Adjust indexing if skipping
+            
             gt_path = os.path.join(gt_root, f"{seq_id}_t{t:04d}_gt.npz")
             if os.path.exists(gt_path):
                 vox_gt_t = load_sparse_voxel_grid(gt_path, device)
             else:
                 vox_gt_t = None
             gt_seq.append(vox_gt_t)
-            
 
         mst = False
         Rmw = None
         tmw = None
+
         for t in range(T):
-            
-            print(f"=============================timestep {t}=============================")
-            imgs = batch["imgs_t"][t]          # <--- this is your old `imgs`
+            imgs = batch["imgs_t"][t]
 
-      
-            # bev_gt, R, tw = self.inference_gt(t, imgs)
-                
-                
-            # seq_id = batch["seq_id"]
-            # gt_path = os.path.join(
-            #     self.cfg.dataset_root,
-            #     "gt_voxels_per_timestep",
-            #     f"{seq_id}_t{t:04d}_gt.npz"
-            # )
-            # self.vox_gt = load_sparse_voxel_grid(gt_path, self.device)
             self.vox_gt = gt_seq[t]
-
             if self.vox_gt is None:
-                print("No GT voxel grid for this timestep, skipping.")
                 continue
             
             if not mst and t != 0:
                 bev, mst, _, _ = self.inference(1, imgs, mst, Rmw, tmw)
             else:
-                bev, mst, _, _ = self.inference(t, imgs, mst, Rmw,tmw)
+                bev, mst, _, _ = self.inference(t, imgs, mst, Rmw, tmw)
         
             with autocast(enabled=False):
-
-                # p_occ_tgt = self.vox_gt.vals_st
-                print("gt voxels: ", (self.vox_gt.vals_st))
-                logit_gt   = self.vox_gt.vals_st.clamp(-8.0, 8.0)   # optional but recommended
-                p_occ_tgt  = torch.sigmoid(logit_gt)
-                #p_occ_tgt = torch.sigmoid(self.vox_gt.vals_st)
-                
                 # (D) decode current occupancy
+                logit_gt   = self.vox_gt.vals_st.clamp(-8.0, 8.0)
+                # p_occ_tgt  = torch.sigmoid(logit_gt)
+                p_occ_tgt = torch.sigmoid(logit_gt * 10.0)
                 p_occ_pred_before = self.vox.decode_occupancy()
-                p_occ_tgt, valid_mask = self.align_probs_to_keys(self.vox_gt.keys, p_occ_tgt,
-                                    self.vox.keys, default=0.0)      
-
-
-
-                p_occ_pred = p_occ_pred_before[valid_mask]
-                p_occ_tgt  = p_occ_tgt[valid_mask]
                 
+                # -------------------------------------------------------------
+                # DUAL LOSS LOGIC START
+                # -------------------------------------------------------------
                 
+                # 1. Align GT to Prediction Keys
+                # valid_mask is TRUE where prediction keys exist in GT
+                p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys(
+                    self.vox_gt.keys, p_occ_tgt, self.vox.keys, default=0.0
+                )      
+
+                # ---------------------------------------------------------
+                # PART A: Loss on Intersection (Pred & GT)
+                # ---------------------------------------------------------
+                pred_intersect = p_occ_pred_before[valid_mask]
+                tgt_intersect  = p_occ_tgt_aligned[valid_mask]
                 
-                if p_occ_pred.numel() > 0:
-                    pred_bin = (p_occ_pred > 0.5)
-                    tgt_bin  = (p_occ_tgt  > 0.5)
-
-                    tp = (pred_bin & tgt_bin).sum()
-                    fp = (pred_bin & ~tgt_bin).sum()
-                    fn = (~pred_bin & tgt_bin).sum()
-
-                    occ_iou = tp / (tp + fp + fn + 1e-8)
-                    self.log("metric/occ_iou", occ_iou)
-
-                    self.log("debug/frac_pos_gt", tgt_bin.float().mean())
-                    self.log("debug/frac_pos_pred", pred_bin.float().mean())
-                else:
-                    self.log("metric/occ_iou", 0.0)
-                    self.log("debug/frac_pos_gt", 0.0)
-                    self.log("debug/frac_pos_pred", 0.0)
-
-
-                # Visualize Overlap
-                intersection = torch.isin(self.vox.keys, self.vox_gt.keys).sum()
-                union = len(self.vox.keys) + len(self.vox_gt.keys) - intersection
-                iou = intersection / (union + 1e-8)
-                print(f"Voxel IoU: {iou:.4f} | Pred Voxels: {len(self.vox.keys)} | GT Voxels: {len(self.vox_gt.keys)}  | Overlap: {intersection}")
-
-
-                # Debug: Compare Centroids
-                if self.vox.keys.numel() > 0 and self.vox_gt.keys.numel() > 0:
-                    # Get world centers of predicted voxels
-                    pred_centers = self.vox.voxel_centers() 
-                    # Get world centers of GT voxels
-                    gt_ijk = self.vox_gt._unhash_keys(self.vox_gt.keys).float()
-                    gt_centers = self.vox_gt.origin + (gt_ijk + 0.5) * self.vox_gt.p.voxel_size
+                loss_intersect = torch.tensor(0.0, device=self.device)
+                
+                if pred_intersect.numel() > 0:
+                    # Calculate weight for positives just like before
+                    pos_mask = (tgt_intersect > 0.5)
+                    num_pos = pos_mask.sum()
+                    num_neg = (~pos_mask).sum()
                     
-                    print(f"Pred Centroid: {pred_centers.mean(0).detach().cpu().numpy()}")
-                    print(f"GT   Centroid: {gt_centers.mean(0).detach().cpu().numpy()}")
-                    
-                    # Check if they are close
-                    dist = torch.norm(pred_centers.mean(0) - gt_centers.mean(0))
-                    print(f"Centroid Distance: {dist.item()} (should be < voxel_size)")
-
-                assert len(torch.unique(self.vox.keys)) == len(self.vox.keys)
-                assert len(torch.unique(self.vox_gt.keys)) == len(self.vox_gt.keys)
-
-
-         
-
-                if p_occ_pred.numel() == 0:
-                    # Nothing to supervise this step
-                    loss_occ = torch.tensor(0.0, device=self.device)
-                else:
-                    # ---- compute positive class weight (same ratio as before) ----
-                    pos_mask = (p_occ_tgt > 0.5)
-                    num_pos  = pos_mask.sum()
-                    num_neg  = (~pos_mask).sum()
-
                     if num_pos > 0:
                         pos_weight = (num_neg.float() / (num_pos.float() + 1e-8)).to(self.device)
                     else:
                         pos_weight = torch.tensor(1.0, device=self.device)
 
-                    weights = torch.ones_like(p_occ_tgt, device=self.device)
+                    weights = torch.ones_like(tgt_intersect, device=self.device)
                     weights[pos_mask] = pos_weight
 
-                    loss_occ = F.binary_cross_entropy(
-                        p_occ_pred.clamp(1e-5, 1-1e-5),
-                        p_occ_tgt.clamp(1e-5, 1-1e-5),
+                    loss_intersect = F.binary_cross_entropy(
+                        pred_intersect.clamp(1e-5, 1-1e-5),
+                        tgt_intersect.clamp(1e-5, 1-1e-5),
                         weight=weights,
                         reduction="mean"
                     )
 
-                logit_gt = self.vox_gt.vals_st
-                p_gt = torch.sigmoid(logit_gt)
-                frac_gt_all = (p_gt > 0.5).float().mean()
-                print("GT fraction occupied over all gt voxels:", float(frac_gt_all))
+                # ---------------------------------------------------------
+                # PART B: Loss on False Positives (Pred - GT)
+                # ---------------------------------------------------------
+                # These are voxels in your prediction that DO NOT exist in GT.
+                # Since GT is truth, these must be empty (0.0).
+                pred_fp = p_occ_pred_before[~valid_mask]
+                loss_fp = torch.tensor(0.0, device=self.device)
 
-                # # p_occ_pred, p_occ_tgt already masked with valid_mask
-                # if p_occ_pred.numel() == 0:
-                #     loss_occ = torch.tensor(0.0, device=self.device)
-                # else:
-                #     tgt_bin = (p_occ_tgt > 0.5)
-                #     pos_idx = tgt_bin.nonzero(as_tuple=True)[0]
-                #     neg_idx = (~tgt_bin).nonzero(as_tuple=True)[0]
+                if pred_fp.numel() > 0:
+                    # Target is all zeros
+                    tgt_fp = torch.zeros_like(pred_fp)
+                    
+                    # Weighting: You might want to weigh this less than intersection
+                    # but here we start with 1.0 (strict precision).
+                    loss_fp = F.binary_cross_entropy(
+                        pred_fp.clamp(1e-5, 1-1e-5),
+                        tgt_fp, 
+                        reduction="mean"
+                    )
 
-                #     num_pos = pos_idx.numel()
-                #     num_neg = neg_idx.numel()
+                # ---------------------------------------------------------
+                # TOTAL OCCUPANCY LOSS & IoU
+                # ---------------------------------------------------------
+                fp_weight = 1.0 
+                loss_occ = loss_intersect + (fp_weight * loss_fp)
 
-                #     if num_pos == 0:
-                #         # nothing occupied in this step → only learn from negatives, small loss
-                #         loss_occ = F.binary_cross_entropy(
-                #             p_occ_pred.clamp(1e-5, 1-1e-5),
-                #             p_occ_tgt.clamp(1e-5, 1-1e-5),
-                #             reduction="mean",
-                #         )
-                #     else:
-                #         # keep all positives
-                #         k = 5  # try k in [3, 10]
-                #         max_neg = min(num_neg, k * num_pos)
-
-                #         if max_neg > 0:
-                #             perm = torch.randperm(num_neg, device=self.device)
-                #             neg_idx_sample = neg_idx[perm[:max_neg]]
-                #             idx = torch.cat([pos_idx, neg_idx_sample], dim=0)
-                #         else:
-                #             idx = pos_idx
-
-                #         p_sub = p_occ_pred[idx]
-                #         t_sub = p_occ_tgt[idx]
-
-                #         loss_occ = F.binary_cross_entropy(
-                #             p_sub.clamp(1e-5, 1-1e-5),
-                #             t_sub.clamp(1e-5, 1-1e-5),
-                #             reduction="mean",
-                #         )
-
-                # Temporal smoothness on logits (optional, encourages stability but not over-smoothing)
-                # keep a buffer of previous decoded occupancy
+                # --- Metrics: Global IoU (Including FP Hallucinations) ---
+                # Valid/Intersect Part
+                pred_bin_int = (pred_intersect > 0.5)
+                tgt_bin_int  = (tgt_intersect  > 0.5)
                 
-                # if t == 1:
-                #     self._prev_p_occ = p_occ_pred.detach()
-                # logit_now  = torch.logit(p_occ_pred.clamp(1e-5, 1-1e-5))
-                # logit_prev = torch.logit(self._prev_p_occ.clamp(1e-5, 1-1e-5)).to(device)
-                # loss_temp = F.smooth_l1_loss(logit_now, logit_prev, beta=0.1)
-                # self._prev_p_occ = p_occ_pred.detach()
+                tp = (pred_bin_int & tgt_bin_int).sum()
+                fp_int = (pred_bin_int & ~tgt_bin_int).sum()
+                fn = (~pred_bin_int & tgt_bin_int).sum()
                 
+                # Hallucination Part (Preds outside GT are all FPs if > 0.5)
+                fp_hallucination = (pred_fp > 0.5).sum()
                 
+                total_fp = fp_int + fp_hallucination
+                
+                occ_iou = tp / (tp + total_fp + fn + 1e-8)
+                metrics_buffer["occ_iou"].append(occ_iou.item())
+
+                # -------------------------------------------------------------
+                # DUAL LOSS LOGIC END
+                # -------------------------------------------------------------
+
+                # --- Loss: Temporal ---
                 if (t == 0) or (self._prev_keys is None):
                     loss_temp = torch.tensor(0.0, device=self.device)
                 else:
-                    prev_aligned, valid_mask = self.align_probs_to_keys(self._prev_keys, self._prev_probs,
-                                                    self.vox.keys, default=0.0)
-                    
+                    prev_aligned, valid_mask_temp = self.align_probs_to_keys(
+                        self._prev_keys, self._prev_probs, self.vox.keys, default=0.0
+                    )
                     
                     logit_now  = torch.logit(p_occ_pred_before.clamp(1e-5, 1-1e-5))
                     logit_prev = torch.logit(prev_aligned.clamp(1e-5, 1-1e-5))
                     
-                    logit_now  = logit_now[valid_mask]
-                    logit_prev = logit_prev[valid_mask]
-                    
+                    logit_now  = logit_now[valid_mask_temp]
+                    logit_prev = logit_prev[valid_mask_temp]
                     
                     if logit_now.numel() == 0:
                         loss_temp = torch.tensor(0.0, device=self.device)
@@ -1084,81 +1349,62 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 self._prev_keys  = self.vox.keys.detach().clone()
                 self._prev_probs = p_occ_pred_before.detach().clone()
 
+                # --- Loss: Others (Entropy / TV) ---
+                loss_ent = torch.tensor(0.0, device=device)
+                if hasattr(self.vox, "_last_entropy") and self.vox._last_entropy is not None:
+                    loss_ent = self.vox._last_entropy
+                
+                loss_tv = torch.tensor(0.0, device=device)
 
-            
-            # Entropy regularizer on routing (OPTIONAL):
-            # add a small penalty you compute inside update_with_features_learned (return avg entropy)
-            # For simplicity, assume you store last entropy in self.grid._last_entropy
-            loss_ent = torch.tensor(0.0, device=device)
-            if hasattr(self.vox, "_last_entropy") and self.vox._last_entropy is not None:
-                loss_ent = self.vox._last_entropy
+                # Combine Losses
+                loss_t = cfg.lambda_occ * loss_occ + cfg.lambda_temp * loss_temp \
+                         + cfg.lambda_ent * loss_ent + cfg.lambda_tv * loss_tv
 
-            # TV regularizer on occupancy map (soft smoothness)
-            # You can build a 3D TV using neighbor shifts (careful—sparse). Simple proxy:
-            loss_tv = torch.tensor(0.0, device=device)
+                # Manual Backward (per timestep)
+                self.manual_backward(loss_t)
 
-            loss_t = cfg.lambda_occ * loss_occ + cfg.lambda_temp * loss_temp \
-                     + cfg.lambda_ent * loss_ent + cfg.lambda_tv * loss_tv
-
-
-
-            
-            self.manual_backward(loss_t)
-
-       
-            loss_total = loss_total + loss_t.detach()
-            
-            print(loss_t.detach())
-            print(loss_total)
-
-            # # logging
-            # self.log_dict({
-            #     "loss/occ": loss_occ,
-            #     "loss/temp": loss_temp,
-            #     "loss/ent": loss_ent,
-            #     "loss/tv": loss_tv,
-            #     "stats/num_voxels": float(self.vox.keys.numel())
-            # }, prog_bar=(t == T-1), on_step=True, on_epoch=True, sync_dist=False)
-            if t == T - 1:
-                self.log_dict(
-                    {
-                        "loss/occ": loss_occ,
-                        "loss/temp": loss_temp,
-                        "loss/ent": loss_ent,
-                        "loss/tv": loss_tv,
-                        "stats/num_voxels": float(self.vox.keys.numel()),
-                    },
-                    prog_bar=True,
-                    on_step=True,
-                    on_epoch=True,
-                    sync_dist=False,
-                )
-            
+                # Accumulate for logging (detach to save memory)
+                loss_total_seq += loss_t.detach()
+                
+                metrics_buffer["loss_occ"].append(loss_occ.detach().item())
+                metrics_buffer["loss_temp"].append(loss_temp.detach().item())
+                metrics_buffer["loss_ent"].append(loss_ent.detach().item())
+                metrics_buffer["loss_tv"].append(loss_tv.detach().item())
 
             self.vox.z_latent = self.vox.z_latent.detach()
-
-
             torch.cuda.empty_cache()
         
-        # add:
+        # ---- End of Sequence Loop ----
+
+        # 1. Clip Gradients
         grad_norm = self.compute_grad_norm()
-        self.log("grad_norm", grad_norm, prog_bar=True, on_step=True, on_epoch=False)
-
         torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)            
-        # then:
-        opt.step()            
-        # --- per-timestep backward + step ---
-        opt.zero_grad(set_to_none=True)
-            
-
-
-        # Add on_epoch=True to smooth the loss curve and save based on the average
-        self.log("loss/total", loss_total, prog_bar=True, on_epoch=True)        
         
-      
+        # 2. Optimizer Step
+        opt.step()            
+        opt.zero_grad(set_to_none=True)
 
-        return loss_total
-    
+        # 3. Aggregate Metrics (Mean over sequence)
+        def get_avg(name):
+            vals = metrics_buffer[name]
+            return sum(vals) / len(vals) if len(vals) > 0 else 0.0
+
+        avg_loss_total = loss_total_seq# / max(T, 1)
+
+        # 4. Log Averaged Metrics
+        self.log_dict({
+            "loss/occ": get_avg("loss_occ"),
+            "loss/temp": get_avg("loss_temp"),
+            "loss/ent": get_avg("loss_ent"),
+            "loss/tv": get_avg("loss_tv"),
+            "loss/total_avg": avg_loss_total,
+            "metric/occ_iou": get_avg("occ_iou"),
+            "stats/num_voxels": float(self.vox.keys.numel()),
+            "grad_norm": grad_norm
+        }, prog_bar=True, on_step=True, on_epoch=True, sync_dist=False)
+
+        return loss_total_seq
+
     # -----------------------------------------------------------
     # ===> PASTE THIS FUNCTION HERE inside VoxelUpdaterSystem <===
     # -----------------------------------------------------------
@@ -1207,172 +1453,347 @@ class VoxelUpdaterSystem(pl.LightningModule):
                     )
     
     
+    # def validation_step(self, batch: Dict, batch_idx: int):
+    #     device = self.device
+
+    #     cfg = self.cfg
+
+    #     self.vox.reset_state()
+    #     self.vox = self.vox.to(self.device)
+
+    #     self.vox_gt = TorchSparseVoxelGrid(
+    #         origin_xyz=np.zeros(3, dtype=np.float32),
+    #         params=VoxelParams(voxel_size=self.voxel_size, promote_hits=2),
+    #         device=self.device 
+    #     )
+        
+    #     # no optimizer / manual_backward here
+    #     T = batch["timesteps"]
+
+    #     val_loss_total = torch.zeros([], device=device)
+
+
+    #     seq_id = batch["seq_id"]
+
+    #     gt_root = os.path.join(self.cfg.dataset_root, "gt_voxels_per_timestep_01")
+    #     gt_seq = []
+    #     for t in range(T):
+    #         if self.cfg.skip:
+    #             t = t*10
+    #         gt_path = os.path.join(gt_root, f"{seq_id}_t{t:04d}_gt.npz")
+    #         vox_gt_t = load_sparse_voxel_grid(gt_path, device)
+    #         gt_seq.append(vox_gt_t)
+            
+    #     mst = False
+
+    #     Rmw = None
+    #     tmw = None
+    #     for t in range(T):
+            
+    #         print(f"=============================timestep {t}=============================")
+
+    #         imgs = batch["imgs_t"][t]
+        
+        
+        
+    #         # seq_id = batch["seq_id"]
+    #         # gt_path = os.path.join(
+    #         #     self.cfg.dataset_root,
+    #         #     "gt_voxels_per_timestep",
+    #         #     f"{seq_id}_t{t:04d}_gt.npz"
+    #         # )
+    #         # self.vox_gt = load_sparse_voxel_grid(gt_path, self.device)
+    #         self.vox_gt = gt_seq[t]
+
+        
+    #         with torch.enable_grad():
+
+    #             # bev_gt, R, tw = self.inference_gt(t, imgs)
+                
+    #             #bev = self.inference(t, imgs)
+    #             if not mst and t != 0:
+    #                 bev, mst, _, _  = self.inference(1, imgs, mst, Rmw, tmw)
+    #             else:
+    #                 bev, mst, _, _  = self.inference(t, imgs, mst, Rmw, tmw)
+        
+        
+
+
+    #         with autocast(enabled=False):
+    #             # p_occ_tgt = self.vox_gt.vals_st
+                
+    #             p_occ_tgt = torch.sigmoid(self.vox_gt.vals_st)
+
+
+    #             p_occ_pred_before = self.vox.decode_occupancy()
+    #             p_occ_tgt, valid_mask = self.align_probs_to_keys(self.vox_gt.keys, p_occ_tgt,
+    #                                 self.vox.keys, default=0.0)      
+
+    #             p_occ_pred = p_occ_pred_before[valid_mask]
+    #             p_occ_tgt  = p_occ_tgt[valid_mask]
+                
+                
+
+
+    #             # Visualize Overlap
+    #             intersection = torch.isin(self.vox.keys, self.vox_gt.keys).sum()
+    #             union = len(self.vox.keys) + len(self.vox_gt.keys) - intersection
+    #             iou = intersection / (union + 1e-8)
+    #             print(f"Voxel IoU: {iou:.4f} | Pred Voxels: {len(self.vox.keys)} | GT Voxels: {len(self.vox_gt.keys)}  | Overlap: {intersection}")
+
+    #                 # Inside training_step, before intersection calculation
+
+    #             # Debug: Compare Centroids
+    #             if self.vox.keys.numel() > 0 and self.vox_gt.keys.numel() > 0:
+    #                 # Get world centers of predicted voxels
+    #                 pred_centers = self.vox.voxel_centers() 
+    #                 # Get world centers of GT voxels
+    #                 gt_ijk = self.vox_gt._unhash_keys(self.vox_gt.keys).float()
+    #                 gt_centers = self.vox_gt.origin + (gt_ijk + 0.5) * self.vox_gt.p.voxel_size
+                    
+    #                 print(f"Pred Centroid: {pred_centers.mean(0).detach().cpu().numpy()}")
+    #                 print(f"GT   Centroid: {gt_centers.mean(0).detach().cpu().numpy()}")
+                    
+    #                 # Check if they are close
+    #                 dist = torch.norm(pred_centers.mean(0) - gt_centers.mean(0))
+    #                 print(f"Centroid Distance: {dist.item()} (should be < voxel_size)")
+
+    #             assert len(torch.unique(self.vox.keys)) == len(self.vox.keys)
+    #             assert len(torch.unique(self.vox_gt.keys)) == len(self.vox_gt.keys)
+
+
+
+
+    #             if p_occ_pred.numel() == 0:
+    #                 # Nothing to supervise this step
+    #                 loss_occ = torch.tensor(0.0, device=self.device)
+    #             else:
+
+    #                 loss_occ = F.binary_cross_entropy(
+    #                     p_occ_pred.clamp(1e-5, 1 - 1e-5),
+    #                     p_occ_tgt.clamp(1e-5, 1 - 1e-5),
+    #                 )
+            
+            
+    #             if (t == 0) or (self._prev_keys is None):
+    #                 loss_temp = torch.tensor(0.0, device=self.device)
+    #             else:
+    #                 # prev_aligned = self.align_probs_to_keys(self._prev_keys, self._prev_probs,
+    #                 #                             self.vox.keys, default=0.0)
+    #                 # logit_now  = torch.logit(p_occ_pred.clamp(1e-5, 1-1e-5))
+    #                 # logit_prev = torch.logit(prev_aligned.clamp(1e-5, 1-1e-5))
+                    
+                    
+    #                 prev_aligned, valid_mask = self.align_probs_to_keys(self._prev_keys, self._prev_probs,
+    #                                                 self.vox.keys, default=0.0)
+                    
+                    
+    #                 logit_now  = torch.logit(p_occ_pred_before.clamp(1e-5, 1-1e-5))
+    #                 logit_prev = torch.logit(prev_aligned.clamp(1e-5, 1-1e-5))
+                    
+    #                 logit_now  = logit_now[valid_mask]
+    #                 logit_prev = logit_prev[valid_mask]
+                    
+                    
+    #                 if logit_now.numel() == 0:
+    #                     loss_temp = torch.tensor(0.0, device=self.device)
+    #                 else:
+    #                     loss_temp = F.smooth_l1_loss(logit_now, logit_prev, beta=0.1)
+
+    #             # update buffers for next step
+    #             self._prev_keys  = self.vox.keys.detach().clone()
+    #             self._prev_probs = p_occ_pred_before.detach().clone()
+            
+            
+    #         loss_t = cfg.lambda_occ * loss_occ + cfg.lambda_temp * loss_temp \
+
+    #         self.vox.z_latent = self.vox.z_latent.detach()
+
+    #         val_loss_total += loss_t.detach()
+            
+            
+    #         torch.cuda.empty_cache()
+
+
+    #     self.log("val_loss_total", val_loss_total, prog_bar=True, on_epoch=True)
+    #     return val_loss_total
+
+    
+    
     def validation_step(self, batch: Dict, batch_idx: int):
         device = self.device
-
         cfg = self.cfg
 
         self.vox.reset_state()
         self.vox = self.vox.to(self.device)
 
+        # Initialize an empty GT grid structure
         self.vox_gt = TorchSparseVoxelGrid(
             origin_xyz=np.zeros(3, dtype=np.float32),
             params=VoxelParams(voxel_size=self.voxel_size, promote_hits=2),
             device=self.device 
         )
         
-        # no optimizer / manual_backward here
+        # Buffers for temporal consistency
+        self._prev_keys = None
+        self._prev_probs = None
+
         T = batch["timesteps"]
+        val_loss_total_seq = torch.zeros([], device=device)
 
-        val_loss_total = torch.zeros([], device=device)
-
+        # Metrics buffer for averaging
+        metrics_buffer = {
+            "loss_occ": [],
+            "loss_temp": [],
+            "occ_iou": []
+        }
 
         seq_id = batch["seq_id"]
-
         gt_root = os.path.join(self.cfg.dataset_root, "gt_voxels_per_timestep_01")
+        
+        # Preload GT
         gt_seq = []
         for t in range(T):
             if self.cfg.skip:
-                t = t*10
+                t = t * 10
             gt_path = os.path.join(gt_root, f"{seq_id}_t{t:04d}_gt.npz")
-            vox_gt_t = load_sparse_voxel_grid(gt_path, device)
+            if os.path.exists(gt_path):
+                vox_gt_t = load_sparse_voxel_grid(gt_path, device)
+            else:
+                vox_gt_t = None
             gt_seq.append(vox_gt_t)
             
         mst = False
-
         Rmw = None
         tmw = None
+
         for t in range(T):
-            
-            print(f"=============================timestep {t}=============================")
-
+            # print(f"== Val Step {t} ==")
             imgs = batch["imgs_t"][t]
-        
-        
-        
-            # seq_id = batch["seq_id"]
-            # gt_path = os.path.join(
-            #     self.cfg.dataset_root,
-            #     "gt_voxels_per_timestep",
-            #     f"{seq_id}_t{t:04d}_gt.npz"
-            # )
-            # self.vox_gt = load_sparse_voxel_grid(gt_path, self.device)
+            
             self.vox_gt = gt_seq[t]
+            if self.vox_gt is None:
+                continue
 
-        
-            with torch.enable_grad():
-
-                # bev_gt, R, tw = self.inference_gt(t, imgs)
-                
-                #bev = self.inference(t, imgs)
+            with torch.enable_grad(): # (Keep grad enabled for inference/update parts if needed by model)
                 if not mst and t != 0:
                     bev, mst, _, _  = self.inference(1, imgs, mst, Rmw, tmw)
                 else:
                     bev, mst, _, _  = self.inference(t, imgs, mst, Rmw, tmw)
-        
-        
 
-
+            # Validation Loss Calculation (No Autocast needed strictly, but good for consistency)
             with autocast(enabled=False):
-                # p_occ_tgt = self.vox_gt.vals_st
-                
-                p_occ_tgt = torch.sigmoid(self.vox_gt.vals_st)
-
+                # p_occ_tgt = torch.sigmoid(self.vox_gt.vals_st)
+                p_occ_tgt = torch.sigmoid(self.vox_gt.vals_st * 10.0)
 
                 p_occ_pred_before = self.vox.decode_occupancy()
-                p_occ_tgt, valid_mask = self.align_probs_to_keys(self.vox_gt.keys, p_occ_tgt,
-                                    self.vox.keys, default=0.0)      
 
-                p_occ_pred = p_occ_pred_before[valid_mask]
-                p_occ_tgt  = p_occ_tgt[valid_mask]
+                # 1. Align GT to Prediction
+                p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys(
+                    self.vox_gt.keys, p_occ_tgt, self.vox.keys, default=0.0
+                )      
+
+                # ---------------------------------------------------------
+                # PART A: Intersection Loss
+                # ---------------------------------------------------------
+                pred_intersect = p_occ_pred_before[valid_mask]
+                tgt_intersect  = p_occ_tgt_aligned[valid_mask]
                 
-                
+                loss_intersect = torch.tensor(0.0, device=self.device)
 
-
-                # Visualize Overlap
-                intersection = torch.isin(self.vox.keys, self.vox_gt.keys).sum()
-                union = len(self.vox.keys) + len(self.vox_gt.keys) - intersection
-                iou = intersection / (union + 1e-8)
-                print(f"Voxel IoU: {iou:.4f} | Pred Voxels: {len(self.vox.keys)} | GT Voxels: {len(self.vox_gt.keys)}  | Overlap: {intersection}")
-
-                    # Inside training_step, before intersection calculation
-
-                # Debug: Compare Centroids
-                if self.vox.keys.numel() > 0 and self.vox_gt.keys.numel() > 0:
-                    # Get world centers of predicted voxels
-                    pred_centers = self.vox.voxel_centers() 
-                    # Get world centers of GT voxels
-                    gt_ijk = self.vox_gt._unhash_keys(self.vox_gt.keys).float()
-                    gt_centers = self.vox_gt.origin + (gt_ijk + 0.5) * self.vox_gt.p.voxel_size
+                if pred_intersect.numel() > 0:
+                    # Positive Weighting
+                    pos_mask = (tgt_intersect > 0.5)
+                    num_pos = pos_mask.sum()
+                    num_neg = (~pos_mask).sum()
                     
-                    print(f"Pred Centroid: {pred_centers.mean(0).detach().cpu().numpy()}")
-                    print(f"GT   Centroid: {gt_centers.mean(0).detach().cpu().numpy()}")
-                    
-                    # Check if they are close
-                    dist = torch.norm(pred_centers.mean(0) - gt_centers.mean(0))
-                    print(f"Centroid Distance: {dist.item()} (should be < voxel_size)")
+                    if num_pos > 0:
+                        pos_weight = (num_neg.float() / (num_pos.float() + 1e-8))
+                    else:
+                        pos_weight = torch.tensor(1.0, device=self.device)
 
-                assert len(torch.unique(self.vox.keys)) == len(self.vox.keys)
-                assert len(torch.unique(self.vox_gt.keys)) == len(self.vox_gt.keys)
+                    weights = torch.ones_like(tgt_intersect)
+                    weights[pos_mask] = pos_weight
 
-
-
-
-                if p_occ_pred.numel() == 0:
-                    # Nothing to supervise this step
-                    loss_occ = torch.tensor(0.0, device=self.device)
-                else:
-
-                    loss_occ = F.binary_cross_entropy(
-                        p_occ_pred.clamp(1e-5, 1 - 1e-5),
-                        p_occ_tgt.clamp(1e-5, 1 - 1e-5),
+                    loss_intersect = F.binary_cross_entropy(
+                        pred_intersect.clamp(1e-5, 1-1e-5),
+                        tgt_intersect.clamp(1e-5, 1-1e-5),
+                        weight=weights
                     )
-            
-            
+
+                # ---------------------------------------------------------
+                # PART B: False Positive Loss (Hallucinations)
+                # ---------------------------------------------------------
+                pred_fp = p_occ_pred_before[~valid_mask]
+                loss_fp = torch.tensor(0.0, device=self.device)
+
+                if pred_fp.numel() > 0:
+                    tgt_fp = torch.zeros_like(pred_fp)
+                    loss_fp = F.binary_cross_entropy(
+                        pred_fp.clamp(1e-5, 1-1e-5),
+                        tgt_fp
+                    )
+
+                # Total Val Loss
+                fp_weight = 1.0
+                loss_occ = loss_intersect + (fp_weight * loss_fp)
+
+                # ---------------------------------------------------------
+                # METRICS: Global IoU (Including Hallucinations)
+                # ---------------------------------------------------------
+                # Intersect part
+                pred_bin_int = (pred_intersect > 0.5)
+                tgt_bin_int  = (tgt_intersect  > 0.5)
+                
+                tp = (pred_bin_int & tgt_bin_int).sum()
+                fp_int = (pred_bin_int & ~tgt_bin_int).sum()
+                fn = (~pred_bin_int & tgt_bin_int).sum()
+                
+                # Hallucination part
+                fp_hallucination = (pred_fp > 0.5).sum()
+                
+                total_fp = fp_int + fp_hallucination
+                occ_iou = tp / (tp + total_fp + fn + 1e-8)
+                
+                metrics_buffer["occ_iou"].append(occ_iou.item())
+
+                # --- Temporal Loss (Optional for Val, but good to track) ---
                 if (t == 0) or (self._prev_keys is None):
                     loss_temp = torch.tensor(0.0, device=self.device)
                 else:
-                    # prev_aligned = self.align_probs_to_keys(self._prev_keys, self._prev_probs,
-                    #                             self.vox.keys, default=0.0)
-                    # logit_now  = torch.logit(p_occ_pred.clamp(1e-5, 1-1e-5))
-                    # logit_prev = torch.logit(prev_aligned.clamp(1e-5, 1-1e-5))
-                    
-                    
-                    prev_aligned, valid_mask = self.align_probs_to_keys(self._prev_keys, self._prev_probs,
-                                                    self.vox.keys, default=0.0)
-                    
-                    
+                    prev_aligned, valid_mask_temp = self.align_probs_to_keys(
+                        self._prev_keys, self._prev_probs, self.vox.keys, default=0.0
+                    )
                     logit_now  = torch.logit(p_occ_pred_before.clamp(1e-5, 1-1e-5))
                     logit_prev = torch.logit(prev_aligned.clamp(1e-5, 1-1e-5))
-                    
-                    logit_now  = logit_now[valid_mask]
-                    logit_prev = logit_prev[valid_mask]
-                    
-                    
+                    logit_now  = logit_now[valid_mask_temp]
+                    logit_prev = logit_prev[valid_mask_temp]
+
                     if logit_now.numel() == 0:
                         loss_temp = torch.tensor(0.0, device=self.device)
                     else:
                         loss_temp = F.smooth_l1_loss(logit_now, logit_prev, beta=0.1)
 
-                # update buffers for next step
                 self._prev_keys  = self.vox.keys.detach().clone()
                 self._prev_probs = p_occ_pred_before.detach().clone()
             
+                loss_t = cfg.lambda_occ * loss_occ + cfg.lambda_temp * loss_temp
+                val_loss_total_seq += loss_t.detach()
+                
+                metrics_buffer["loss_occ"].append(loss_occ.item())
+                metrics_buffer["loss_temp"].append(loss_temp.item())
             
-            loss_t = cfg.lambda_occ * loss_occ + cfg.lambda_temp * loss_temp \
-
             self.vox.z_latent = self.vox.z_latent.detach()
-
-            val_loss_total += loss_t.detach()
-            
-            
             torch.cuda.empty_cache()
 
+        # Average over sequence
+        val_loss_total = val_loss_total_seq #/ max(T, 1)
+        avg_iou = sum(metrics_buffer["occ_iou"]) / len(metrics_buffer["occ_iou"]) if metrics_buffer["occ_iou"] else 0.0
 
-        self.log("val_loss_total", val_loss_total, prog_bar=True, on_epoch=True)
+        self.log("val_loss_total", val_loss_total, prog_bar=True, on_epoch=True, sync_dist=False)
+        self.log("val_metric/occ_iou", avg_iou, prog_bar=True, on_epoch=True, sync_dist=False)
+        
         return val_loss_total
-
-    
 # dataset_auto.py
 import os, re, random
 from typing import List, Dict, Optional, Tuple
@@ -1712,7 +2133,8 @@ def main():
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=1,
         enable_progress_bar=True,
-        logger=wandb_logger,          # <<< add this
+        logger=wandb_logger,
+        accumulate_grad_batches=4,
 
 
     )
