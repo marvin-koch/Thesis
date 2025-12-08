@@ -146,36 +146,7 @@ class TrainConfig:
     teacher_beam_every_t: bool = True  # run teacher for every timestep (offline precomputed if possible)
     skip: bool = False
 
-# --------------------------
-# 4) Dataset (sequence-level)
-#   Yields a dict with all frames of one sequence; teacher can be precomputed and cached.
-# --------------------------
-class HabitatSeqDataset(Dataset):
-    def __init__(self, root: str, seq_list_file: str):
-        with open(seq_list_file, "r") as f:
-            self.seq_paths = [os.path.join(root, line.strip()) for line in f if line.strip()]
-        assert len(self.seq_paths) > 0, "Empty sequence list."
 
-    def __len__(self):
-        return len(self.seq_paths)
-
-    def __getitem__(self, idx: int) -> Dict:
-        seq_dir = self.seq_paths[idx]
-        # TODO: load sequence frames here:
-        # - images per camera per timestep OR already-formed partial point clouds per timestep
-        # - camera poses / intrinsics if needed
-        # - optionally: cached teacher voxel labels per timestep
-        # Return a dict:
-        # {
-        #   "seq_id": str,
-        #   "timesteps": int T,
-        #   "points_t":   List[Tensor (Nt,3)]  # partial points per t (world)
-        #   "rgb_t":      List[Tensor (Nt,3)]  # optional colors per point
-        #   "cams_t":     List[Tensor (Nt,3)]  # optional per-point camera centers
-        #   "teacher_occ": Optional[List[Dict]] # optional precomputed teacher labels per t
-        #   "init_full":  Dict with {"points": Tensor (N0,3), "rgb": (N0,3)} for init
-        # }
-        raise NotImplementedError
 
 # --------------------------
 # 5) LightningModule
@@ -1275,8 +1246,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 weights[pos_mask] = pos_weight
 
                 loss_intersect = F.binary_cross_entropy(
-                    pred_intersect.clamp(1e-5, 1-1e-5),
-                    tgt_intersect.clamp(1e-5, 1-1e-5),
+                    pred_intersect.float().clamp(1e-5, 1-1e-5),
+                    tgt_intersect.float().clamp(1e-5, 1-1e-5),
                     weight=weights,
                     reduction="mean"
                 )
@@ -1296,8 +1267,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 # Weighting: You might want to weigh this less than intersection
                 # but here we start with 1.0 (strict precision).
                 loss_fp = F.binary_cross_entropy(
-                    pred_fp.clamp(1e-5, 1-1e-5),
-                    tgt_fp, 
+                    pred_fp.float().clamp(1e-5, 1-1e-5),
+                    tgt_fp.float(), 
                     reduction="mean"
                 )
 
@@ -1730,8 +1701,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 weights[pos_mask] = pos_weight
 
                 loss_intersect = F.binary_cross_entropy(
-                    pred_intersect.clamp(1e-5, 1-1e-5),
-                    tgt_intersect.clamp(1e-5, 1-1e-5),
+                    pred_intersect.float().clamp(1e-5, 1-1e-5),
+                    tgt_intersect.float().clamp(1e-5, 1-1e-5),
                     weight=weights
                 )
 
@@ -1744,12 +1715,12 @@ class VoxelUpdaterSystem(pl.LightningModule):
             if pred_fp.numel() > 0:
                 tgt_fp = torch.zeros_like(pred_fp)
                 loss_fp = F.binary_cross_entropy(
-                    pred_fp.clamp(1e-5, 1-1e-5),
-                    tgt_fp
+                    pred_fp.float().clamp(1e-5, 1-1e-5),
+                    tgt_fp.float()
                 )
 
             # Total Val Loss
-            fp_weight = 1.0
+            fp_weight = 0.1
             loss_occ = loss_intersect + (fp_weight * loss_fp)
 
             # ---------------------------------------------------------
