@@ -87,17 +87,17 @@ class TorchSparseVoxelGrid:
 
         # per-voxel counters/guards (aligned to keys)
         self.hit_count       = torch.empty(0, dtype=torch.int32, device=self.device)  # total + hits (legacy)
-        self.pos_occ_count   = torch.empty(0, dtype=torch.int16, device=self.device)  # consecutive + hits (legacy)
-        self.neg_free_count  = torch.empty(0, dtype=torch.int16, device=self.device)  # consecutive frees
+        self.pos_occ_count   = torch.empty(0, dtype=torch.int32, device=self.device)  # consecutive + hits (legacy)
+        self.neg_free_count  = torch.empty(0, dtype=torch.int32, device=self.device)  # consecutive frees
         self.last_occ_epoch  = torch.empty(0, dtype=torch.int32, device=self.device)
         self.last_free_epoch = torch.empty(0, dtype=torch.int32, device=self.device)
-        self.view_bits       = torch.empty(0, dtype=torch.int16, device=self.device)  # 8-dir bitmask (cumulative this session)
+        self.view_bits       = torch.empty(0, dtype=torch.int32, device=self.device)  # 8-dir bitmask (cumulative this session)
 
         # ---------- NEW: epoch-based promotion state ----------
         self.seen_occ_epoch   = torch.empty(0, dtype=torch.int32, device=self.device)  # last epoch index when seen occupied
-        self.seen_view_bits_e = torch.empty(0, dtype=torch.int16, device=self.device)  # per-epoch view bits
-        self.occ_epoch_count  = torch.empty(0, dtype=torch.int16, device=self.device)  # number of distinct epochs seen occupied
-        self.view_bits_cum    = torch.empty(0, dtype=torch.int16, device=self.device)  # OR of per-epoch view bits
+        self.seen_view_bits_e = torch.empty(0, dtype=torch.int32, device=self.device)  # per-epoch view bits
+        self.occ_epoch_count  = torch.empty(0, dtype=torch.int32, device=self.device)  # number of distinct epochs seen occupied
+        self.view_bits_cum    = torch.empty(0, dtype=torch.int32, device=self.device)  # OR of per-epoch view bits
         self.lt_promoted_flag = torch.empty(0, dtype=torch.uint8, device=self.device)  # 0/1: already promoted (for "once")
 
         self.epoch: int = 0  # advance once per integration round
@@ -197,15 +197,15 @@ class TorchSparseVoxelGrid:
                 epochs_ok = self.occ_epoch_count[seen_now] >= int(self.p.promote_epochs)
                 if int(self.p.lt_min_view_sectors) > 1:
                     # popcount of 8-bit mask (branchless)
-                    vb = self.view_bits_cum[seen_now].to(torch.int16)
-                    pop = ((vb & 1 > 0).to(torch.int16) +
-                           ((vb >> 1) & 1 > 0).to(torch.int16) +
-                           ((vb >> 2) & 1 > 0).to(torch.int16) +
-                           ((vb >> 3) & 1 > 0).to(torch.int16) +
-                           ((vb >> 4) & 1 > 0).to(torch.int16) +
-                           ((vb >> 5) & 1 > 0).to(torch.int16) +
-                           ((vb >> 6) & 1 > 0).to(torch.int16) +
-                           ((vb >> 7) & 1 > 0).to(torch.int16))
+                    vb = self.view_bits_cum[seen_now].to(torch.int32)
+                    pop = ((vb & 1 > 0).to(torch.int32) +
+                           ((vb >> 1) & 1 > 0).to(torch.int32) +
+                           ((vb >> 2) & 1 > 0).to(torch.int32) +
+                           ((vb >> 3) & 1 > 0).to(torch.int32) +
+                           ((vb >> 4) & 1 > 0).to(torch.int32) +
+                           ((vb >> 5) & 1 > 0).to(torch.int32) +
+                           ((vb >> 6) & 1 > 0).to(torch.int32) +
+                           ((vb >> 7) & 1 > 0).to(torch.int32))
                     mv_ok = pop >= int(self.p.lt_min_view_sectors)
                 else:
                     mv_ok = torch.ones_like(self.occ_epoch_count[seen_now], dtype=torch.bool, device=self.device)
@@ -307,11 +307,11 @@ class TorchSparseVoxelGrid:
             v = centers - torch.as_tensor(cam_center_world, dtype=self.origin.dtype, device=self.device).reshape(1,3)
             yaw = torch.atan2(v[:,1], v[:,0])
             sector = torch.floor((yaw + math.pi) / (2*math.pi) * 8.0) % 8.0
-            bits = (1 << sector.to(torch.int16)).to(self.view_bits.dtype)
+            bits = (1 << sector.to(torch.int32)).to(self.view_bits.dtype)
             self.view_bits[idx] = self.view_bits[idx] | bits
 
             # --- NEW: per-epoch view bits (for promotion gating) ---
-            bits_e = (1 << sector.to(torch.int16)).to(self.seen_view_bits_e.dtype)
+            bits_e = (1 << sector.to(torch.int32)).to(self.seen_view_bits_e.dtype)
             self.seen_view_bits_e[idx] = self.seen_view_bits_e[idx] | bits_e
 
         # --- NEW: mark seen this epoch for epoch-based promotion ---

@@ -267,15 +267,15 @@ class LatentVoxelGrid(nn.Module):
         self.eb("vals_lt",        (0,),     dtype)
         self.eb("vals",           (0,),     dtype)
         self.eb("hit_count",      (0,),     torch.int32)
-        self.eb("pos_occ_count",  (0,),     torch.int16)
-        self.eb("neg_free_count", (0,),     torch.int16)
+        self.eb("pos_occ_count",  (0,),     torch.int32)
+        self.eb("neg_free_count", (0,),     torch.int32)
         self.eb("last_occ_epoch", (0,),     torch.int32)
         self.eb("last_free_epoch",(0,),     torch.int32)
-        self.eb("view_bits",      (0,),     torch.int16)
+        self.eb("view_bits",      (0,),     torch.int32)
         self.eb("seen_occ_epoch", (0,),     torch.int32)
-        self.eb("seen_view_bits_e",(0,),    torch.int16)
-        self.eb("occ_epoch_count",(0,),     torch.int16)
-        self.eb("view_bits_cum",  (0,),     torch.int16)
+        self.eb("seen_view_bits_e",(0,),    torch.int32)
+        self.eb("occ_epoch_count",(0,),     torch.int32)
+        self.eb("view_bits_cum",  (0,),     torch.int32)
         self.eb("lt_promoted_flag",(0,),    torch.uint8)
 
         self.epoch: int = 0
@@ -346,15 +346,15 @@ class LatentVoxelGrid(nn.Module):
         # self.eb("vals_lt",        (0,),     self.dtype)
         # self.eb("vals",           (0,),     self.dtype)
         # self.eb("hit_count",      (0,),     torch.int32)
-        # self.eb("pos_occ_count",  (0,),     torch.int16)
-        # self.eb("neg_free_count", (0,),     torch.int16)
+        # self.eb("pos_occ_count",  (0,),     torch.int32)
+        # self.eb("neg_free_count", (0,),     torch.int32)
         # self.eb("last_occ_epoch", (0,),     torch.int32)
         # self.eb("last_free_epoch",(0,),     torch.int32)
-        # self.eb("view_bits",      (0,),     torch.int16)
+        # self.eb("view_bits",      (0,),     torch.int32)
         # self.eb("seen_occ_epoch", (0,),     torch.int32)
-        # self.eb("seen_view_bits_e",(0,),    torch.int16)
-        # self.eb("occ_epoch_count",(0,),     torch.int16)
-        # self.eb("view_bits_cum",  (0,),     torch.int16)
+        # self.eb("seen_view_bits_e",(0,),    torch.int32)
+        # self.eb("occ_epoch_count",(0,),     torch.int32)
+        # self.eb("view_bits_cum",  (0,),     torch.int32)
         # self.eb("lt_promoted_flag",(0,),    torch.uint8)
 
 
@@ -370,15 +370,15 @@ class LatentVoxelGrid(nn.Module):
         reset_buf("vals_lt",        (0,),     self.dtype)
         reset_buf("vals",           (0,),     self.dtype)
         reset_buf("hit_count",      (0,),     torch.int32)
-        reset_buf("pos_occ_count",  (0,),     torch.int16)
-        reset_buf("neg_free_count", (0,),     torch.int16)
+        reset_buf("pos_occ_count",  (0,),     torch.int32)
+        reset_buf("neg_free_count", (0,),     torch.int32)
         reset_buf("last_occ_epoch", (0,),     torch.int32)
         reset_buf("last_free_epoch",(0,),     torch.int32)
-        reset_buf("view_bits",      (0,),     torch.int16)
+        reset_buf("view_bits",      (0,),     torch.int32)
         reset_buf("seen_occ_epoch", (0,),     torch.int32)
-        reset_buf("seen_view_bits_e",(0,),    torch.int16)
-        reset_buf("occ_epoch_count",(0,),     torch.int16)
-        reset_buf("view_bits_cum",  (0,),     torch.int16)
+        reset_buf("seen_view_bits_e",(0,),    torch.int32)
+        reset_buf("occ_epoch_count",(0,),     torch.int32)
+        reset_buf("view_bits_cum",  (0,),     torch.int32)
         reset_buf("lt_promoted_flag",(0,),    torch.uint8)
         
 
@@ -498,15 +498,15 @@ class LatentVoxelGrid(nn.Module):
 
                 epochs_ok = self.occ_epoch_count[seen_now] >= int(self.p.promote_epochs)
                 if int(self.p.lt_min_view_sectors) > 1:
-                    vb = self.view_bits_cum[seen_now].to(torch.int16)
-                    pop = ((vb & 1 > 0).to(torch.int16) +
-                           ((vb >> 1) & 1 > 0).to(torch.int16) +
-                           ((vb >> 2) & 1 > 0).to(torch.int16) +
-                           ((vb >> 3) & 1 > 0).to(torch.int16) +
-                           ((vb >> 4) & 1 > 0).to(torch.int16) +
-                           ((vb >> 5) & 1 > 0).to(torch.int16) +
-                           ((vb >> 6) & 1 > 0).to(torch.int16) +
-                           ((vb >> 7) & 1 > 0).to(torch.int16))
+                    vb = self.view_bits_cum[seen_now].to(torch.int32)
+                    pop = ((vb & 1 > 0).to(torch.int32) +
+                           ((vb >> 1) & 1 > 0).to(torch.int32) +
+                           ((vb >> 2) & 1 > 0).to(torch.int32) +
+                           ((vb >> 3) & 1 > 0).to(torch.int32) +
+                           ((vb >> 4) & 1 > 0).to(torch.int32) +
+                           ((vb >> 5) & 1 > 0).to(torch.int32) +
+                           ((vb >> 6) & 1 > 0).to(torch.int32) +
+                           ((vb >> 7) & 1 > 0).to(torch.int32))
                     mv_ok = pop >= int(self.p.lt_min_view_sectors)
                 else:
                     mv_ok = torch.ones_like(self.occ_epoch_count[seen_now], dtype=torch.bool, device=self.device)
