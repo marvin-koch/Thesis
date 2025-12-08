@@ -185,7 +185,6 @@ class _TapLastDecoder:
 # ---------------------------
 # main function
 # ---------------------------
-@torch.no_grad()
 def inference_with_features(
     pairs: List[Tuple[dict, dict]],
     model,
@@ -206,11 +205,17 @@ def inference_with_features(
     if verbose:
         print(f"[inference_with_featmaps] pairs={len(pairs)} batch_size={batch_size}")
 
+
+
     if not pairs:
-        return dust3r_inference(pairs, model, device, batch_size=batch_size, verbose=verbose), []
+        with torch.no_grad():
+            out = dust3r_inference(pairs, model, device, batch_size=batch_size, verbose=verbose)
+            return out, []
 
     with _TapLastDecoder(model) as tap:
-        out = dust3r_inference(pairs, model, device, batch_size=batch_size, verbose=verbose)
+        with torch.no_grad():
+            out = dust3r_inference(pairs, model, device, batch_size=batch_size, verbose=verbose)
+            
     dec1_all, dec2_all = tap.pop()  # [K,S,D] each
 
 
