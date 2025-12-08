@@ -878,10 +878,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
             
             # 3. Zero Gradients (Clear buffer for next accumulation cycle)
             opt.zero_grad(set_to_none=True)
-            
-            # Optional: Log grad_norm only when we actually step
-            self.log("grad_norm", grad_norm, prog_bar=True, on_step=True, on_epoch=False)
-
+   
         # 3. Aggregate Metrics (Mean over sequence)
         def get_avg(name):
             vals = metrics_buffer[name]
@@ -1467,7 +1464,8 @@ def main():
         check_val_every_n_epoch=2,
         callbacks=[ckpt_cb, lr_cb],
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
-        devices=1,
+        devices="auto",
+        strategy="ddp_find_unused_parameters_true",
         enable_progress_bar=True,
         logger=wandb_logger,
 
