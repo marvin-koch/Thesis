@@ -2134,7 +2134,6 @@ def main():
         devices=1,
         enable_progress_bar=True,
         logger=wandb_logger,
-        accumulate_grad_batches=4,
 
 
     )
