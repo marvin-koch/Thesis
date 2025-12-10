@@ -787,10 +787,12 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 target_hw = (512 // STRIDE, 512 // STRIDE)
 
             if "world_points" in predictions:
-                 predictions["world_points"] = predictions["world_points"][..., ::STRIDE, ::STRIDE, :]
+                predictions["world_points"] = predictions["world_points"][..., ::STRIDE, ::STRIDE, :]
 
             if "images" in predictions:
-                 predictions["images"] = predictions["images"][..., ::STRIDE, ::STRIDE, :]
+                if img.shape[-3] == 3 and img.shape[-1] != 3:
+                     img = img.permute(0, 2, 3, 1) # (S, 3, H, W) -> (S, H, W, 3)
+                predictions["images"] = predictions["images"][..., ::STRIDE, ::STRIDE, :]
 
             # --- PROCESS FEATURES ---
             raw_feats_list = predictions["view_feats"]
