@@ -1582,7 +1582,7 @@ class HabitatDataModule(pl.LightningDataModule):
         else:
             train_seqs, val_seqs = all_seqs, []
 
-        self.train_set = HabitatSeqDataset(
+        self.train_set = HabitatSeqDatasetPrecomputed(
             dataset_root=self.dataset_root,
             size=self.size,
             verbose=self.verbose,
@@ -1590,7 +1590,7 @@ class HabitatDataModule(pl.LightningDataModule):
             skip=self.skip
         )
         
-        self.val_set = HabitatSeqDataset(
+        self.val_set = HabitatSeqDatasetPrecomputed(
             dataset_root=self.dataset_root,
             size=self.size,
             verbose=self.verbose,
