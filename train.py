@@ -750,7 +750,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 continue
         
             # Load dict from disk (CPU)
-            predictions = torch.load(cache_path, map_location="cpu")
+            predictions = torch.load(cache_path, map_location=self.device)
 
             if "world_points_conf" in predictions:
                 # Assuming shape is [N_views, H, W] or similar. 
@@ -1545,6 +1545,6 @@ def main():
     ckpt_path = "/cluster/scratch/kochmar/checkpoints/voxup-epoch=03-val_loss_total=5.8081.ckpt"
     #ckpt_path = "/cluster/scratch/kochmar/checkpoints/voxup-epoch=37-val_loss_total=13.2433.ckpt"
 
-    trainer.fit(sys, dm, ckpt_path=ckpt_path)
+    trainer.fit(sys, dm)
 if __name__ == "__main__":
     main()
