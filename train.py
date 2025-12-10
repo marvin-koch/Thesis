@@ -1500,7 +1500,7 @@ class HabitatSeqDatasetPrecomputed(Dataset):
             
             if os.path.exists(path):
                 # Load to CPU memory (RAM)
-                data = torch.load(path, map_location=self.device)
+                data = torch.load(path, map_location="cpu")
                 cached_frames.append(data)
             else:
                 cached_frames.append(None)
