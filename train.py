@@ -107,7 +107,7 @@ class TrainConfig:
     ema_to_st: float = 0.4        # how strongly decoded prob refreshes ST log-odds during training updates
 
     # optimization
-    lr: float = 1e-3
+    lr: float = 1e-4
     weight_decay: float = 1e-4
     max_epochs: int = 30
     batch_size: int = 1           # 1 sequence per batch (we iterate over timesteps inside)
@@ -1414,12 +1414,13 @@ def main():
         temp=0.5,
         feature_dim=64,
         occ_decoder_hidden=64,
-        lr=1e-3,
-        max_epochs=20,
+        lr=2e-4,
+        max_epochs=50,
         batch_size=1,
-        num_workers=4,
+        num_workers=2,
         precision="bf16",
         skip=True,
+        #weight_decay=0
     )
 
     dm = HabitatDataModule(
@@ -1464,14 +1465,15 @@ def main():
         check_val_every_n_epoch=2,
         callbacks=[ckpt_cb, lr_cb],
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
-        devices="auto",
-        strategy="ddp_find_unused_parameters_true",
+        devices=1,
+        #strategy="ddp_find_unused_parameters_true",
         enable_progress_bar=True,
         logger=wandb_logger,
     )
     print(">>> before trainer.fit()", flush=True)
-    ckpt_path = "/cluster/scratch/kochmar/checkpoints/voxup-epoch=09-val_loss_total=19.5780.ckpt"
+    ckpt_path = "/cluster/scratch/kochmar/checkpoints/voxup-epoch=03-val_loss_total=5.8081.ckpt"
+    #ckpt_path = "/cluster/scratch/kochmar/checkpoints/voxup-epoch=37-val_loss_total=13.2433.ckpt"
 
-    trainer.fit(sys, dm)
+    trainer.fit(sys, dm, ckpt_path=ckpt_path)
 if __name__ == "__main__":
     main()
