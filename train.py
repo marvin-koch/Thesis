@@ -1049,7 +1049,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
         seq_id = batch["seq_id"]
         gt_root = os.path.join(self.cfg.dataset_root, "gt_voxels_per_timestep_01")
-        
+        precomputed_root = os.path.join(self.cfg.dataset_root, "precomputed_cache")
+
         # Preload GT
         gt_seq = []
         for t in range(T):
@@ -1073,12 +1074,49 @@ class VoxelUpdaterSystem(pl.LightningModule):
             self.vox_gt = gt_seq[t]
             if self.vox_gt is None:
                 continue
+            
+            p = t *10
+            cache_path = os.path.join(precomputed_root, seq_id, f"t{p:04d}.pt")
+            if not os.path.exists(cache_path):
+                continue
+        
+            # Load dict from disk (CPU)
+            predictions = torch.load(cache_path, map_location="cpu")
 
+            if "world_points_conf" in predictions:
+                # Assuming shape is [N_views, H, W] or similar. 
+                # Grab the last two dimensions.
+                conf_tensor = predictions["world_points_conf"]
+                
+                # Handle list vs tensor
+                if isinstance(conf_tensor, list):
+                    # Take the first non-None frame
+                    ref_frame = next(item for item in conf_tensor if item is not None)
+                    target_hw = ref_frame.shape[-2:] # (H, W)
+                else:
+                    target_hw = conf_tensor.shape[-2:] # (H, W)
+            else:
+                # Fallback if somehow missing (unlikely)
+                target_hw = (512, 512)
+
+            # --- PROCESS FEATURES ---
+            raw_feats_list = predictions["view_feats"]
+            projected_feats_map = []
+
+            for f_raw in raw_feats_list:
+                # Pass the dynamically inferred size
+                f_proj = self.apply_projector_to_map(f_raw, target_hw=target_hw)
+                projected_feats_map.append(f_proj)
+                
+            predictions["view_feats"] = projected_feats_map
+            del projected_feats_map
+            
             with torch.enable_grad(): # (Keep grad enabled for inference/update parts if needed by model)
                 if not mst and t != 0:
-                    bev, mst, _, _  = self.inference(1, imgs, mst, Rmw, tmw)
+                    bev, mst, _, _ = self.inference(1, imgs, mst, Rmw, tmw, predictions)
                 else:
-                    bev, mst, _, _  = self.inference(t, imgs, mst, Rmw, tmw)
+                    bev, mst, _, _ = self.inference(t, imgs, mst, Rmw, tmw, predictions)
+            
 
             # Validation Loss Calculation (No Autocast needed strictly, but good for consistency)
             # with autocast(enabled=False):
