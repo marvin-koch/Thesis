@@ -686,7 +686,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
         device = self.device
         opt = self.optimizers()
         
-        N_ACCUM = 4
+        N_ACCUM = 16
         
         self.vox.reset_state()
         self.vox = self.vox.to(self.device)
@@ -818,6 +818,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 
                 if num_pos > 0:
                     pos_weight = (num_neg.float() / (num_pos.float() + 1e-8)).to(self.device)
+                    pos_weight = pos_weight.clamp(min=1.0, max=20.0).to(self.device)
                 else:
                     pos_weight = torch.tensor(1.0, device=self.device)
 
@@ -934,7 +935,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
         # # 1. Clip Gradients
         grad_norm = self.compute_grad_norm()
-        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)            
+        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=0.5)            
         
         # # 2. Optimizer Step
         # opt.step()            
@@ -1484,12 +1485,13 @@ def main():
         temp=0.5,
         feature_dim=64,
         occ_decoder_hidden=64,
-        lr=1e-3,
+        lr=2e-4,
         max_epochs=20,
         batch_size=1,
         num_workers=4,
         precision="bf16",
         skip=True,
+        weight_decay=1e-5
     )
 
     dm = HabitatDataModule(

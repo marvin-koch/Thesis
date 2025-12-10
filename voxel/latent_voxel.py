@@ -178,6 +178,7 @@ class LatentToOccupancyDecoder(nn.Module):
         h = F.relu(self.fc1(x))
         h = h + F.relu(self.fc2(h))  # tiny residual
         logit = self.fc3(h).squeeze(-1)
+        logit = logit.clamp(-10.0, 10.0)
         return torch.sigmoid(logit)
 
 
