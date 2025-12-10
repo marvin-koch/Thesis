@@ -1081,7 +1081,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 continue
         
             # Load dict from disk (CPU)
-            predictions = torch.load(cache_path, map_location="cpu")
+            predictions = torch.load(cache_path, map_location=self.device)
 
             if "world_points_conf" in predictions:
                 # Assuming shape is [N_views, H, W] or similar. 
