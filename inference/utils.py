@@ -279,13 +279,26 @@ def inference_with_features(
         else:
             H2t, W2t = H2net, W2net
 
-        # build feat maps for both views
-        fm1 = _tokens_to_featmap(dec1_all[k], (H1net, W1net), (ph, pw), target_hw=(H1t, W1t))  # [D,H1t,W1t]
-        fm2 = _tokens_to_featmap(dec2_all[k], (H2net, W2net), (ph, pw), target_hw=(H2t, W2t))  # [D,H2t,W2t]
+        # # build feat maps for both views
+        # fm1 = _tokens_to_featmap(dec1_all[k], (H1net, W1net), (ph, pw), target_hw=(H1t, W1t))  # [D,H1t,W1t]
+        # fm2 = _tokens_to_featmap(dec2_all[k], (H2net, W2net), (ph, pw), target_hw=(H2t, W2t))  # [D,H2t,W2t]
 
 
 
+        if projector is None:
+            target_hw1 = (H1net // ph, W1net // pw)
+            target_hw2 = (H2net // ph, W2net // pw)
+        else:
+            # If we have a projector, we are likely doing live inference.
+            # Use the full target resolution (e.g. 512x512).
+            target_hw1 = (H1t, W1t)
+            target_hw2 = (H2t, W2t)
 
+        # build feat maps for both views using the determined target size
+        fm1 = _tokens_to_featmap(dec1_all[k], (H1net, W1net), (ph, pw), target_hw=target_hw1)  
+        fm2 = _tokens_to_featmap(dec2_all[k], (H2net, W2net), (ph, pw), target_hw=target_hw2)
+        
+        
         if projector is not None:
             # project tokens first (much smaller)
             tok1_small = projector(dec1_all[k])   # dec1_all[k]: [S,768] -> [S,64]
