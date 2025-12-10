@@ -643,7 +643,7 @@ class LatentVoxelGrid(nn.Module):
                 (self._unhash_keys(self.keys) + 0.5) * vox).to(dev).contiguous()
 
         # --- query in chunks, radius-only neighbors ---
-        torch.cuda.synchronize()
+        #torch.cuda.synchronize()
 
         start = time.time()
         CH = 512_000
@@ -692,13 +692,13 @@ class LatentVoxelGrid(nn.Module):
         
 
 
-        torch.cuda.synchronize()
+        #torch.cuda.synchronize()
 
-        print("Pairs took", time.time() - start, "seconds!")
+        #print("Pairs took", time.time() - start, "seconds!")
 
         # # --- quick sanity (optional) ---
         # counts_per_point = torch.bincount(i_idx, minlength=N)
-        # print("Mean neighbors:", float(counts_per_point.float().mean()),
+        # #print("Mean neighbors:", float(counts_per_point.float().mean()),
         #       "Max:", int(counts_per_point.max()), "Min:", int(counts_per_point.min()))
 
         # ---------- SIM / WEIGHTS / ACCUM ----------
@@ -725,9 +725,9 @@ class LatentVoxelGrid(nn.Module):
             # 3) sim
             sim_flat = self.sim_net(f_sel, z_sel, delta)
             # sim_flat = fast_sim_mlp_pairs(self.sim_net, i_idx, j_idx, f_proj_all, self.z_latent, delta)
-        torch.cuda.synchronize()
+        #torch.cuda.synchronize()
 
-        print("Sim flat took", time.time() - start, "seconds!")
+        #print("Sim flat took", time.time() - start, "seconds!")
         start = time.time()
 
         # 4) stable softmax per point
@@ -757,11 +757,11 @@ class LatentVoxelGrid(nn.Module):
         sum_per_i = torch.zeros(Nfull, device=dev, dtype=torch.float32).scatter_add(0, i_idx, w_unnorm)
         weights   = w_unnorm / (sum_per_i[i_idx] + 1e-8)
         
-        torch.cuda.synchronize()
+        #torch.cuda.synchronize()
 
 
 
-        print("Softmax took", time.time() - start, "seconds!")
+        #print("Softmax took", time.time() - start, "seconds!")
 
         
         start = time.time()
@@ -772,7 +772,7 @@ class LatentVoxelGrid(nn.Module):
         # if idx_upd.numel() == 0:
         #     return
 
-        # print(f"unique operation took {time.time() - start:.4f} seconds")
+        # #print(f"unique operation took {time.time() - start:.4f} seconds")
 
         # # Accumulate directly into sparse buffer (only U voxels, not M)
         # u_sparse = torch.zeros(idx_upd.numel(), self.feature_dim, device=dev, dtype=torch.float32)
@@ -823,9 +823,9 @@ class LatentVoxelGrid(nn.Module):
         u_sel = u.to(self.z_latent.dtype)
         z_sel = self.z_latent[idx_upd]
         
-        torch.cuda.synchronize()
+        #torch.cuda.synchronize()
 
-        print("accum took", time.time() - start, "seconds!")
+        #print("accum took", time.time() - start, "seconds!")
         start = time.time()
 
 
@@ -839,9 +839,9 @@ class LatentVoxelGrid(nn.Module):
         # z = self.z_latent[idx_upd]
         # gamma = torch.sigmoid(self.gate_mlp(torch.cat([u, z], dim=-1)))
         # x_in  = gamma * u
-        torch.cuda.synchronize()
+        #torch.cuda.synchronize()
 
-        print("gate took", time.time() - start, "seconds!")
+        #print("gate took", time.time() - start, "seconds!")
         start = time.time()
         # inp = x_in.unsqueeze(1)    # (U, 1, D)
         # h0  = z_sel.unsqueeze(0)    # (1, U, D)
@@ -862,9 +862,9 @@ class LatentVoxelGrid(nn.Module):
         self.z_latent.index_copy_(0, idx_upd, z_new)
             
             # self.z_latent = self.gru_cell(x_in, self.z_latent)
-        torch.cuda.synchronize()
+        #torch.cuda.synchronize()
 
-        print("Gru took", time.time() - start, "seconds!")
+        #print("Gru took", time.time() - start, "seconds!")
 
             
     # ---------- exports ----------
@@ -914,7 +914,7 @@ class LatentVoxelGrid(nn.Module):
         returns: (M,) probabilities aligned with self.keys
         """
         if self.z_latent.numel() == 0:
-            print("empty")
+            #print("empty")
             return torch.empty(0, device=self.device, dtype=torch.float32)
         if with_xyz_cond:
             centers = self.voxel_centers()
@@ -1032,7 +1032,7 @@ class LatentVoxelGrid(nn.Module):
         f_pts = f_pts.to(dev, dt)
         assert pts_world.shape[0] == f_pts.shape[0]
 
-        print(self.keys.get_device())
+        #print(self.keys.get_device())
         # 1) insert all voxels touched by points
         ijk = self._world_to_ijk(pts_world)                       # (N,3)
         keys = self._hash_ijk(ijk)                                # (N,)
