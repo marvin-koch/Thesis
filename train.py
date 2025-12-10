@@ -165,7 +165,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
         # convenience buffer for device transfers
         self.register_buffer("_origin", torch.zeros(3), persistent=False)
         
-        self.projector = FeatureProjector(in_dim=1024, out_dim=self.feature_dim)
+        self.projector = FeatureProjector(in_dim=768, out_dim=self.feature_dim)
 
 
         self.automatic_optimization = False   # <<< add this
@@ -221,6 +221,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
             align_corners=False
         ).squeeze(0)                 # Remove batch dim
         
+        proj = proj.permute(1, 2, 0) 
         return proj
     
     
@@ -452,7 +453,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
         del predictions  # drops images, view_feats, etc. all at once
 
         # after build_maps_from_latent_features(...)
-        del frames_map, conf_map, images_map, features_map, image_tensors
+        del frames_map, conf_map, images_map, features_map
 
         return bev, mst, Rmw, tmw
     
