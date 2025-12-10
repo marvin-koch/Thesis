@@ -189,7 +189,38 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
         return [opt], [{"scheduler": scheduler, "interval": "epoch"}]
 
-    def inference(self, i, imgs, mst, Rmw=None, tmw=None):
+
+    def apply_projector_to_map(self, feat_map_raw, target_hw=(512, 512)):
+        """
+        Args:
+            feat_map_raw: Tensor (C_in, H_small, W_small) e.g. (1024, 32, 32)
+            target_hw: Tuple (H, W) target size e.g. (512, 512)
+        """
+        if feat_map_raw is None:
+            return None
+        
+        # 1. Project at low resolution (Computationally cheap!)
+        C_in, h, w = feat_map_raw.shape
+        flat = feat_map_raw.flatten(1).permute(1, 0) # (h*w, 1024)
+        
+        proj = self.projector(flat) # (h*w, 32)
+        
+        # Reshape back to small spatial map
+        proj = proj.permute(1, 0).view(self.feature_dim, h, w) # (32, 32, 32)
+        
+        # 2. Upsample to full resolution for the voxel grid
+        # Use bilinear interpolation
+        proj = F.interpolate(
+            proj.unsqueeze(0),       # Add batch dim: (1, 32, 32, 32)
+            size=target_hw,          # Target size: (512, 512)
+            mode='bilinear', 
+            align_corners=False
+        ).squeeze(0)                 # Remove batch dim
+        
+        return proj
+    
+    
+    def inference(self, i, imgs, mst, Rmw=None, tmw=None, predictions=None):
 
 
         POINTS = "world_points"
@@ -206,88 +237,91 @@ class VoxelUpdaterSystem(pl.LightningModule):
         R_w2m = to_torch(R_w2m, device=self.device)
         t_w2m = to_torch(t_w2m, device=self.device)
         
-        image_tensors = torch.stack([d["img"] for d in imgs])
+        if predictions is None:
+            image_tensors = torch.stack([d["img"] for d in imgs])
 
-        image_tensors = []
-        for d in imgs:
-            t = d["img"]                        # (1,3,H,W), likely float in [0,1]
-            if t.ndim == 4 and t.shape[0] == 1:
-                t = t[0]                        # -> (3,H,W)
-            t = t.detach().cpu()
-            if not t.dtype.is_floating_point:
-                t = t.float()
-            if t.max() > 1.0:                   # in case values are 0..255
-                t = t / 255.0
-            image_tensors.append(t.clamp(0,1))
-            
-        image_tensors = torch.stack(image_tensors, dim=0)  
-        image_tensors = image_tensors.to(self.device)
-
-        if i < 1:
-            
-            start = time.time()
-
-            predictions = get_reconstructed_scene_no_opt(i, ".", imgs, self.model, self.device, False, 512, "", "linear", 50, 1, True, False, True, False, 0.05, "oneref", 1, 0, projector=self.projector)
-
-            self.keyframes = image_tensors.clone()
-            
-            end = time.time()
-            length = end - start
-
-            print("Running inference took", length, "seconds!")
-            
-
-        else:
-        
-            start = time.time()
-
-            changed_idx = changed_images(image_tensors, self.keyframes, thresh=0.000005)
-            
-            print(changed_idx)
-
-            end = time.time()
-            length = end - start
-            
-            if len(changed_idx) < 2:
-                    # Advance epoch so the pipeline’s temporal bookkeeping stays aligned
-                    self.vox.next_epoch()
-                    return None, None, None, None
- 
-            print("Finding changed images took", length, "seconds!")
-
-            changed_idx = [0] + [x for x in changed_idx if x != 0]
-            
-            index_map = {new: old for new, old in enumerate(changed_idx)}
-                    
-            idx_t = torch.tensor(changed_idx, device=self.device, dtype=torch.long)
-            self.keyframes.index_copy_(0, idx_t, image_tensors.index_select(0, idx_t))
-            
-            
-            print("final changed idx:", changed_idx)
-
-            start = time.time()
-   
-            print("inference pred")
-            mst = True
-            predictions = get_reconstructed_scene_no_opt(i, ".", imgs, self.model, self.device, False, 512, "", "linear", 50, 1, True, False, True, False, 0.05, "oneref", 1, 0, changed_gids=changed_idx, projector=self.projector)
+            image_tensors = []
+            for d in imgs:
+                t = d["img"]                        # (1,3,H,W), likely float in [0,1]
+                if t.ndim == 4 and t.shape[0] == 1:
+                    t = t[0]                        # -> (3,H,W)
+                t = t.detach().cpu()
+                if not t.dtype.is_floating_point:
+                    t = t.float()
+                if t.max() > 1.0:                   # in case values are 0..255
+                    t = t / 255.0
+                image_tensors.append(t.clamp(0,1))
                 
-            end = time.time()
-            length = end - start
+            image_tensors = torch.stack(image_tensors, dim=0)  
+            image_tensors = image_tensors.to(self.device)
 
-            print("Running inference took", length, "seconds!")
+            if i < 1:
+                
+                start = time.time()
+
+                predictions = get_reconstructed_scene_no_opt(i, ".", imgs, self.model, self.device, False, 512, "", "linear", 50, 1, True, False, True, False, 0.05, "oneref", 1, 0, projector=self.projector)
+
+                self.keyframes = image_tensors.clone()
+                
+                end = time.time()
+                length = end - start
+
+                print("Running inference took", length, "seconds!")
+                
+
+            else:
+            
+                start = time.time()
+
+                changed_idx = changed_images(image_tensors, self.keyframes, thresh=0.000005)
+                
+                print(changed_idx)
+
+                end = time.time()
+                length = end - start
+                
+                if len(changed_idx) < 2:
+                        # Advance epoch so the pipeline’s temporal bookkeeping stays aligned
+                        self.vox.next_epoch()
+                        return None, None, None, None
+    
+                print("Finding changed images took", length, "seconds!")
+
+                changed_idx = [0] + [x for x in changed_idx if x != 0]
+                
+                index_map = {new: old for new, old in enumerate(changed_idx)}
+                        
+                idx_t = torch.tensor(changed_idx, device=self.device, dtype=torch.long)
+                self.keyframes.index_copy_(0, idx_t, image_tensors.index_select(0, idx_t))
+                
+                
+                print("final changed idx:", changed_idx)
+
+                start = time.time()
+    
+                print("inference pred")
+                mst = True
+                predictions = get_reconstructed_scene_no_opt(i, ".", imgs, self.model, self.device, False, 512, "", "linear", 50, 1, True, False, True, False, 0.05, "oneref", 1, 0, changed_gids=changed_idx, projector=self.projector)
+                    
+                end = time.time()
+                length = end - start
+
+                print("Running inference took", length, "seconds!")
 
 
-        # Keep tensors; only extract what we need later.
-        # If you truly need NumPy later, convert specific keys then.
-        needed = {
-            "images","extrinsic", POINTS, CONF, "view_feats"
-        }
-        for k in list(predictions.keys()):
-            if k not in needed:
-                del predictions[k]  # drop unneeded heavy stuff early
+            # Keep tensors; only extract what we need later.
+            # If you truly need NumPy later, convert specific keys then.
+            needed = {
+                "images","extrinsic", POINTS, CONF, "view_feats"
+            }
+            for k in list(predictions.keys()):
+                if k not in needed:
+                    del predictions[k]  # drop unneeded heavy stuff early
 
 
 
+        
+ 
         start = time.time()
         
         WPTS_m = rotate_points(predictions[POINTS], R_w2m, t_w2m)
@@ -682,7 +716,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
         # ---- iterate timesteps ----
         seq_id = batch["seq_id"]
         gt_root = os.path.join(self.cfg.dataset_root, "gt_voxels_per_timestep_01")
-        
+        precomputed_root = os.path.join(self.cfg.dataset_root, "precomputed_cache")
         # Preload GT (optional optimization you had)
         gt_seq = []
         if not os.path.exists(os.path.join(gt_root, f"{seq_id}_t0000_gt.npz")):
@@ -710,10 +744,46 @@ class VoxelUpdaterSystem(pl.LightningModule):
             if self.vox_gt is None:
                 continue
             
-            if not mst and t != 0:
-                bev, mst, _, _ = self.inference(1, imgs, mst, Rmw, tmw)
+            p = t *10
+            cache_path = os.path.join(precomputed_root, seq_id, f"t{p:04d}.pt")
+            if not os.path.exists(cache_path):
+                continue
+        
+            # Load dict from disk (CPU)
+            predictions = torch.load(cache_path, map_location="cpu")
+
+            if "world_points_conf" in predictions:
+                # Assuming shape is [N_views, H, W] or similar. 
+                # Grab the last two dimensions.
+                conf_tensor = predictions["world_points_conf"]
+                
+                # Handle list vs tensor
+                if isinstance(conf_tensor, list):
+                    # Take the first non-None frame
+                    ref_frame = next(item for item in conf_tensor if item is not None)
+                    target_hw = ref_frame.shape[-2:] # (H, W)
+                else:
+                    target_hw = conf_tensor.shape[-2:] # (H, W)
             else:
-                bev, mst, _, _ = self.inference(t, imgs, mst, Rmw, tmw)
+                # Fallback if somehow missing (unlikely)
+                target_hw = (512, 512)
+
+            # --- PROCESS FEATURES ---
+            raw_feats_list = predictions["view_feats"]
+            projected_feats_map = []
+
+            for f_raw in raw_feats_list:
+                # Pass the dynamically inferred size
+                f_proj = self.apply_projector_to_map(f_raw, target_hw=target_hw)
+                projected_feats_map.append(f_proj)
+                
+            predictions["view_feats"] = projected_feats_map
+            del projected_feats_map
+        
+            if not mst and t != 0:
+                bev, mst, _, _ = self.inference(1, imgs, mst, Rmw, tmw, predictions)
+            else:
+                bev, mst, _, _ = self.inference(t, imgs, mst, Rmw, tmw, predictions)
         
             #with autocast(enabled=False):
             # (D) decode current occupancy
