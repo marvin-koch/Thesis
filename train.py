@@ -733,6 +733,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
         mst = False
         Rmw = None
         tmw = None
+        
+        cached_seq = batch["cached_frames"] # List of dicts
 
         for t in range(T):
             imgs = batch["imgs_t"][t]
@@ -741,13 +743,19 @@ class VoxelUpdaterSystem(pl.LightningModule):
             if self.vox_gt is None:
                 continue
             
-            p = t *10
-            cache_path = os.path.join(precomputed_root, seq_id, f"t{p:04d}.pt")
-            if not os.path.exists(cache_path):
-                continue
+            
+           
+            # p = t *10
+            # cache_path = os.path.join(precomputed_root, seq_id, f"t{p:04d}.pt")
+            # if not os.path.exists(cache_path):
+            #     continue
         
-            predictions = torch.load(cache_path, map_location=self.device)
+    
+            # predictions = torch.load(cache_path, map_location=self.device)
 
+            predictions = cached_seq[t] 
+            if predictions is None: continue
+            
             if "world_points_conf" in predictions:
                 # Assuming shape is [N_views, H, W] or similar. 
                 # Grab the last two dimensions.
@@ -1065,7 +1073,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
         mst = False
         Rmw = None
         tmw = None
-
+        cached_seq = batch["cached_frames"] # List of dicts
         for t in range(T):
             # #print(f"== Val Step {t} ==")
             imgs = batch["imgs_t"][t]
@@ -1074,14 +1082,19 @@ class VoxelUpdaterSystem(pl.LightningModule):
             if self.vox_gt is None:
                 continue
             
-            p = t *10
-            cache_path = os.path.join(precomputed_root, seq_id, f"t{p:04d}.pt")
-            if not os.path.exists(cache_path):
-                continue
+            # p = t *10
+            # cache_path = os.path.join(precomputed_root, seq_id, f"t{p:04d}.pt")
+            # if not os.path.exists(cache_path):
+            #     continue
+       
         
             # Load dict from disk (CPU)
-            predictions = torch.load(cache_path, map_location=self.device)
-
+            # predictions = torch.load(cache_path, map_location=self.device)
+     
+            predictions = cached_seq[t] 
+            if predictions is None: continue
+            
+            
             if "world_points_conf" in predictions:
                 # Assuming shape is [N_views, H, W] or similar. 
                 # Grab the last two dimensions.
@@ -1395,6 +1408,112 @@ class HabitatSeqDataset(Dataset):
             "timesteps": len(imgs_t),
             "imgs_t": imgs_t,   # List[List[dict]]; each inner list is what your inference() expects
         }
+        
+class HabitatSeqDatasetPrecomputed(Dataset):
+    """
+    Each sample = one sequence with timesteps.
+    """
+    def __init__(
+        self,
+        dataset_root: str,
+        size: int = 512,
+        verbose: bool = False,
+        min_images_per_timestep: int = 1,
+        sequences: Optional[List[str]] = None,   # pass a subset for train/val if you want
+        skip=False,
+        seq_list: str = "/cluster/scratch/kochmar/renders/seq_manifest.json"
+
+    ):
+        self.root = dataset_root
+        self.size = size
+        self.verbose = verbose
+        self.min_images_per_timestep = min_images_per_timestep
+        self.skip = skip
+        self.seq_list = seq_list
+        
+        if sequences is None:
+            # seqs = _sequence_dirs_from_root(dataset_root)
+            with open(self.seq_list) as f:
+                all_entries = json.load(f)
+
+            if self.skip:
+                seqs = [e["seq_path"] for e in all_entries if e["has_gt"]]
+                all_ids  = [e["seq_id"]  for e in all_entries if e["has_gt"]]
+            else:
+                seqs = [e["seq_path"] for e in all_entries]
+                all_ids  = [e["seq_id"]  for e in all_entries]
+                
+        else:
+            seqs = [p if os.path.isabs(p) else os.path.join(dataset_root, p) for p in sequences]
+        for s in seqs:
+            if not os.path.isdir(s):
+                raise FileNotFoundError(f"Sequence dir missing: {s}")
+            
+            
+        self.seq_paths = seqs
+
+    def __len__(self): return len(self.seq_paths)
+
+    def _list_timesteps(self, seq_dir: str) -> List[str]:
+        # timesteps are immediate subfolders; if none, treat the seq_dir itself as one timestep
+        t_dirs = _list_dirs(seq_dir)
+        return t_dirs if t_dirs else [seq_dir]
+
+    def _load_timestep(self, t_dir: str) -> List[Dict]:
+        img_paths = _list_imgs(t_dir)
+        if len(img_paths) < self.min_images_per_timestep:
+            return []
+        return li(img_paths, size=self.size, verbose=self.verbose)
+
+    def __getitem__(self, idx: int) -> Dict:
+        seq_dir = self.seq_paths[idx]
+        t_dirs = self._list_timesteps(seq_dir)
+
+        imgs_t: List[List[Dict]] = []
+        for t, td in enumerate(t_dirs):
+            if t % 10 != 0 and self.skip:
+                continue
+            imgs = self._load_timestep(td)
+            if imgs:
+                imgs_t.append(imgs)
+
+        if not imgs_t:
+            raise RuntimeError(f"No images found for sequence: {seq_dir}")
+
+        p = seq_dir.rstrip("/") 
+        basis = os.path.basename(os.path.dirname(p)) # "kfPV7w3FaU5.basis" 
+        basis = basis.replace(".basis", "") # "kfPV7w3FaU5" 
+        final = os.path.basename(p) # "0" 
+        seq_id = f"{basis}_{final}"
+
+
+        # Pre-load ALL cache files for this sequence into RAM
+        # (Assuming you have enough RAM. If sequence is 100 frames * 2MB = 200MB. Totally fine.)
+        precomputed_root = "/cluster/scratch/kochmar/renders/precomputed_cache/"
+        seq_cache_dir = os.path.join(precomputed_root, seq_id)
+        
+        cached_frames = []
+        for t in range(len(imgs_t)): # Or however many timesteps you have
+            # Handle skipping logic if needed
+            p_idx = t * 10 if self.skip else t 
+            path = os.path.join(seq_cache_dir, f"t{p_idx:04d}.pt")
+            
+            if os.path.exists(path):
+                # Load to CPU memory (RAM)
+                data = torch.load(path, map_location=self.device)
+                cached_frames.append(data)
+            else:
+                cached_frames.append(None)
+
+        return {
+            "seq_id": seq_id,
+            "seq_path": seq_dir,
+            "timesteps": len(imgs_t),
+            "imgs_t": imgs_t,   # List[List[dict]]; each inner list is what your inference() expects
+            "cached_frames": cached_frames, # <--- Pass this to training_step
+
+        }
+        
 
 # ---------- datamodule (no seq_list needed) ----------
 class HabitatDataModule(pl.LightningDataModule):
@@ -1525,7 +1644,7 @@ def main():
         lr=2e-4,
         max_epochs=50,
         batch_size=1,
-        num_workers=2,
+        num_workers=4,
         precision="bf16",
         skip=True,
         weight_decay=1e-5
