@@ -165,7 +165,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
         # convenience buffer for device transfers
         self.register_buffer("_origin", torch.zeros(3), persistent=False)
         
-        self.projector = FeatureProjector(out_dim=self.feature_dim)
+        self.projector = FeatureProjector(in_dim=1024, out_dim=self.feature_dim)
 
 
         self.automatic_optimization = False   # <<< add this
@@ -199,6 +199,10 @@ class VoxelUpdaterSystem(pl.LightningModule):
         if feat_map_raw is None:
             return None
         
+        if feat_map_raw.shape[-1] in [768, 1024]: 
+            # Permute (H, W, C) -> (C, H, W)
+            feat_map_raw = feat_map_raw.permute(2, 0, 1)
+
         # 1. Project at low resolution (Computationally cheap!)
         C_in, h, w = feat_map_raw.shape
         flat = feat_map_raw.flatten(1).permute(1, 0) # (h*w, 1024)
