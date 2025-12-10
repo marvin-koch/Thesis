@@ -1097,7 +1097,6 @@ def build_frames_and_centers_vectorized_torch(
 from typing import Any, Dict, Optional, Tuple
 import torch
 
-@torch.no_grad()
 def filter_frames(
     predictions: Dict[str, Any],
     *,

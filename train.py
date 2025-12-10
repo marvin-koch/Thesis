@@ -73,14 +73,6 @@ def load_sparse_voxel_grid(path, device):
     return vox_gt
 
 
-def _dump_prof(prof, tag="trace"):
-    try:
-        prof.export_chrome_trace(f"{tag}.json")
-        print(f"[profiler] wrote {tag}.json")
-        print(prof.key_averages().table(sort_by="self_cpu_memory_usage", row_limit=30))
-    except Exception as e:
-        print("[profiler] export failed:", e)
-
 
 # --------------------------
 # 1) Your modules (import these from your codebase)
@@ -271,7 +263,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 end = time.time()
                 length = end - start
 
-                print("Running inference took", length, "seconds!")
+                #print("Running inference took", length, "seconds!")
                 
 
             else:
@@ -280,7 +272,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
                 changed_idx = changed_images(image_tensors, self.keyframes, thresh=0.000005)
                 
-                print(changed_idx)
+                #print(changed_idx)
 
                 end = time.time()
                 length = end - start
@@ -290,7 +282,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                         self.vox.next_epoch()
                         return None, None, None, None
     
-                print("Finding changed images took", length, "seconds!")
+                #print("Finding changed images took", length, "seconds!")
 
                 changed_idx = [0] + [x for x in changed_idx if x != 0]
                 
@@ -300,18 +292,18 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 self.keyframes.index_copy_(0, idx_t, image_tensors.index_select(0, idx_t))
                 
                 
-                print("final changed idx:", changed_idx)
+                #print("final changed idx:", changed_idx)
 
                 start = time.time()
     
-                print("inference pred")
+                #print("inference pred")
                 mst = True
                 predictions = get_reconstructed_scene_no_opt(i, ".", imgs, self.model, self.device, False, 512, "", "linear", 50, 1, True, False, True, False, 0.05, "oneref", 1, 0, changed_gids=changed_idx, projector=self.projector)
                     
                 end = time.time()
                 length = end - start
 
-                print("Running inference took", length, "seconds!")
+                #print("Running inference took", length, "seconds!")
 
 
             # Keep tensors; only extract what we need later.
@@ -361,7 +353,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 # Calculate scale factor
                 scale = dist_gt / (dist_pred + 1e-8)
 
-                print(f"[Align] Fixing Scale. GT_spread={dist_gt:.2f}, Pred_spread={dist_pred:.2f}, Scale={scale:.4f}")
+                #print(f"[Align] Fixing Scale. GT_spread={dist_gt:.2f}, Pred_spread={dist_pred:.2f}, Scale={scale:.4f}")
 
                 # --- C. Apply Transform ---
                 # New_Pos = (Old_Pos - Old_Center) * Scale + New_Center
@@ -376,7 +368,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                      pass
 
             else:
-                 print("[Align] Warning: Empty clouds, skipping align.")
+                 #print("[Align] Warning: Empty clouds, skipping align.")
             """
 
 
@@ -385,7 +377,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
         end = time.time()
         length = end - start
 
-        print("Aligning frames took", length, "seconds!")
+        #print("Aligning frames took", length, "seconds!")
         start = time.time()
 
 
@@ -393,7 +385,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
         end = time.time()
         length = end - start
 
-        print("Projecting view feats", length, "seconds!")
+        #print("Projecting view feats", length, "seconds!")
         
         start = time.time()
 
@@ -412,7 +404,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
         end = time.time()
         length = end - start
 
-        print("Building frames/camera centers took", length, "seconds!")
+        #print("Building frames/camera centers took", length, "seconds!")
 
         start = time.time()
 
@@ -443,7 +435,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
         end = time.time()
         length = end - start
 
-        print("Building Voxel and BEV took", length, "seconds!")
+        #print("Building Voxel and BEV took", length, "seconds!")
 
         
             
@@ -504,7 +496,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
         end = time.time()
         length = end - start
 
-        print("Running inference took", length, "seconds!")
+        #print("Running inference took", length, "seconds!")
         
 
 
@@ -526,7 +518,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
             WPTS_m = rotate_points(predictions[POINTS], R_w2m, t_w2m)
             if Rmw is None and tmw is None:
-                print("aligning floor")
+                #print("aligning floor")
                 Rmw, tmw, info = align_pointcloud_torch_fast(WPTS_m, inlier_dist=self.voxel_size*0.75)
 
             WPTS_m = rotate_points(WPTS_m, Rmw, tmw)
@@ -549,7 +541,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
             end = time.time()
             length = end - start
 
-            print("Aligning and building frames/camera centers took", length, "seconds!")
+            #print("Aligning and building frames/camera centers took", length, "seconds!")
 
             start = time.time()
 
@@ -580,7 +572,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
             end = time.time()
             length = end - start
 
-            print("Building Voxel and BEV took", length, "seconds!")
+            #print("Building Voxel and BEV took", length, "seconds!")
 
             
                 
@@ -754,7 +746,6 @@ class VoxelUpdaterSystem(pl.LightningModule):
             if not os.path.exists(cache_path):
                 continue
         
-            # Load dict from disk (CPU)
             predictions = torch.load(cache_path, map_location=self.device)
 
             if "world_points_conf" in predictions:
@@ -779,7 +770,10 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
             for f_raw in raw_feats_list:
                 # Pass the dynamically inferred size
+                if torch.isnan(f_raw).any() or torch.isinf(f_raw).any():
+                    f_raw = torch.nan_to_num(f_raw, nan=0.0, posinf=0.0, neginf=0.0)
                 f_proj = self.apply_projector_to_map(f_raw, target_hw=target_hw)
+                
                 projected_feats_map.append(f_proj)
                 
             predictions["view_feats"] = projected_feats_map
@@ -988,7 +982,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
             current_size = self.vox.keys.shape[0]
 
             if target_size != current_size:
-                print(f"[Checkpoint Load] Resizing voxel grid buffers from {current_size} to {target_size}...")
+                #print(f"[Checkpoint Load] Resizing voxel grid buffers from {current_size} to {target_size}...")
 
                 # List of all sparse buffers in your VoxelGrid
                 buffer_names = [
@@ -1073,7 +1067,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
         tmw = None
 
         for t in range(T):
-            # print(f"== Val Step {t} ==")
+            # #print(f"== Val Step {t} ==")
             imgs = batch["imgs_t"][t]
             
             self.vox_gt = gt_seq[t]
@@ -1430,7 +1424,7 @@ class HabitatDataModule(pl.LightningDataModule):
         self.skip = skip
         self.seq_list = seq_list
     def setup(self, stage: Optional[str] = None):
-        print("getting seqs")
+        #print("getting seqs")
         # all_seqs = _sequence_dirs_from_root(self.dataset_root)
         
         
@@ -1460,7 +1454,7 @@ class HabitatDataModule(pl.LightningDataModule):
             all_seqs = [e["seq_path"] for e in all_entries]
             all_ids  = [e["seq_id"]  for e in all_entries]
 
-        print("got seqs")
+        #print("got seqs")
         if self.train_val_split > 0.0:
             #random.Random(self.seed).shuffle(all_seqs)
             n_val = max(1, int(len(all_seqs) * self.train_val_split))
@@ -1559,7 +1553,7 @@ def main():
     lr_cb = pl.callbacks.LearningRateMonitor(logging_interval="step")
 
  
-    print(">>> before Trainer()", flush=True)
+    #print(">>> before Trainer()", flush=True)
 
 
     # --- Wandb logger ---
@@ -1584,7 +1578,7 @@ def main():
         enable_progress_bar=True,
         logger=wandb_logger,
     )
-    print(">>> before trainer.fit()", flush=True)
+    #print(">>> before trainer.fit()", flush=True)
     ckpt_path = "/cluster/scratch/kochmar/checkpoints/voxup-epoch=03-val_loss_total=5.8081.ckpt"
     #ckpt_path = "/cluster/scratch/kochmar/checkpoints/voxup-epoch=37-val_loss_total=13.2433.ckpt"
 
