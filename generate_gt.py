@@ -199,7 +199,7 @@ def build_gt_voxel_for_timestep(
             z_clip_vox=(-np.inf, np.inf),
             z_band_bev=(0.02, 0.5),
             samples_per_voxel=2.0,
-            ray_stride=2,
+            ray_stride=4,
             max_free_rays=10000,
             frame_ids=frame_ids,
         )
@@ -236,7 +236,7 @@ def main():
     os.makedirs(out_root, exist_ok=True)
 
     #for seq_idx in range(len(seqs)):
-    for seq_idx in range(0, len(seqs)):
+    for seq_idx in range(len(seqs), -1, -1):
         print(seq_idx)
         batch = dataset[seq_idx]        # __getitem__ returns dict with seq info
         seq_id = batch["seq_id"]
