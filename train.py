@@ -790,9 +790,11 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 predictions["world_points"] = predictions["world_points"][..., ::STRIDE, ::STRIDE, :]
 
             if "images" in predictions:
+                img = predictions["images"]
                 if img.shape[-3] == 3 and img.shape[-1] != 3:
                      img = img.permute(0, 2, 3, 1) # (S, 3, H, W) -> (S, H, W, 3)
-                predictions["images"] = predictions["images"][..., ::STRIDE, ::STRIDE, :]
+                predictions["images"] = img[..., ::STRIDE, ::STRIDE, :]
+                del img
 
             # --- PROCESS FEATURES ---
             raw_feats_list = predictions["view_feats"]
@@ -958,6 +960,37 @@ class VoxelUpdaterSystem(pl.LightningModule):
             metrics_buffer["loss_tv"].append(loss_tv.detach().item())
 
             self.vox.z_latent = self.vox.z_latent.detach()
+
+            with torch.no_grad():
+                # 1. GROUND TRUTH STATS (Is my batch empty?)
+                num_pos_gt = (tgt_intersect > 0.5).sum().float()
+                num_neg_gt = (~(tgt_intersect > 0.5)).sum().float()
+                pos_ratio = num_pos_gt / (num_pos_gt + num_neg_gt + 1e-8)
+
+                # 2. PREDICTION STATS (Is my model confident or scared?)
+                # "Active" means prediction > 0.5 (model thinks it's a wall)
+                num_pred_active = (pred_intersect > 0.5).sum().float()
+                avg_prob_on_walls = pred_intersect[tgt_intersect > 0.5].mean() if num_pos_gt > 0 else torch.tensor(0.0)
+                avg_prob_on_empty = pred_intersect[tgt_intersect < 0.5].mean()
+
+                # 3. OVERLAP DIAGNOSTICS (Why is IoU low?)
+                intersection = ((pred_intersect > 0.5) & (tgt_intersect > 0.5)).sum().float()
+                union = ((pred_intersect > 0.5) | (tgt_intersect > 0.5)).sum().float()
+
+                # 4. WEIGHT CHECK (What is my dynamic weight actually doing?)
+                # If you used the dynamic formula, log what it calculated
+                current_pos_weight = pos_weight if isinstance(pos_weight, torch.Tensor) else torch.tensor(pos_weight)
+
+                # --- PRINT TO TERMINAL (Every 100 steps or on specific batch) ---
+                print(f"\n[Step {self.global_step} Analysis]")
+                print(f"  GT Walls: {int(num_pos_gt)} voxels ({pos_ratio:.4%} of volume)")
+                print(f"  Pred Walls: {int(num_pred_active)} voxels")
+                print(f"  Confidence: Walls={avg_prob_on_walls:.4f}, Empty={avg_prob_on_empty:.4f}")
+                print(f"  Pos Weight Used: {current_pos_weight.item():.2f}")
+                print(f"  IoU Components: Intersect={int(intersection)} / Union={int(union)}")
+                print("-" * 30)
+
+
             torch.cuda.empty_cache()
         
         # ---- End of Sequence Loop ----
@@ -1556,8 +1589,8 @@ def main():
         temp=0.5,
         feature_dim=64,
         occ_decoder_hidden=64,
-        lr=2e-4,
-        max_epochs=100,
+        lr=5e-5,
+        max_epochs=200,
         batch_size=1,
         num_workers=4,
         precision="bf16",
@@ -1575,7 +1608,13 @@ def main():
         skip=True
     )
 
-    sys = VoxelUpdaterSystem(cfg)
+    #sys = VoxelUpdaterSystem(cfg)
+    sys = VoxelUpdaterSystem.load_from_checkpoint(
+        "/cluster/scratch/kochmar/checkpoints/voxup-epoch=39-val_loss_total=11.3340.ckpt",
+        strict=False,
+        # This overrides the saved hparams with your new config
+        cfg=cfg
+    )
 
     ckpt_cb = pl.callbacks.ModelCheckpoint(
         dirpath="/cluster/scratch/kochmar/checkpoints/",       # Explicitly set a folder so you can find them
@@ -1615,6 +1654,7 @@ def main():
     #print(">>> before trainer.fit()", flush=True)
     ckpt_path = "/cluster/scratch/kochmar/checkpoints/voxup-epoch=03-val_loss_total=5.8081.ckpt"
     #ckpt_path = "/cluster/scratch/kochmar/checkpoints/voxup-epoch=37-val_loss_total=13.2433.ckpt"
+    ckpt_path = "/cluster/scratch/kochmar/checkpoints/voxup-epoch=11-val_loss_total=11.7345.ckpt"
 
     trainer.fit(sys, dm)
 if __name__ == "__main__":
