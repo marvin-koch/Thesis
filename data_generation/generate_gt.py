@@ -23,14 +23,42 @@ from inference.utils import *
 
 
 
+# def save_sparse_voxel_grid(grid: TorchSparseVoxelGrid, path: str):
+#     """
+#     Save a sparse voxel grid as compressed npz:
+#       origin: (3,) float32
+#       voxel_size: (1,) float32
+#       keys: (N,) int64
+#       vals: (N,) float32  (occupancy probs or log-odds)
+#     """
+#     import os
+#     os.makedirs(os.path.dirname(path), exist_ok=True)
+
+#     # origin
+#     origin = getattr(grid, "origin_xyz", None)
+#     if origin is None:
+#         origin = getattr(grid, "origin", None)
+#     if origin is None:
+#         raise ValueError("Grid has no origin_xyz/origin attribute")
+
+#     origin = torch.as_tensor(origin, dtype=torch.float32).detach().cpu().numpy()
+#     voxel_size = np.array([grid.p.voxel_size], dtype=np.float32)
+
+#     keys = grid.keys.detach().cpu().numpy()      # int64
+#     vals = grid.vals_st.detach().cpu().numpy()   # float32
+
+#     np.savez_compressed(
+#         path,
+#         origin=origin,
+#         voxel_size=voxel_size,
+#         keys=keys,
+#         vals=vals,
+#     )
+#     print(f"[GT] Saved voxel grid with {keys.shape[0]} voxels to {path}")
+    
+
+
 def save_sparse_voxel_grid(grid: TorchSparseVoxelGrid, path: str):
-    """
-    Save a sparse voxel grid as compressed npz:
-      origin: (3,) float32
-      voxel_size: (1,) float32
-      keys: (N,) int64
-      vals: (N,) float32  (occupancy probs or log-odds)
-    """
     import os
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
@@ -47,6 +75,30 @@ def save_sparse_voxel_grid(grid: TorchSparseVoxelGrid, path: str):
     keys = grid.keys.detach().cpu().numpy()      # int64
     vals = grid.vals_st.detach().cpu().numpy()   # float32
 
+    # --- DEBUGGING STATS ---
+    # We use the threshold 0.0 or the grid's own threshold to decide what is "Occupied"
+    # Usually vals > 0 means occupied log-odds.
+    n_total = keys.shape[0]
+    n_occupied = (vals > 0.0).sum()
+    n_empty = n_total - n_occupied
+    
+    print(f"\n[GT CHECK] {os.path.basename(path)}")
+    print(f"  Total Voxels:    {n_total}")
+    print(f"  Occupied Walls:  {n_occupied}")
+    print(f"  Empty Air:       {n_empty}")
+    
+    if n_total > 0:
+        ratio = n_occupied / n_total
+        print(f"  Wall Ratio:      {ratio:.2%}")
+        
+        if ratio > 0.50:
+            print("  ⚠️ WARNING: >50% Walls! You are likely missing free space (Ray Tracing failed).")
+        elif n_total < 1000:
+            print("  ⚠️ WARNING: Extremely low voxel count! Points likely clipped.")
+    else:
+        print("  ⚠️ ERROR: Grid is empty!")
+    # -----------------------
+
     np.savez_compressed(
         path,
         origin=origin,
@@ -54,9 +106,7 @@ def save_sparse_voxel_grid(grid: TorchSparseVoxelGrid, path: str):
         keys=keys,
         vals=vals,
     )
-    print(f"[GT] Saved voxel grid with {keys.shape[0]} voxels to {path}")
-    
-
+    # print(f"[GT] Saved voxel grid to {path}")
 def build_gt_voxel_for_timestep(
     imgs,
     model: AsymmetricCroCo3DStereo,
@@ -70,7 +120,7 @@ def build_gt_voxel_for_timestep(
     POINTS = "world_points"
     CONF   = "world_points_conf"
     threshold = 1.0
-    z_clip_map = (-0.1, 0.3)
+    z_clip_map = (-1.0, 1.0)
 
     # rotation to map world->metric frame (same as in your code)
     R_w2m_np = np.array([[0, 0, -1],
@@ -124,7 +174,12 @@ def build_gt_voxel_for_timestep(
             z_clip_map=z_clip_map,
             return_flat=True,
         )
-
+        
+    total_points = sum(f.shape[0] for f in frames_map)
+    print(f"  [Points] Survivors after filtering/clipping: {total_points}")
+    if total_points < 100:
+        print("  🔴 CRITICAL: Almost no points left! Check your z_clip_map or threshold.")
+        
     # --- make a *fresh* GT grid for this timestep only ---
     vox_gt = TorchSparseVoxelGrid(
         origin_xyz=np.zeros(3, dtype=np.float32),
