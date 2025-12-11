@@ -1589,7 +1589,7 @@ def main():
         temp=0.5,
         feature_dim=64,
         occ_decoder_hidden=64,
-        lr=5e-5,
+        lr=2e-4,
         max_epochs=200,
         batch_size=1,
         num_workers=4,
@@ -1608,13 +1608,13 @@ def main():
         skip=True
     )
 
-    #sys = VoxelUpdaterSystem(cfg)
-    sys = VoxelUpdaterSystem.load_from_checkpoint(
-        "/cluster/scratch/kochmar/checkpoints/voxup-epoch=39-val_loss_total=11.3340.ckpt",
-        strict=False,
-        # This overrides the saved hparams with your new config
-        cfg=cfg
-    )
+    sys = VoxelUpdaterSystem(cfg)
+    #sys = VoxelUpdaterSystem.load_from_checkpoint(
+    #    "/cluster/scratch/kochmar/checkpoints/voxup-epoch=39-val_loss_total=11.3340.ckpt",
+    #    strict=False,
+    #    # This overrides the saved hparams with your new config
+    #    cfg=cfg
+    #)
 
     ckpt_cb = pl.callbacks.ModelCheckpoint(
         dirpath="/cluster/scratch/kochmar/checkpoints/",       # Explicitly set a folder so you can find them
