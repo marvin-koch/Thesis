@@ -199,7 +199,7 @@ def build_gt_voxel_for_timestep(
         z_clip_vox=(-np.inf, np.inf),
         z_band_bev=(0.02, 0.5),
         samples_per_voxel=0.7,
-        ray_stride=6,
+        ray_stride=3,
         max_free_rays=10000,
         frame_ids=frame_ids,
     )
