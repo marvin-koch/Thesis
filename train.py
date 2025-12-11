@@ -318,6 +318,31 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
 
         
+        
+        raw_pts = predictions["world_points"]
+        # Calculate current scale (how big is the scene?)
+        current_size = torch.median(torch.norm(raw_pts, dim=1))
+
+        # Target 5.0 meters (typical room depth)
+        target_size = 5.0
+
+        scale_factor = target_size / (current_size + 1e-6)
+        print(f"[GT] Scaling Scene: {current_size:.2f}m -> 3.00m (Factor: {scale_factor:.2f}x)")
+
+        # 1. Scale Points
+        predictions["world_points"] = raw_pts * scale_factor
+
+        # 2. Scale Camera Positions (Translations)
+        # Iterate over the batch of extrinsics to scale the translation vector
+        # Extrinsic is typically [R | t]. Scaling t moves cameras apart.
+        # Check shape: usually (N, 4, 4)
+        if isinstance(predictions["extrinsic"], torch.Tensor):
+            predictions["extrinsic"][:, :3, 3] *= scale_factor
+        elif isinstance(predictions["extrinsic"], list):
+            for i in range(len(predictions["extrinsic"])):
+                predictions["extrinsic"][i][:3, 3] *= scale_factor
+                
+                
  
         start = time.time()
         
