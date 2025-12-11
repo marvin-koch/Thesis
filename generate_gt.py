@@ -94,6 +94,11 @@ def build_gt_voxel_for_timestep(
     R_w2m = torch.from_numpy(R_w2m_np).to(device=device, dtype=torch.float32)
     t_w2m = torch.from_numpy(t_w2m_np).to(device=device, dtype=torch.float32)
 
+    # --- DUSt3R prediction (Accelerated) ---
+    # We use inference_mode for speed. Autocast is helpful but explicit casting above handles the hard crash.
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        predictions = get_reconstructed_scene_no_opt(0, ".", imgs, model, device, False, 512, "", "linear", 50, 1, True, False, True, False, 0.05, "oneref", 1, 0)
+
     # --- normalize images like in your inference_gt() ---
 #    for d in imgs:
 #        t = d["img"]  # (1,3,H,W) or (3,H,W)
@@ -104,7 +109,7 @@ def build_gt_voxel_for_timestep(
 #        d["img"] = t.clamp(0, 1)
 
     # --- DUSt3R prediction ---
-    predictions = get_reconstructed_scene_no_opt(0, ".", imgs, model, device, False, 512, "", "linear", 100, 1, True, False, True, False, 0.05, "oneref", 1, 0)
+    #predictions = get_reconstructed_scene_no_opt(0, ".", imgs, model, device, False, 512, "", "linear", 100, 1, True, False, True, False, 0.05, "oneref", 1, 0)
 
 
     with torch.no_grad():
@@ -214,7 +219,6 @@ def main():
     # DUSt3R weights path – same as in your VoxelUpdaterSystem __init__
     weights_path = "/cluster/home/kochmar/Thesis/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth"
     model = AsymmetricCroCo3DStereo.from_pretrained(weights_path).eval().to(device)
-    model = model.to(device, dtype=torch.bfloat16).eval()
     for p in model.parameters():
         p.requires_grad = False
 
@@ -224,6 +228,7 @@ def main():
         size=512,
         verbose=False,
     )
+
     seqs = dataset.seq_paths
     print(f"[GT] Found {len(seqs)} sequences.")
 
@@ -232,6 +237,7 @@ def main():
 
     #for seq_idx in range(len(seqs)):
     for seq_idx in range(0, len(seqs)):
+        print(seq_idx)
         batch = dataset[seq_idx]        # __getitem__ returns dict with seq info
         seq_id = batch["seq_id"]
         imgs_t = batch["imgs_t"]
@@ -251,11 +257,13 @@ def main():
                 print(f"[GT]   skip t={t} (exists)")
                 continue
 
+
             print(f"[GT]   computing t={t}/{T-1}")
             vox_gt = build_gt_voxel_for_timestep(imgs, model, device, voxel_size)
             save_sparse_voxel_grid(vox_gt, out_path)
 
     print("\n[GT] Done.")
+
 
 
 
