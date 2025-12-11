@@ -501,6 +501,8 @@ class TorchSparseVoxelGrid:
             self._update_free_guarded_(idx_free)
 
         self.vals = self._display_vals()
+        # Inside integrate_points_with_cameras, print median ray length
+        print(f"DEBUG: Median Ray Length: {torch.median(torch.linalg.norm(P-C, dim=1)):.2f}m")
 
     # ---------- exports ----------
     def to_numpy(self):
