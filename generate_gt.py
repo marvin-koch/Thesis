@@ -20,44 +20,7 @@ from tqdm import tqdm
 
 from inference.utils import *
 
-
-
-
-# def save_sparse_voxel_grid(grid: TorchSparseVoxelGrid, path: str):
-#     """
-#     Save a sparse voxel grid as compressed npz:
-#       origin: (3,) float32
-#       voxel_size: (1,) float32
-#       keys: (N,) int64
-#       vals: (N,) float32  (occupancy probs or log-odds)
-#     """
-#     import os
-#     os.makedirs(os.path.dirname(path), exist_ok=True)
-
-#     # origin
-#     origin = getattr(grid, "origin_xyz", None)
-#     if origin is None:
-#         origin = getattr(grid, "origin", None)
-#     if origin is None:
-#         raise ValueError("Grid has no origin_xyz/origin attribute")
-
-#     origin = torch.as_tensor(origin, dtype=torch.float32).detach().cpu().numpy()
-#     voxel_size = np.array([grid.p.voxel_size], dtype=np.float32)
-
-#     keys = grid.keys.detach().cpu().numpy()      # int64
-#     vals = grid.vals_st.detach().cpu().numpy()   # float32
-
-#     np.savez_compressed(
-#         path,
-#         origin=origin,
-#         voxel_size=voxel_size,
-#         keys=keys,
-#         vals=vals,
-#     )
-#     print(f"[GT] Saved voxel grid with {keys.shape[0]} voxels to {path}")
-    
-
-
+@torch.no_grad()
 def save_sparse_voxel_grid(grid: TorchSparseVoxelGrid, path: str):
     import os
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -107,6 +70,7 @@ def save_sparse_voxel_grid(grid: TorchSparseVoxelGrid, path: str):
         vals=vals,
     )
     # print(f"[GT] Saved voxel grid to {path}")
+
 def build_gt_voxel_for_timestep(
     imgs,
     model: AsymmetricCroCo3DStereo,
@@ -142,96 +106,98 @@ def build_gt_voxel_for_timestep(
     # --- DUSt3R prediction ---
     predictions = get_reconstructed_scene_no_opt(0, ".", imgs, model, device, False, 512, "", "linear", 100, 1, True, False, True, False, 0.05, "oneref", 1, 0)
 
-    # ==============================
-    # 🛑 SCALE FIX: Dollhouse -> Real House
-    # ==============================
-    raw_pts = predictions["world_points"]
-    # Calculate current scale (how big is the scene?)
-    current_size = torch.median(torch.norm(raw_pts, dim=1))
 
-    # Target 5.0 meters (typical room depth)
-    target_size = 5.0
+    with torch.no_grad():
+        # ==============================
+        # 🛑 SCALE FIX: Dollhouse -> Real House
+        # ==============================
+        raw_pts = predictions["world_points"]
+        # Calculate current scale (how big is the scene?)
+        current_size = torch.median(torch.norm(raw_pts, dim=1))
 
-    scale_factor = target_size / (current_size + 1e-6)
-    print(f"[GT] Scaling Scene: {current_size:.2f}m -> 3.00m (Factor: {scale_factor:.2f}x)")
+        # Target 5.0 meters (typical room depth)
+        target_size = 5.0
 
-    # 1. Scale Points
-    predictions["world_points"] = raw_pts * scale_factor
+        scale_factor = target_size / (current_size + 1e-6)
+        print(f"[GT] Scaling Scene: {current_size:.2f}m -> 3.00m (Factor: {scale_factor:.2f}x)")
 
-    # 2. Scale Camera Positions (Translations)
-    # Iterate over the batch of extrinsics to scale the translation vector
-    # Extrinsic is typically [R | t]. Scaling t moves cameras apart.
-    # Check shape: usually (N, 4, 4)
-    if isinstance(predictions["extrinsic"], torch.Tensor):
-         predictions["extrinsic"][:, :3, 3] *= scale_factor
-    elif isinstance(predictions["extrinsic"], list):
-         for i in range(len(predictions["extrinsic"])):
-              predictions["extrinsic"][i][:3, 3] *= scale_factor
-    # ==============================
+        # 1. Scale Points
+        predictions["world_points"] = raw_pts * scale_factor
 
-
-
-
-    # keep only needed keys
-    needed = {"images", "extrinsic", POINTS, CONF}
-    for k in list(predictions.keys()):
-        if k not in needed:
-            del predictions[k]
-
-    # --- align points ---
-    WPTS_m = rotate_points(predictions[POINTS], R_w2m, t_w2m)
+        # 2. Scale Camera Positions (Translations)
+        # Iterate over the batch of extrinsics to scale the translation vector
+        # Extrinsic is typically [R | t]. Scaling t moves cameras apart.
+        # Check shape: usually (N, 4, 4)
+        if isinstance(predictions["extrinsic"], torch.Tensor):
+            predictions["extrinsic"][:, :3, 3] *= scale_factor
+        elif isinstance(predictions["extrinsic"], list):
+            for i in range(len(predictions["extrinsic"])):
+                predictions["extrinsic"][i][:3, 3] *= scale_factor
+        # ==============================
 
 
-    Rmw, tmw, _ = align_pointcloud_torch_fast(
-        WPTS_m,
-        inlier_dist=voxel_size * 0.75,
-    )
-    WPTS_m = rotate_points(WPTS_m, Rmw, tmw)
-    predictions[POINTS] = WPTS_m
 
-    camera_R = R_w2m @ Rmw
-    camera_t = t_w2m + tmw
 
-    frames_map, cam_centers_map, conf_map, images_map, _, (S, H, W), frame_ids = \
-        build_frames_and_centers_vectorized_torch(
-            predictions,
-            POINTS=POINTS,
-            CONF=CONF,
-            threshold=threshold,
-            Rmw=camera_R,
-            tmw=camera_t,
-            z_clip_map=z_clip_map,
-            return_flat=True,
+        # keep only needed keys
+        needed = {"images", "extrinsic", POINTS, CONF}
+        for k in list(predictions.keys()):
+            if k not in needed:
+                del predictions[k]
+
+        # --- align points ---
+        WPTS_m = rotate_points(predictions[POINTS], R_w2m, t_w2m)
+
+
+        Rmw, tmw, _ = align_pointcloud_torch_fast(
+            WPTS_m,
+            inlier_dist=voxel_size * 0.75,
         )
-        
-    total_points = sum(f.shape[0] for f in frames_map)
-    print(f"  [Points] Survivors after filtering/clipping: {total_points}")
-    if total_points < 100:
-        print("  🔴 CRITICAL: Almost no points left! Check your z_clip_map or threshold.")
-        
-    # --- make a *fresh* GT grid for this timestep only ---
-    vox_gt = TorchSparseVoxelGrid(
-        origin_xyz=np.zeros(3, dtype=np.float32),
-        params=VoxelParams(voxel_size=voxel_size, promote_hits=2),
-        device=device,
-    )
+        WPTS_m = rotate_points(WPTS_m, Rmw, tmw)
+        predictions[POINTS] = WPTS_m
 
-    vox_gt, bev, meta = build_maps_from_points_and_centers_torch(
-        frames_map,
-        cam_centers_map,
-        conf_map,
-        vox_gt,
-        align_to_voxel=False,
-        voxel_size=voxel_size,
-        bev_window_m=(5.0, 5.0),
-        bev_origin_xy=(-2.0, -2.0),
-        z_clip_vox=(-np.inf, np.inf),
-        z_band_bev=(0.02, 0.5),
-        samples_per_voxel=2.0,
-        ray_stride=2,
-        max_free_rays=10000,
-        frame_ids=frame_ids,
-    )
+        camera_R = R_w2m @ Rmw
+        camera_t = t_w2m + tmw
+
+        frames_map, cam_centers_map, conf_map, images_map, _, (S, H, W), frame_ids = \
+            build_frames_and_centers_vectorized_torch(
+                predictions,
+                POINTS=POINTS,
+                CONF=CONF,
+                threshold=threshold,
+                Rmw=camera_R,
+                tmw=camera_t,
+                z_clip_map=z_clip_map,
+                return_flat=True,
+            )
+            
+        total_points = sum(f.shape[0] for f in frames_map)
+        print(f"  [Points] Survivors after filtering/clipping: {total_points}")
+        if total_points < 100:
+            print("  🔴 CRITICAL: Almost no points left! Check your z_clip_map or threshold.")
+            
+        # --- make a *fresh* GT grid for this timestep only ---
+        vox_gt = TorchSparseVoxelGrid(
+            origin_xyz=np.zeros(3, dtype=np.float32),
+            params=VoxelParams(voxel_size=voxel_size, promote_hits=2),
+            device=device,
+        )
+
+        vox_gt, bev, meta = build_maps_from_points_and_centers_torch(
+            frames_map,
+            cam_centers_map,
+            conf_map,
+            vox_gt,
+            align_to_voxel=False,
+            voxel_size=voxel_size,
+            bev_window_m=(5.0, 5.0),
+            bev_origin_xy=(-2.0, -2.0),
+            z_clip_vox=(-np.inf, np.inf),
+            z_band_bev=(0.02, 0.5),
+            samples_per_voxel=2.0,
+            ray_stride=2,
+            max_free_rays=10000,
+            frame_ids=frame_ids,
+        )
 
     # vox_gt.next_epoch()  # optional for bookkeeping
 
@@ -248,6 +214,7 @@ def main():
     # DUSt3R weights path – same as in your VoxelUpdaterSystem __init__
     weights_path = "/cluster/home/kochmar/Thesis/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth"
     model = AsymmetricCroCo3DStereo.from_pretrained(weights_path).eval().to(device)
+    model = model.to(device, dtype=torch.bfloat16).eval()
     for p in model.parameters():
         p.requires_grad = False
 
