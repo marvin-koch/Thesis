@@ -1103,6 +1103,7 @@ def filter_frames(
     POINTS: str = "world_points_from_depth",   # (S, H, W, 3)
     CONF: str = "world_points_conf",           # (S, H, W)
     IMG: str = "images",                       # (S, H, W, 3)
+    EXTR_KEY: str = "extrinsic",s
     FEAT: Optional[str] = None,                # (S, H, W, D) optional
     threshold: float = 50.0,                   # percentile [0..100]
     z_clip_map: Optional[Tuple[float, float]] = None,
@@ -1214,6 +1215,10 @@ def filter_frames(
             conf_threshold = torch.quantile(sample, q).item()
 
 
+        
+    EXTR = predictions[EXTR_KEY]
+    if not isinstance(EXTR, torch.Tensor):
+        EXTR = torch.from_numpy(EXTR)
     # --- Pad extrinsics if needed ---
     if EXTR.dim() == 3 and EXTR.shape[1:] == (3, 4):
         bottom = torch.tensor([[0, 0, 0, 1]], dtype=EXTR.dtype, device=device)
