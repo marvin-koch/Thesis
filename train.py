@@ -1700,6 +1700,6 @@ def main():
     ckpt_path = "/cluster/scratch/kochmar/checkpoints/voxup-epoch=11-val_loss_total=11.7345.ckpt"
     ckpt_path = "/cluster/scratch/kochmar/checkpoints/voxup-epoch=03-val_loss_total=16.1524.ckpt"
 
-    trainer.fit(sys, dm, ckpt_path=ckpt_path)
+    trainer.fit(sys, dm)
 if __name__ == "__main__":
     main()
