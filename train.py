@@ -738,7 +738,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
         # ---- iterate timesteps ----
         seq_id = batch["seq_id"]
-        gt_root = os.path.join(self.cfg.dataset_root, "gt_voxels_per_timestep_01")
+        gt_root = os.path.join(self.cfg.dataset_root, "gt_voxels_per_timestep_005_v2")
         precomputed_root = os.path.join(self.cfg.dataset_root, "precomputed_cache")
         # Preload GT (optional optimization you had)
         gt_seq = []
@@ -865,7 +865,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
             tgt_intersect  = p_occ_tgt_aligned[valid_mask]
             
             loss_intersect = torch.tensor(0.0, device=self.device)
-            
+            pos_weight = torch.tensor(1.0, device=self.device)
+
             if pred_intersect.numel() > 0:
                 # Calculate weight for positives just like before
                 pos_mask = (tgt_intersect > 0.5)
@@ -1135,7 +1136,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
         }
 
         seq_id = batch["seq_id"]
-        gt_root = os.path.join(self.cfg.dataset_root, "gt_voxels_per_timestep_01")
+        gt_root = os.path.join(self.cfg.dataset_root, "gt_voxels_per_timestep_005_v2")
         precomputed_root = os.path.join(self.cfg.dataset_root, "precomputed_cache")
 
         # Preload GT
@@ -1608,7 +1609,7 @@ def main():
         # dataset_root="/Users/marvin/Documents/Thesis/repo/dataset_generation/habitat/",
         #dataset_root="/home/mpk40/Documents/data/",
         dataset_root="/cluster/scratch/kochmar/renders/",
-        voxel_size=0.1,
+        voxel_size=0.05,
         radius_m=0.25,
         topk=8,
         temp=0.5,
@@ -1640,7 +1641,6 @@ def main():
     #    # This overrides the saved hparams with your new config
     #    cfg=cfg
     #)
-
     ckpt_cb = pl.callbacks.ModelCheckpoint(
         dirpath="/cluster/scratch/kochmar/checkpoints/",       # Explicitly set a folder so you can find them
         monitor="val_loss_total",
