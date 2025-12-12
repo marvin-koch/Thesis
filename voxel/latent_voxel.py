@@ -150,7 +150,8 @@ class LatentToOccupancyDecoder(nn.Module):
         self.fc2 = nn.Linear(hidden, hidden)
         self.fc3 = nn.Linear(hidden, 1)
 
-        nn.init.constant_(self.fc3.bias, -5.0)      
+        nn.init.constant_(self.fc3.bias, -3.0)      
+        nn.init.zeros_(self.fc3.weight)
           
     def _fourier_pe(self, xyz: torch.Tensor) -> torch.Tensor:
         """
@@ -309,9 +310,19 @@ class LatentVoxelGrid(nn.Module):
         self.routing_tau: float = 0.3   # temperature for softmax
         self.routing_topk: int = 8      # voxels per point (after radius prefilter)
         
+        
         self.decoder = LatentToOccupancyDecoder(feature_dim)
         
+        # 1. Initialize WHOLE network (Good for fc1, fc2 hidden layers)
+        # This sets all biases to 0.0, including fc3
         self.apply(self.kaiming_init)
+
+        # 2. Overwrite ONLY the final layer (Fixes the output prior)
+        # Bias -3.0 -> ~5% probability
+        nn.init.constant_(self.decoder.fc3.bias, -3.0) 
+        # Weight 0.0 -> Prevents random noise from overriding the bias
+        nn.init.zeros_(self.decoder.fc3.weight)
+
 
         
     def eb(self, name, shape, dtype_, persistent=True):
