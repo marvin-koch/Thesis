@@ -766,6 +766,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
             self.vox_gt = gt_seq[t]
             if self.vox_gt is None:
+                print("Missing GT voxel at time", t)
                 continue
             
             
@@ -773,6 +774,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
             p = t *10
             cache_path = os.path.join(precomputed_root, seq_id, f"t{p:04d}.pt")
             if not os.path.exists(cache_path):
+                print("Missing cache:", cache_path)
                 continue
         
     
@@ -987,34 +989,33 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
             self.vox.z_latent = self.vox.z_latent.detach()
 
-            with torch.no_grad():
-                # 1. GROUND TRUTH STATS (Is my batch empty?)
-                num_pos_gt = (tgt_intersect > 0.5).sum().float()
-                num_neg_gt = (~(tgt_intersect > 0.5)).sum().float()
-                pos_ratio = num_pos_gt / (num_pos_gt + num_neg_gt + 1e-8)
+            # 1. GROUND TRUTH STATS (Is my batch empty?)
+            num_pos_gt = (tgt_intersect > 0.5).sum().float()
+            num_neg_gt = (~(tgt_intersect > 0.5)).sum().float()
+            pos_ratio = num_pos_gt / (num_pos_gt + num_neg_gt + 1e-8)
 
-                # 2. PREDICTION STATS (Is my model confident or scared?)
-                # "Active" means prediction > 0.5 (model thinks it's a wall)
-                num_pred_active = (pred_intersect > 0.5).sum().float()
-                avg_prob_on_walls = pred_intersect[tgt_intersect > 0.5].mean() if num_pos_gt > 0 else torch.tensor(0.0)
-                avg_prob_on_empty = pred_intersect[tgt_intersect < 0.5].mean()
+            # 2. PREDICTION STATS (Is my model confident or scared?)
+            # "Active" means prediction > 0.5 (model thinks it's a wall)
+            num_pred_active = (pred_intersect > 0.5).sum().float()
+            avg_prob_on_walls = pred_intersect[tgt_intersect > 0.5].mean() if num_pos_gt > 0 else torch.tensor(0.0)
+            avg_prob_on_empty = pred_intersect[tgt_intersect < 0.5].mean()
 
-                # 3. OVERLAP DIAGNOSTICS (Why is IoU low?)
-                intersection = ((pred_intersect > 0.5) & (tgt_intersect > 0.5)).sum().float()
-                union = ((pred_intersect > 0.5) | (tgt_intersect > 0.5)).sum().float()
+            # 3. OVERLAP DIAGNOSTICS (Why is IoU low?)
+            intersection = ((pred_intersect > 0.5) & (tgt_intersect > 0.5)).sum().float()
+            union = ((pred_intersect > 0.5) | (tgt_intersect > 0.5)).sum().float()
 
-                # 4. WEIGHT CHECK (What is my dynamic weight actually doing?)
-                # If you used the dynamic formula, log what it calculated
-                current_pos_weight = pos_weight if isinstance(pos_weight, torch.Tensor) else torch.tensor(pos_weight)
+            # 4. WEIGHT CHECK (What is my dynamic weight actually doing?)
+            # If you used the dynamic formula, log what it calculated
+            current_pos_weight = pos_weight if isinstance(pos_weight, torch.Tensor) else torch.tensor(pos_weight)
 
-                # --- PRINT TO TERMINAL (Every 100 steps or on specific batch) ---
-                print(f"\n[Step {self.global_step} Analysis]")
-                print(f"  GT Walls: {int(num_pos_gt)} voxels ({pos_ratio:.4%} of volume)")
-                print(f"  Pred Walls: {int(num_pred_active)} voxels")
-                print(f"  Confidence: Walls={avg_prob_on_walls:.4f}, Empty={avg_prob_on_empty:.4f}")
-                print(f"  Pos Weight Used: {current_pos_weight.item():.2f}")
-                print(f"  IoU Components: Intersect={int(intersection)} / Union={int(union)}")
-                print("-" * 30)
+            # --- PRINT TO TERMINAL (Every 100 steps or on specific batch) ---
+            print(f"\n[Step {batch_idx} Analysis]")
+            print(f"  GT Walls: {int(num_pos_gt)} voxels ({pos_ratio:.4%} of volume)")
+            print(f"  Pred Walls: {int(num_pred_active)} voxels")
+            print(f"  Confidence: Walls={avg_prob_on_walls:.4f}, Empty={avg_prob_on_empty:.4f}")
+            print(f"  Pos Weight Used: {current_pos_weight.item():.2f}")
+            print(f"  IoU Components: Intersect={int(intersection)} / Union={int(union)}")
+            print("-" * 30)
 
 
             torch.cuda.empty_cache()
