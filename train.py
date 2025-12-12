@@ -49,7 +49,6 @@ serialization.add_safe_globals([argparse.Namespace])
 import logging
 from torch.cuda.amp import autocast
 
-
 logging.getLogger("pytorch_lightning").setLevel(logging.DEBUG)
 
 
@@ -100,6 +99,9 @@ class TrainConfig:
     # data
     dataset_root: str
     voxel_size: float = 0.10
+    gt_voxels_file: str = "gt_voxels_per_timestep_005_v2",
+    precomputed_cache_file: str ="precomputed_cache",
+    seq_file: str ="seq_manifest.json",
     radius_m: float = 0.25
     topk: int = 8
     temp: float = 0.5
@@ -126,6 +128,9 @@ class TrainConfig:
     # teacher supervision
     teacher_beam_every_t: bool = True  # run teacher for every timestep (offline precomputed if possible)
     skip: bool = False
+    
+    n_accum: int = 16               # gradient accumulation steps
+    stride: int = 4               # ray stride for voxel supervision
 
 
 
@@ -172,6 +177,10 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
 
         self.automatic_optimization = False   # <<< add this
+        
+        self.bev_window_m=(10.0, 10.0)
+        self.bev_origin_xy=(-2.0, -2.0)
+        self.z_band_bev=(0.02, 0.8)
 
     def configure_optimizers(self):
         params = list(self.vox.sim_net.parameters()) + \
@@ -464,10 +473,10 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 camera_centers,
                 self.vox,
                 voxel_size=self.voxel_size,           # 10 cm
-                bev_window_m=(5.0, 5.0), # local 20x20 m
-                bev_origin_xy=(-2.0, -2.0),
+                bev_window_m=self.bev_window_m, # local 20x20 m
+                bev_origin_xy=self.bev_origin_xy,
                 z_clip_vox=(-np.inf, np.inf),
-                z_band_bev=(0.02, 0.5),
+                z_band_bev=self.z_band_bev,
                 frame_ids=frame_ids
             )
 
@@ -725,8 +734,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
         device = self.device
         opt = self.optimizers()
         
-        N_ACCUM = 16
-        STRIDE = 4
+        self.cfg.n_accum = 16
+        self.cfg.stride = 4
         
         self.vox.reset_state()
         self.vox = self.vox.to(self.device)
@@ -755,8 +764,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
         # ---- iterate timesteps ----
         seq_id = batch["seq_id"]
-        gt_root = os.path.join(self.cfg.dataset_root, "gt_voxels_per_timestep_005_v2")
-        precomputed_root = os.path.join(self.cfg.dataset_root, "precomputed_cache")
+        gt_root = os.path.join(self.cfg.dataset_root, self.cfg.gt_voxels_file)
+        precomputed_root = os.path.join(self.cfg.dataset_root, self.cfg.precomputed_cache_file)
         # Preload GT (optional optimization you had)
         gt_seq = []
         if not os.path.exists(os.path.join(gt_root, f"{seq_id}_t0000_gt.npz")):
@@ -818,7 +827,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 
                 
             if "world_points_conf" in predictions:
-                predictions["world_points_conf"] = predictions["world_points_conf"][..., ::STRIDE, ::STRIDE]
+                predictions["world_points_conf"] = predictions["world_points_conf"][..., ::self.cfg.stride, ::self.cfg.stride]
                 
                 # Get NEW smaller target size (e.g. 128x128)
                 conf_tensor = predictions["world_points_conf"]
@@ -828,16 +837,16 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 else:
                     target_hw = conf_tensor.shape[-2:]
             else:
-                target_hw = (512 // STRIDE, 512 // STRIDE)
+                target_hw = (512 // self.cfg.stride, 512 // self.cfg.stride)
 
             if "world_points" in predictions:
-                predictions["world_points"] = predictions["world_points"][..., ::STRIDE, ::STRIDE, :]
+                predictions["world_points"] = predictions["world_points"][..., ::self.cfg.stride, ::self.cfg.stride, :]
 
             if "images" in predictions:
                 img = predictions["images"]
                 if img.shape[-3] == 3 and img.shape[-1] != 3:
                      img = img.permute(0, 2, 3, 1) # (S, 3, H, W) -> (S, H, W, 3)
-                predictions["images"] = img[..., ::STRIDE, ::STRIDE, :]
+                predictions["images"] = img[..., ::self.cfg.stride, ::self.cfg.stride, :]
                 del img
 
             # --- PROCESS FEATURES ---
@@ -1048,7 +1057,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
         # opt.zero_grad(set_to_none=True)
         
         
-        if (batch_idx + 1) % N_ACCUM == 0:
+        if (batch_idx + 1) % self.cfg.n_accum == 0:
             
             # 2. Step Optimizer
             opt.step()            
@@ -1154,8 +1163,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
         }
 
         seq_id = batch["seq_id"]
-        gt_root = os.path.join(self.cfg.dataset_root, "gt_voxels_per_timestep_005_v2")
-        precomputed_root = os.path.join(self.cfg.dataset_root, "precomputed_cache")
+        gt_root = os.path.join(self.cfg.dataset_root, self.cfg.gt_voxels_file)
+        precomputed_root = os.path.join(self.cfg.dataset_root, self.cfg.precomputed_cache_file)
 
         # Preload GT
         gt_seq = []
@@ -1344,6 +1353,113 @@ class VoxelUpdaterSystem(pl.LightningModule):
         self.log("val_metric/occ_iou", avg_iou, prog_bar=True, on_epoch=True, sync_dist=False)
         
         return val_loss_total
+    
+    
+    def predict_step(self, batch: Dict, batch_idx: int, dataloader_idx: int = 0):
+        device = self.device
+
+        self.vox.reset_state()
+        self.vox = self.vox.to(self.device)
+
+        # Initialize an empty GT grid structure
+        self.vox_gt = TorchSparseVoxelGrid(
+            origin_xyz=np.zeros(3, dtype=np.float32),
+            params=VoxelParams(voxel_size=self.voxel_size, promote_hits=2),
+            device=self.device 
+        )
+        
+        # Buffers for temporal consistency
+        self._prev_keys = None
+        self._prev_probs = None
+
+        T = batch["timesteps"]
+       
+
+        seq_id = batch["seq_id"]
+        gt_root = os.path.join(self.cfg.dataset_root, self.cfg.gt_voxels_file)
+        precomputed_root = os.path.join(self.cfg.dataset_root, self.cfg.precomputed_cache_file)
+
+        # Preload GT
+        gt_seq = []
+        for t in range(T):
+            if self.cfg.skip:
+                t = t * 10
+            gt_path = os.path.join(gt_root, f"{seq_id}_t{t:04d}_gt.npz")
+            if os.path.exists(gt_path):
+                vox_gt_t = load_sparse_voxel_grid(gt_path, device)
+            else:
+                vox_gt_t = None
+            gt_seq.append(vox_gt_t)
+            
+        mst = False
+        Rmw = None
+        tmw = None
+        for t in range(T):
+            # #print(f"== Val Step {t} ==")
+            imgs = batch["imgs_t"][t]
+            
+            self.vox_gt = gt_seq[t]
+            if self.vox_gt is None:
+                continue
+            
+            p = t *10
+            cache_path = os.path.join(precomputed_root, seq_id, f"t{p:04d}.pt")
+            if not os.path.exists(cache_path):
+                continue
+       
+    
+            predictions = torch.load(cache_path, map_location=self.device)
+            
+            if "world_points_conf" in predictions:
+                # Assuming shape is [N_views, H, W] or similar. 
+                # Grab the last two dimensions.
+                conf_tensor = predictions["world_points_conf"]
+                
+                # Handle list vs tensor
+                if isinstance(conf_tensor, list):
+                    # Take the first non-None frame
+                    ref_frame = next(item for item in conf_tensor if item is not None)
+                    target_hw = ref_frame.shape[-2:] # (H, W)
+                else:
+                    target_hw = conf_tensor.shape[-2:] # (H, W)
+            else:
+                # Fallback if somehow missing (unlikely)
+                target_hw = (512, 512)
+
+            # --- PROCESS FEATURES ---
+            raw_feats_list = predictions["view_feats"]
+            projected_feats_map = []
+
+            for f_raw in raw_feats_list:
+                # Pass the dynamically inferred size
+                f_proj = self.apply_projector_to_map(f_raw, target_hw=target_hw)
+                projected_feats_map.append(f_proj)
+                
+            predictions["view_feats"] = projected_feats_map
+            del projected_feats_map
+            
+            with torch.enable_grad(): # (Keep grad enabled for inference/update parts if needed by model)
+                if not mst and t != 0:
+                    bev, mst, _, _ = self.inference(1, imgs, mst, Rmw, tmw, predictions)
+                else:
+                    bev, mst, _, _ = self.inference(t, imgs, mst, Rmw, tmw, predictions)
+    
+    
+
+            bev_spec = BevSpec(
+                resolution=self.vox_gt.p.voxel_size,
+                width_m=float(self.bev_window_m[0]),
+                height_m=float(self.bev_window_m[1]),
+                origin_xy=self.bev_origin_xy,
+                z_band=self.z_band_bev,
+            )
+            
+            bev_gt, meta = bev_from_voxels(self.vox_gt, bev_spec, include_free=True)
+        
+        return bev, bev_gt
+
+        
+        
 # dataset_auto.py
 import os, re, random
 from typing import List, Dict, Optional, Tuple
@@ -1579,7 +1695,8 @@ class HabitatDataModule(pl.LightningDataModule):
             size=self.size,
             verbose=self.verbose,
             sequences=train_seqs,
-            skip=self.skip
+            skip=self.skip,
+            seq_list=self.seq_list
         )
         
         self.val_set = HabitatSeqDataset(
@@ -1587,8 +1704,8 @@ class HabitatDataModule(pl.LightningDataModule):
             size=self.size,
             verbose=self.verbose,
             sequences=val_seqs,
-            skip=self.skip
-
+            skip=self.skip,
+            seq_list=self.seq_list
         ) if val_seqs else None
 
     def train_dataloader(self):
@@ -1627,6 +1744,9 @@ def main():
         # dataset_root="/Users/marvin/Documents/Thesis/repo/dataset_generation/habitat/",
         #dataset_root="/home/mpk40/Documents/data/",
         dataset_root="/cluster/scratch/kochmar/renders/",
+        gt_voxels_file="gt_voxels_per_timestep_005_v2",
+        precomputed_cache_file="precomputed_cache",
+        seq_file="seq_manifest.json",
         voxel_size=0.05,
         radius_m=0.25,
         topk=8,
@@ -1639,7 +1759,11 @@ def main():
         num_workers=4,
         precision="bf16",
         skip=True,
-        weight_decay=1e-5
+        weight_decay=1e-5,
+        lambda_occ= 1.0,
+        lambda_temp = 0.05,      # temporal consistency weight
+        lambda_ent = 1e-3,      # routing entropy reg
+        lambda_tv = 1e-4 ,      # (optional) spatial TV on occupancy
     )
 
     dm = HabitatDataModule(
@@ -1649,7 +1773,8 @@ def main():
         size=512,
         verbose=False,
         train_val_split=0.1,  # or whatever you want
-        skip=True
+        skip=True,
+        seq_list=os.path.join(cfg.dataset_root, cfg.seq_file)
     )
 
     sys = VoxelUpdaterSystem(cfg)
