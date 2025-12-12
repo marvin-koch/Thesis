@@ -338,7 +338,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
         target_size = 5.0
 
         scale_factor = target_size / (current_size + 1e-6)
-        print(f"[GT] Scaling Scene: {current_size:.2f}m -> 3.00m (Factor: {scale_factor:.2f}x)")
+        print(f"[GT] Scaling Scene: {current_size:.2f}m -> 5.00m (Factor: {scale_factor:.2f}x)")
 
         # 1. Scale Points
         predictions["world_points"] = raw_pts * scale_factor
@@ -425,12 +425,17 @@ class VoxelUpdaterSystem(pl.LightningModule):
         
         start = time.time()
 
-        frames_map, conf_map, images_map, features_map, (S,H,W), frame_ids = filter_frames(
+
+        camera_R = R_w2m @ Rmw
+        camera_t = t_w2m + tmw
+        
+        frames_map, conf_map, images_map, features_map, camera_centers, (S,H,W), frame_ids = filter_frames(
             predictions,
             POINTS=POINTS,
             CONF=CONF,
             FEAT="view_feats",
             threshold=threshold,
+            Rmw=camera_R, tmw=camera_t,
             z_clip_map=z_clip_map,   # or None
         )  
         
@@ -456,6 +461,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 frames_map,
                 conf_map,
                 features_map,
+                camera_centers,
                 self.vox,
                 voxel_size=self.voxel_size,           # 10 cm
                 bev_window_m=(5.0, 5.0), # local 20x20 m
@@ -1259,7 +1265,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                     loss_intersect = F.binary_cross_entropy(
                         pred_intersect.float().clamp(1e-5, 1-1e-5),
                         tgt_intersect.float().clamp(1e-5, 1-1e-5),
-                        weight=weights
+                        #weight=weights
                     )
 
             # ---------------------------------------------------------

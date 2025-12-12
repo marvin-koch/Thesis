@@ -124,7 +124,7 @@ def build_gt_voxel_for_timestep(
         target_size = 5.0
 
         scale_factor = target_size / (current_size + 1e-6)
-        print(f"[GT] Scaling Scene: {current_size:.2f}m -> 3.00m (Factor: {scale_factor:.2f}x)")
+        print(f"[GT] Scaling Scene: {current_size:.2f}m -> 5.00m (Factor: {scale_factor:.2f}x)")
 
         # 1. Scale Points
         predictions["world_points"] = raw_pts * scale_factor
