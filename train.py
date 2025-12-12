@@ -63,6 +63,15 @@ def load_sparse_voxel_grid(path, device):
     keys = torch.from_numpy(data["keys"]).to(device)
     vals = torch.from_numpy(data["vals"]).to(device, dtype=torch.float32)
 
+
+    n_total = keys.shape[0]
+    n_occupied = (vals > 0.0).sum()
+    n_empty = n_total - n_occupied
+    
+    print(f"  Total Voxels:    {n_total}")
+    print(f"  Occupied Walls:  {n_occupied}")
+    print(f"  Empty Air:       {n_empty}")
+    
     vox_gt = TorchSparseVoxelGrid(
         origin_xyz=origin,
         params=VoxelParams(voxel_size=voxel_size, promote_hits=2),
@@ -70,6 +79,8 @@ def load_sparse_voxel_grid(path, device):
     )
     vox_gt.keys = keys
     vox_gt.vals_st = vals
+    vox_gt.vals = vals
+
     return vox_gt
 
 
@@ -279,7 +290,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 
                 if len(changed_idx) < 2:
                         # Advance epoch so the pipeline’s temporal bookkeeping stays aligned
-                        self.vox.next_epoch()
+                        # self.vox.next_epoch()
                         return None, None, None, None
     
                 #print("Finding changed images took", length, "seconds!")
@@ -464,7 +475,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
         
             
-        self.vox.next_epoch()
+        # self.vox.next_epoch()
         
         # after build_frames_and_centers_vectorized(...)
         del predictions  # drops images, view_feats, etc. all at once
@@ -601,7 +612,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
             
                 
-            self.vox_gt.next_epoch()
+            #self.vox_gt.next_epoch()
             
         
           # after build_frames_and_centers_vectorized(...)
