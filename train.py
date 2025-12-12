@@ -68,9 +68,9 @@ def load_sparse_voxel_grid(path, device):
     n_occupied = (vals > 0.0).sum()
     n_empty = n_total - n_occupied
     
-    print(f"  Total Voxels:    {n_total}")
-    print(f"  Occupied Walls:  {n_occupied}")
-    print(f"  Empty Air:       {n_empty}")
+    #print(f"  Total Voxels:    {n_total}")
+    #print(f"  Occupied Walls:  {n_occupied}")
+    #print(f"  Empty Air:       {n_empty}")
     
     vox_gt = TorchSparseVoxelGrid(
         origin_xyz=origin,
@@ -1692,7 +1692,8 @@ def main():
     ckpt_path = "/cluster/scratch/kochmar/checkpoints/voxup-epoch=03-val_loss_total=5.8081.ckpt"
     #ckpt_path = "/cluster/scratch/kochmar/checkpoints/voxup-epoch=37-val_loss_total=13.2433.ckpt"
     ckpt_path = "/cluster/scratch/kochmar/checkpoints/voxup-epoch=11-val_loss_total=11.7345.ckpt"
+    ckpt_path = "/cluster/scratch/kochmar/checkpoints/voxup-epoch=03-val_loss_total=16.1524.ckpt"
 
-    trainer.fit(sys, dm)
+    trainer.fit(sys, dm, ckpt_path=ckpt_path)
 if __name__ == "__main__":
     main()
