@@ -1106,12 +1106,14 @@ def filter_frames(
     FEAT: Optional[str] = None,                # (S, H, W, D) optional
     threshold: float = 50.0,                   # percentile [0..100]
     z_clip_map: Optional[Tuple[float, float]] = None,
+    Rmw=None, tmw=None,
     device: Optional[str] = None,
 ) -> Tuple[
     torch.Tensor,              # P_all: (N, 3)
     torch.Tensor,              # C_all: (N,)
     torch.Tensor,              # I_all: (N, 3)
     Optional[torch.Tensor],    # F_all: (N, D) or None
+    torch.Tensor,              # I_all: (N, 3)
     Tuple[int, int, int],      # (S, H, W)
     torch.Tensor               # frame_ids: (N,)
 ]:
@@ -1211,6 +1213,25 @@ def filter_frames(
             q = max(0.0, min(1.0, threshold / 100.0))
             conf_threshold = torch.quantile(sample, q).item()
 
+
+    # --- Pad extrinsics if needed ---
+    if EXTR.dim() == 3 and EXTR.shape[1:] == (3, 4):
+        bottom = torch.tensor([[0, 0, 0, 1]], dtype=EXTR.dtype, device=device)
+        bottom = bottom.unsqueeze(0).expand(S, -1, -1)
+        EXTR = torch.cat([EXTR, bottom], dim=1)
+    
+    # --- Camera centers ---
+    Cw = EXTR[:, :3, 3]  # (S, 3)
+    
+    if Rmw is not None and tmw is not None:
+        # Camera Center C_new = R * C_old + t
+        # Note: Rmw is usually rotation of points. 
+        # Ensure Rmw/tmw match the transform applied to P.
+        
+        # If P_new = P_old @ Rmw.T + tmw (standard point rotation)
+        Cw = Cw @ Rmw.T + tmw
+        
+        
     # ---- Valid mask (vectorized) ----
     finite_xyz = torch.isfinite(P).all(dim=-1)     # (S, H, W)
     finite_conf = torch.isfinite(C)                # (S, H, W)
@@ -1243,7 +1264,7 @@ def filter_frames(
     if F is not None:
         F_all = F.reshape(S * H * W, feat_dim).index_select(0, keep)
 
-    return [P_all], [C_all], [I_all], [F_all], (S, H, W), frame_ids
+    return [P_all], [C_all], [I_all], [F_all], [Cw], (S, H, W), frame_ids
 
 
 # =============================
@@ -1754,6 +1775,7 @@ def build_maps_from_latent_features(
     frames_xyz: list[np.ndarray],          # list of (N_i,3) in MAP frame
     conf_map: list[np.ndarray],         
     features: list[np.ndarray],
+    camera_centers: list[np.ndarray],
     tvox,
     *,
     voxel_size: float = 0.10,
@@ -1782,7 +1804,6 @@ def build_maps_from_latent_features(
         # Skip all the concatenation logic
         keep = torch.isfinite(pts).all(dim=1) & torch.isfinite(CONF_all)
         pts = pts[keep]
-        cameras = None
         CONF_all = CONF_all[keep]
         fts = F_all[keep]
         
@@ -1791,7 +1812,7 @@ def build_maps_from_latent_features(
     if i == 0:
         # Initialize voxel latents + (optionally) occupancy
         tvox.initialize_latents_from_full_cloud(
-            pts_world=pts, f_pts=fts)
+            pts_world=pts, f_pts=fts, camera_centers=camera_centers)
     else:
         if batch_chunk_points is None or pts.shape[0] <= batch_chunk_points:
             tvox.update_with_features(

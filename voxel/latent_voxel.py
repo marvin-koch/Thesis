@@ -1005,23 +1005,150 @@ class LatentVoxelGrid(nn.Module):
             self.z_latent = z
 
             
-    #@torch.no_grad()
+    # #@torch.no_grad()
+    # def initialize_latents_from_full_cloud(
+    #     self,
+    #     pts_world: torch.Tensor,   # (N,3) full scene points (aligned)
+    #     f_pts: torch.Tensor,       # (N,D) point features (e.g., PointNeXt)
+    #     *,
+    #     pool: str = "mean",        # "mean" or "mean+max"
+    #     init_lt: bool = True,      # initialize LT/ST from decoded probs
+    #     lt_level: float | None = None,  # if set, override decoded probs with constant occupancy level in LT
+    #     z_whiten: bool = False     # optional: per-voxel whitening of pooled features
+    # ):
+    #     """
+    #     Seed z_latent for all touched voxels using the *full* point cloud.
+    #     Optionally compute initial occupancy via the decoder and write ST/LT log-odds.
+
+    #     Typical call right after your first DUSt3R run:
+    #         grid.initialize_latents_from_full_cloud(P_world, point_features, decoder=dec)
+    #     """
+    #     dev, dt = self.device, self.dtype
+
+    #     if pts_world.numel() == 0:
+    #         return
+
+    #     pts_world = pts_world.to(dev, dt)
+    #     f_pts = f_pts.to(dev, dt)
+    #     assert pts_world.shape[0] == f_pts.shape[0]
+
+    #     #print(self.keys.get_device())
+    #     # 1) insert all voxels touched by points
+    #     ijk = self._world_to_ijk(pts_world)                       # (N,3)
+    #     keys = self._hash_ijk(ijk)                                # (N,)
+
+    #     idx = self._ensure_and_index(keys)                        # (N,) positions in self.keys
+    #     self._ensure_feature_storage_()
+
+    #     M = self.keys.shape[0]
+    #     Dp = f_pts.shape[-1]
+    #     Dl = self.feature_dim
+
+    #     # 2) voxel pooling of point features
+    #     feat_sum = torch.zeros((M, Dp), device=dev, dtype=dt)
+    #     feat_cnt = torch.zeros((M, 1),  device=dev, dtype=dt)
+
+    #     # sum / count
+    #     # torch.scatter_add_(feat_sum, 0, idx[:, None].expand(-1, Dp), f_pts)
+    #     # torch.scatter_add_(feat_cnt, 0, idx[:, None],                 torch.ones_like(idx, dtype=dt).unsqueeze(-1))
+
+
+    #     feat_sum.index_add_(0, idx, f_pts)  # (M, Dp) += (N, Dp) at rows idx
+    #     feat_cnt.index_add_(0, idx, torch.ones((idx.shape[0], 1), device=dev, dtype=dt))
+
+    #     # mean
+    #     z_mean = torch.where(feat_cnt > 0, feat_sum / feat_cnt.clamp_min(1e-6), torch.zeros_like(feat_sum))
+
+    #     if pool == "mean+max":
+    #         # compute voxel-wise max features too (approx via segment-max)
+    #         # implement a simple max by bucketizing: initialize -inf and scatter_max
+    #         z_max = torch.full((M, Dp), -1e9, device=dev, dtype=dt)
+    #         # emulate scatter_max: compare and write
+    #         # (PyTorch has scatter_reduce_ with "amax" in 2.x; if available, use that for speed.)
+    #         # Fallback loop over feature dims (kept tiny Dp): robust & simple
+    #         for d in range(Dp):
+    #             flat = torch.full((M,), -1e9, device=dev, dtype=dt)
+    #             torch.scatter_reduce_(flat, 0, idx, f_pts[:, d], reduce="amax", include_self=True)
+    #             z_max[:, d] = flat
+    #         z_pool = torch.cat([z_mean, z_max], dim=-1)  # (M, 2*Dp)
+    #         # optional projection to latent size
+    #         if isinstance(self.z_proj, nn.Identity):
+    #             # if latent_dim == 2*Dp you can change latent_dim beforehand,
+    #             # else define self.z_proj = nn.Linear(2*Dp, Dl)
+    #             pass
+    #     else:
+    #         z_pool = z_mean  # (M, Dp)
+
+    #     # 3) optional per-voxel whitening to normalize scale (helps early training)
+    #     if z_whiten:
+    #         mu = z_pool.mean(dim=-1, keepdim=True)
+    #         sd = z_pool.std(dim=-1, keepdim=True).clamp_min(1e-4)
+    #         z_pool = (z_pool - mu) / sd
+
+    #     # 4) write into z_latent (through projection if needed)
+    #     if isinstance(self.z_proj, nn.Identity):
+    #         # if dims match, direct; else assert
+    #         if z_pool.shape[1] != Dl:
+    #             raise ValueError(f"latent_dim {Dl} != pooled feature dim {z_pool.shape[1]} "
+    #                             f"(set self.z_proj to Linear({z_pool.shape[1]}->{Dl}))")
+    #         self.z_latent = z_pool
+    #     else:
+    #         self.z_latent = self.z_proj(z_pool)  # (M, Dl)
+
+    #     # 5) optional: initialize occupancy (LT/ST) using decoder or constant level
+    #     if init_lt:
+    #         if lt_level is not None:
+    #             # write constant occupancy (in prob space) where voxel was touched
+    #             p_occ = torch.full((M,), float(lt_level), device=dev, dtype=dt)
+    #             touched = (feat_cnt.squeeze(-1) > 0)
+    #             logit = torch.logit(p_occ.clamp(1e-5, 1-1e-5))
+    #             self.vals_lt[touched] = logit[touched]
+    #             self.vals_st[touched] = logit[touched]
+    #         elif self.decoder is not None:
+    #             centers = self.voxel_centers()
+    #             p_occ = self.decoder(self.z_latent, centers if getattr(self.decoder, "cond", None) == "xyz" else None)
+    #             logit = torch.logit(p_occ.clamp(1e-5, 1-1e-5))
+    #             # only commit for voxels that actually saw points
+    #             touched = (feat_cnt.squeeze(-1) > 0)
+    #             self.vals_lt[touched] = logit[touched]
+    #             self.vals_st[touched] = logit[touched]
+
+    #         # clamp & refresh display buffer
+    #         self.vals_lt.clamp_(min=self.p.l_min, max=self.p.l_max)
+    #         self.vals_st.clamp_(min=self.p.l_min, max=self.p.l_max)
+    #         self.vals = self._display_vals()
+
+    #     # 6) housekeeping: mark as seen this epoch (so promotion logic can kick in later if you use it)
+    #     if pts_world.shape[0] > 0:
+    #         # all touched indices this pass:
+    #         touched_idx = torch.nonzero(feat_cnt.squeeze(-1) > 0, as_tuple=False).squeeze(-1)
+    #         if touched_idx.numel() > 0:
+    #             now = torch.tensor(self.epoch, dtype=self.seen_occ_epoch.dtype, device=self.device)
+    #             if self.seen_occ_epoch.shape[0] != self.keys.shape[0]:
+    #                 # grow aux arrays just in case
+    #                 self._ensure_and_index(torch.empty(0, dtype=torch.int64, device=self.device))
+    #             self.seen_occ_epoch[touched_idx] = now
+
+
+    
+
+
     def initialize_latents_from_full_cloud(
         self,
         pts_world: torch.Tensor,   # (N,3) full scene points (aligned)
-        f_pts: torch.Tensor,       # (N,D) point features (e.g., PointNeXt)
+        f_pts: torch.Tensor,       # (N,D) point features
+        cam_centers: torch.Tensor, # (N,3) Camera center for each point <--- NEW ARGUMENT
         *,
         pool: str = "mean",        # "mean" or "mean+max"
         init_lt: bool = True,      # initialize LT/ST from decoded probs
-        lt_level: float | None = None,  # if set, override decoded probs with constant occupancy level in LT
-        z_whiten: bool = False     # optional: per-voxel whitening of pooled features
+        lt_level: float | None = None,
+        z_whiten: bool = False,
+        carve_free: bool = True,    # <--- NEW SWITCH
+        stride: int = 4         # <--- NEW PARAMETER
     ):
         """
         Seed z_latent for all touched voxels using the *full* point cloud.
-        Optionally compute initial occupancy via the decoder and write ST/LT log-odds.
-
-        Typical call right after your first DUSt3R run:
-            grid.initialize_latents_from_full_cloud(P_world, point_features, decoder=dec)
+        Also optionally carves free space along the ray.
         """
         dev, dt = self.device, self.dtype
 
@@ -1030,104 +1157,151 @@ class LatentVoxelGrid(nn.Module):
 
         pts_world = pts_world.to(dev, dt)
         f_pts = f_pts.to(dev, dt)
-        assert pts_world.shape[0] == f_pts.shape[0]
+        
+        # --- 1. Identify Surface Voxels (Walls) ---
+        ijk = self._world_to_ijk(pts_world)
+        keys_surf = self._hash_ijk(ijk)
 
-        #print(self.keys.get_device())
-        # 1) insert all voxels touched by points
-        ijk = self._world_to_ijk(pts_world)                       # (N,3)
-        keys = self._hash_ijk(ijk)                                # (N,)
+        # --- 2. Identify Free Space Voxels (Air) ---
+        keys_free = torch.empty(0, dtype=torch.int64, device=dev)
+        
+        if carve_free and cam_centers is not None:
+            cam_centers = cam_centers.to(dev, dt)
+            
+            # Use a stride to save memory (we don't need every single ray for free space)
+            # A stride of 4 is usually sufficient to fill the volume
+            P_sub = pts_world[::stride]
+            C_sub = cam_centers[::stride]
+            
+            V = P_sub - C_sub
+            dists = torch.norm(V, dim=1)
+            
+            # Stop 2 voxels before the wall to keep surface features clean
+            # We don't want to accidentally overwrite a wall voxel with "empty"
+            dist_stop = dists - (self.p.voxel_size * 2.0)
+            mask_valid = dist_stop > 0
+            
+            if mask_valid.any():
+                V = V[mask_valid]
+                C = C_sub[mask_valid]
+                dist_stop = dist_stop[mask_valid]
+                
+                # Normalize direction
+                V_norm = V / (torch.norm(V, dim=1, keepdim=True) + 1e-8)
+                
+                # Create sample steps along the rays
+                step_size = self.p.voxel_size
+                max_steps = int(dist_stop.max() / step_size)
+                
+                if max_steps > 0:
+                    t = torch.arange(max_steps, device=dev, dtype=dt) * step_size
+                    
+                    # (N_rays, Steps, 3)
+                    ray_pts = C.unsqueeze(1) + V_norm.unsqueeze(1) * t.unsqueeze(-1)
+                    
+                    # Filter points that go beyond the wall for their specific ray
+                    mask_steps = t[None, :] < dist_stop[:, None]
+                    valid_free_pts = ray_pts[mask_steps]
+                    
+                    if valid_free_pts.numel() > 0:
+                        ijk_free = self._world_to_ijk(valid_free_pts)
+                        keys_free = self._hash_ijk(ijk_free)
 
-        idx = self._ensure_and_index(keys)                        # (N,) positions in self.keys
+        # --- 3. Allocate Everything (Walls + Air) ---
+        # We combine them so _ensure_and_index processes them in one batch.
+        # Note: We filter unique keys to avoid duplicates.
+        all_keys = torch.cat([keys_free, keys_surf]) # Free first, but unique sorts anyway
+        
+        # This allocates memory for all keys. 
+        # New voxels (including air) get z_latent initialized to 0.0.
+        self._ensure_and_index(all_keys)
+
+        # --- 4. Feature Pooling (ONLY into Surface Voxels) ---
+        # We need to add features to 'keys_surf', but 'keys_free' should stay 0.0.
+        # Since _ensure_and_index sorts self.keys, we must find where our wall keys ended up.
+        
+        # 'idx' will contain the indices in self.z_latent corresponding to pts_world
+        idx = torch.searchsorted(self.keys, keys_surf)
+        
+        # Safety check: ensure the keys actually matched (should always pass)
+        # mask_match = (self.keys[idx] == keys_surf)
+        # idx = idx[mask_match]
+        # f_pts = f_pts[mask_match]
+
         self._ensure_feature_storage_()
 
         M = self.keys.shape[0]
         Dp = f_pts.shape[-1]
         Dl = self.feature_dim
 
-        # 2) voxel pooling of point features
+        # voxel pooling of point features
         feat_sum = torch.zeros((M, Dp), device=dev, dtype=dt)
         feat_cnt = torch.zeros((M, 1),  device=dev, dtype=dt)
 
-        # sum / count
-        # torch.scatter_add_(feat_sum, 0, idx[:, None].expand(-1, Dp), f_pts)
-        # torch.scatter_add_(feat_cnt, 0, idx[:, None],                 torch.ones_like(idx, dtype=dt).unsqueeze(-1))
-
-
-        feat_sum.index_add_(0, idx, f_pts)  # (M, Dp) += (N, Dp) at rows idx
+        # sum / count ONLY at surface indices
+        feat_sum.index_add_(0, idx, f_pts)  
         feat_cnt.index_add_(0, idx, torch.ones((idx.shape[0], 1), device=dev, dtype=dt))
 
         # mean
         z_mean = torch.where(feat_cnt > 0, feat_sum / feat_cnt.clamp_min(1e-6), torch.zeros_like(feat_sum))
 
+        # (Optional) Max pooling logic
         if pool == "mean+max":
-            # compute voxel-wise max features too (approx via segment-max)
-            # implement a simple max by bucketizing: initialize -inf and scatter_max
             z_max = torch.full((M, Dp), -1e9, device=dev, dtype=dt)
-            # emulate scatter_max: compare and write
-            # (PyTorch has scatter_reduce_ with "amax" in 2.x; if available, use that for speed.)
-            # Fallback loop over feature dims (kept tiny Dp): robust & simple
             for d in range(Dp):
                 flat = torch.full((M,), -1e9, device=dev, dtype=dt)
                 torch.scatter_reduce_(flat, 0, idx, f_pts[:, d], reduce="amax", include_self=True)
                 z_max[:, d] = flat
-            z_pool = torch.cat([z_mean, z_max], dim=-1)  # (M, 2*Dp)
-            # optional projection to latent size
-            if isinstance(self.z_proj, nn.Identity):
-                # if latent_dim == 2*Dp you can change latent_dim beforehand,
-                # else define self.z_proj = nn.Linear(2*Dp, Dl)
-                pass
+            z_pool = torch.cat([z_mean, z_max], dim=-1)
         else:
             z_pool = z_mean  # (M, Dp)
 
-        # 3) optional per-voxel whitening to normalize scale (helps early training)
+        # per-voxel whitening
         if z_whiten:
             mu = z_pool.mean(dim=-1, keepdim=True)
             sd = z_pool.std(dim=-1, keepdim=True).clamp_min(1e-4)
             z_pool = (z_pool - mu) / sd
 
-        # 4) write into z_latent (through projection if needed)
+        # write into z_latent
+        # Note: Air voxels (where feat_cnt == 0) will remain 0.0 here, which is exactly what we want.
         if isinstance(self.z_proj, nn.Identity):
-            # if dims match, direct; else assert
             if z_pool.shape[1] != Dl:
-                raise ValueError(f"latent_dim {Dl} != pooled feature dim {z_pool.shape[1]} "
-                                f"(set self.z_proj to Linear({z_pool.shape[1]}->{Dl}))")
+                raise ValueError(f"latent_dim {Dl} != pooled feature dim {z_pool.shape[1]}")
             self.z_latent = z_pool
         else:
-            self.z_latent = self.z_proj(z_pool)  # (M, Dl)
+            self.z_latent = self.z_proj(z_pool)
 
-        # 5) optional: initialize occupancy (LT/ST) using decoder or constant level
+        # --- 5. Initialize Occupancy Logits ---
         if init_lt:
             if lt_level is not None:
-                # write constant occupancy (in prob space) where voxel was touched
                 p_occ = torch.full((M,), float(lt_level), device=dev, dtype=dt)
                 touched = (feat_cnt.squeeze(-1) > 0)
                 logit = torch.logit(p_occ.clamp(1e-5, 1-1e-5))
                 self.vals_lt[touched] = logit[touched]
                 self.vals_st[touched] = logit[touched]
             elif self.decoder is not None:
+                # Decode everything (including air). 
+                # Air latents are 0.0 -> Decoder should predict ~0.1 (low prob)
                 centers = self.voxel_centers()
                 p_occ = self.decoder(self.z_latent, centers if getattr(self.decoder, "cond", None) == "xyz" else None)
+                
                 logit = torch.logit(p_occ.clamp(1e-5, 1-1e-5))
-                # only commit for voxels that actually saw points
-                touched = (feat_cnt.squeeze(-1) > 0)
-                self.vals_lt[touched] = logit[touched]
-                self.vals_st[touched] = logit[touched]
+                
+                # Only write to voxels we explicitly touched (or air we carved)
+                # Ideally, we write to ALL valid voxels.
+                # Here we just write to everything allocated.
+                self.vals_lt[:] = logit
+                self.vals_st[:] = logit
 
-            # clamp & refresh display buffer
             self.vals_lt.clamp_(min=self.p.l_min, max=self.p.l_max)
             self.vals_st.clamp_(min=self.p.l_min, max=self.p.l_max)
             self.vals = self._display_vals()
 
-        # 6) housekeeping: mark as seen this epoch (so promotion logic can kick in later if you use it)
+        # 6) housekeeping
         if pts_world.shape[0] > 0:
-            # all touched indices this pass:
             touched_idx = torch.nonzero(feat_cnt.squeeze(-1) > 0, as_tuple=False).squeeze(-1)
             if touched_idx.numel() > 0:
                 now = torch.tensor(self.epoch, dtype=self.seen_occ_epoch.dtype, device=self.device)
                 if self.seen_occ_epoch.shape[0] != self.keys.shape[0]:
-                    # grow aux arrays just in case
                     self._ensure_and_index(torch.empty(0, dtype=torch.int64, device=self.device))
                 self.seen_occ_epoch[touched_idx] = now
-
-
-   
