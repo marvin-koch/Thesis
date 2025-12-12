@@ -1817,7 +1817,7 @@ def build_maps_from_latent_features(
     if i == 0:
         # Initialize voxel latents + (optionally) occupancy
         tvox.initialize_latents_from_full_cloud(
-            pts_world=pts, f_pts=fts, camera_centers=camera_centers)
+            pts_world=pts, f_pts=fts, cam_centers=camera_centers)
     else:
         if batch_chunk_points is None or pts.shape[0] <= batch_chunk_points:
             tvox.update_with_features(
