@@ -142,13 +142,16 @@ class LatentToOccupancyDecoder(nn.Module):
             raise ValueError("cond must be None or 'xyz'")
 
         # small but expressive head (LN + two residual blocks)
-        self.ln = nn.LayerNorm(in_dim)
+        
+        # self.ln = nn.LayerNorm(in_dim)
+        self.ln = nn.Identity()
+        
         self.fc1 = nn.Linear(in_dim, hidden)
         self.fc2 = nn.Linear(hidden, hidden)
         self.fc3 = nn.Linear(hidden, 1)
 
-        nn.init.constant_(self.fc3.bias, -2.0) # Sigmoid(-2.0) ~= 0.12
-        
+        nn.init.constant_(self.fc3.bias, -5.0)      
+          
     def _fourier_pe(self, xyz: torch.Tensor) -> torch.Tensor:
         """
         xyz: (..., 3) in meters. Returns (..., 3*2*B).
