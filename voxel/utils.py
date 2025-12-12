@@ -1103,7 +1103,7 @@ def filter_frames(
     POINTS: str = "world_points_from_depth",   # (S, H, W, 3)
     CONF: str = "world_points_conf",           # (S, H, W)
     IMG: str = "images",                       # (S, H, W, 3)
-    EXTR_KEY: str = "extrinsic",s
+    EXTR_KEY: str = "extrinsic",
     FEAT: Optional[str] = None,                # (S, H, W, D) optional
     threshold: float = 50.0,                   # percentile [0..100]
     z_clip_map: Optional[Tuple[float, float]] = None,
