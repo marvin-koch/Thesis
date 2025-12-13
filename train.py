@@ -129,7 +129,7 @@ class TrainConfig:
     teacher_beam_every_t: bool = True  # run teacher for every timestep (offline precomputed if possible)
     skip: bool = False
     
-    n_accum: int = 16               # gradient accumulation steps
+    n_accum: int = 4               # gradient accumulation steps
     stride: int = 4               # ray stride for voxel supervision
 
 
@@ -734,8 +734,6 @@ class VoxelUpdaterSystem(pl.LightningModule):
         device = self.device
         opt = self.optimizers()
         
-        self.cfg.n_accum = 16
-        self.cfg.stride = 4
         
         self.vox.reset_state()
         self.vox = self.vox.to(self.device)
@@ -875,6 +873,9 @@ class VoxelUpdaterSystem(pl.LightningModule):
             # p_occ_tgt  = torch.sigmoid(logit_gt)
             p_occ_tgt = torch.sigmoid(logit_gt * 10.0)
             p_occ_pred_before = self.vox.decode_occupancy()
+
+            if not torch.isfinite(p_occ_pred_before).all():
+                p_occ_pred_before = torch.nan_to_num(p_occ_pred_before, nan=0.001)
             
             # -------------------------------------------------------------
             # DUAL LOSS LOGIC START
@@ -1050,7 +1051,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
         # # 1. Clip Gradients
         grad_norm = self.compute_grad_norm()
-        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=0.5)            
+        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=5.0)            
         
         # # 2. Optimizer Step
         # opt.step()            
@@ -1753,7 +1754,7 @@ def main():
         temp=0.5,
         feature_dim=64,
         occ_decoder_hidden=64,
-        lr=2e-4,
+        lr=3e-4,
         max_epochs=200,
         batch_size=1,
         num_workers=4,
@@ -1805,6 +1806,40 @@ def main():
         save_dir="./wandb_logs",         # where to put local files
     )
 
+
+    # 2. Load the checkpoint file manually
+    ckpt_path = "/cluster/scratch/kochmar/checkpoints/voxup-epoch=05-val_loss_total=21.8105.ckpt"
+    checkpoint = torch.load(ckpt_path, map_location="cpu") # Load to CPU first to save GPU mem
+    state_dict = checkpoint["state_dict"]
+
+    # 3. Load the state dictionary with strict=False
+    #    This tells PyTorch: "If you see 'log_temp' in the file but not in the model, just ignore it."
+    keys_to_remove = [
+        "vox.keys",
+        "vox.vals_st",
+        "vox.vals_lt",
+        "vox.vals",
+        "vox.hit_count",
+        "vox.pos_occ_count",
+        "vox.neg_free_count",
+        "vox.last_occ_epoch",
+        "vox.last_free_epoch",
+        "vox.view_bits",
+        "vox.seen_occ_epoch",
+        "vox.seen_view_bits_e",
+        "vox.occ_epoch_count",
+        "vox.view_bits_cum",
+        "vox.lt_promoted_flag",
+        "vox.z_latent"  # CRITICAL: Also remove the old latent vectors!
+    ]
+
+    # 3. Delete them from the dictionary
+    print("Filtering checkpoint: Removing voxel structure, keeping network weights...")
+    for key in keys_to_remove:
+        if key in state_dict:
+            del state_dict[key]
+    keys = sys.load_state_dict(checkpoint["state_dict"], strict=False)
+
  
     trainer = pl.Trainer(
         max_epochs=cfg.max_epochs,
@@ -1823,7 +1858,7 @@ def main():
     ckpt_path = "/cluster/scratch/kochmar/checkpoints/voxup-epoch=03-val_loss_total=5.8081.ckpt"
     #ckpt_path = "/cluster/scratch/kochmar/checkpoints/voxup-epoch=37-val_loss_total=13.2433.ckpt"
     ckpt_path = "/cluster/scratch/kochmar/checkpoints/voxup-epoch=11-val_loss_total=11.7345.ckpt"
-    ckpt_path = "/cluster/scratch/kochmar/checkpoints/voxup-epoch=03-val_loss_total=16.1524.ckpt"
+    ckpt_path = "/cluster/scratch/kochmar/checkpoints/voxup-epoch=05-val_loss_total=21.8105.ckpt"
 
     trainer.fit(sys, dm)
 if __name__ == "__main__":

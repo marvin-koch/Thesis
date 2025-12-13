@@ -75,7 +75,7 @@ class FeatureVoxelSimilarity(nn.Module):
         self.delta_lin = nn.Linear(3, 1, bias=True)
         self.use_cosine = use_cosine
         # learned temperature to calibrate scale
-        self.log_temp = nn.Parameter(torch.tensor(0.0))
+        #self.log_temp = nn.Parameter(torch.tensor(0.0))
 
     def forward(self,
                 f_pts_flat: torch.Tensor,   # (R, D)
@@ -91,6 +91,9 @@ class FeatureVoxelSimilarity(nn.Module):
         Fp = self.f_proj(f)
         Zp = self.z_proj(z)
 
+        Fp = Fp.clamp(min=-1e3, max=1e3)
+        Zp = Zp.clamp(min=-1e3, max=1e3)
+
         if self.use_cosine:
             Fp = Fp / (Fp.norm(dim=-1, keepdim=True) + 1e-6)
             Zp = Zp / (Zp.norm(dim=-1, keepdim=True) + 1e-6)
@@ -101,9 +104,14 @@ class FeatureVoxelSimilarity(nn.Module):
         # tiny delta term (R,)
         dterm = self.delta_lin(d).squeeze(-1)
 
+        
         # scale
-        temp = self.log_temp.exp()
-        return temp * (core + dterm)
+        #safe_log_temp = self.log_temp.clamp(max=4.6)
+        #temp = safe_log_temp.exp()
+
+        #return temp * (core + dterm)
+
+        return core + dterm
     
     
     
@@ -644,6 +652,8 @@ class LatentVoxelGrid(nn.Module):
             return
         
       
+        if not torch.isfinite(f_pts).all():
+            f_pts = torch.nan_to_num(f_pts, nan=0.0, posinf=0.0, neginf=0.0)
 
         dev = self.device
         N   = int(pts_world.shape[0])
@@ -760,16 +770,19 @@ class LatentVoxelGrid(nn.Module):
         tau = max(float(self.routing_tau), 1e-6)
 
         # Force Float32 for precision in exponentials
-        sim_flat_f32 = sim_flat.float() 
+        #sim_flat_f32 = sim_flat.float() 
+        sim_flat_f32 = sim_flat.float().clamp(min=-50.0, max=50.0)
         
         max_per_i = torch.full((Nfull,), -1e9, device=dev, dtype=torch.float32)
         max_per_i = max_per_i.scatter_reduce(0, i_idx, sim_flat_f32, reduce="amax", include_self=True)
         
         sim_shift = sim_flat_f32 - max_per_i[i_idx]
-        w_unnorm  = torch.exp(sim_shift / tau) # Safer in float32
+        #w_unnorm  = torch.exp(sim_shift / tau) # Safer in float32
+        w_unnorm  = torch.exp((sim_shift / tau).clamp(min=-50.0, max=50.0))
 
         sum_per_i = torch.zeros(Nfull, device=dev, dtype=torch.float32).scatter_add(0, i_idx, w_unnorm)
         weights   = w_unnorm / (sum_per_i[i_idx] + 1e-8)
+        weights = torch.nan_to_num(weights, nan=0.0)
         
         #torch.cuda.synchronize()
 
@@ -872,6 +885,9 @@ class LatentVoxelGrid(nn.Module):
             # z_new = self.ema_upd(x_in, z_sel)
         z_new = z_new.to(self.z_latent.dtype)
 
+        if not torch.isfinite(z_new).all():
+            # print("Warning: NaN/Inf detected in GRU update. Sanitizing...")
+            z_new = torch.nan_to_num(z_new, nan=0.0, posinf=0.0, neginf=0.0)
 
         self.z_latent.index_copy_(0, idx_upd, z_new)
             
