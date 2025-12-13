@@ -804,24 +804,6 @@ class VoxelUpdaterSystem(pl.LightningModule):
     
             predictions = torch.load(cache_path, map_location=self.device)
 
- 
-            
-            # if "world_points_conf" in predictions:
-            #     # Assuming shape is [N_views, H, W] or similar. 
-            #     # Grab the last two dimensions.
-            #     conf_tensor = predictions["world_points_conf"]
-                
-            #     # Handle list vs tensor
-            #     if isinstance(conf_tensor, list):
-            #         # Take the first non-None frame
-            #         ref_frame = next(item for item in conf_tensor if item is not None)
-            #         target_hw = ref_frame.shape[-2:] # (H, W)
-            #     else:
-            #         target_hw = conf_tensor.shape[-2:] # (H, W)
-            # else:
-            #     # Fallback if somehow missing (unlikely)
-            #     target_hw = (512, 512)
-                
                 
                 
             if "world_points_conf" in predictions:
@@ -869,13 +851,14 @@ class VoxelUpdaterSystem(pl.LightningModule):
         
             #with autocast(enabled=False):
             # (D) decode current occupancy
-            logit_gt   = self.vox_gt.vals_st.clamp(-8.0, 8.0)
+            logit_gt   = self.vox_gt.vals_st.clamp(-10.0, 10.0)
             # p_occ_tgt  = torch.sigmoid(logit_gt)
             p_occ_tgt = torch.sigmoid(logit_gt * 10.0)
-            p_occ_pred_before = self.vox.decode_occupancy()
+            
+            logit_pred_before = self.vox.decode_occupancy()
 
-            if not torch.isfinite(p_occ_pred_before).all():
-                p_occ_pred_before = torch.nan_to_num(p_occ_pred_before, nan=0.001)
+            if not torch.isfinite(logit_pred_before).all():
+                logit_pred_before = torch.nan_to_num(logit_pred_before, nan=0.001)
             
             # -------------------------------------------------------------
             # DUAL LOSS LOGIC START
@@ -883,15 +866,15 @@ class VoxelUpdaterSystem(pl.LightningModule):
             
             # 1. Align GT to Prediction Keys
             # valid_mask is TRUE where prediction keys exist in GT
-            p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys(
+            p_occ_tgt_gt_aligned, valid_mask = self.align_probs_to_keys(
                 self.vox_gt.keys, p_occ_tgt, self.vox.keys, default=0.0
             )      
 
             # ---------------------------------------------------------
             # PART A: Loss on Intersection (Pred & GT)
             # ---------------------------------------------------------
-            pred_intersect = p_occ_pred_before[valid_mask]
-            tgt_intersect  = p_occ_tgt_aligned[valid_mask]
+            pred_intersect = logit_pred_before[valid_mask]
+            tgt_intersect  = p_occ_tgt_gt_aligned[valid_mask]
             
             loss_intersect = torch.tensor(0.0, device=self.device)
             pos_weight = torch.tensor(1.0, device=self.device)
@@ -911,21 +894,28 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 weights = torch.ones_like(tgt_intersect, device=self.device)
                 weights[pos_mask] = pos_weight
                 
-                with autocast(enabled=False):
+                # with autocast(enabled=False):
 
-                    loss_intersect = F.binary_cross_entropy(
-                        pred_intersect.float().clamp(1e-5, 1-1e-5),
-                        tgt_intersect.float().clamp(1e-5, 1-1e-5),
-                        weight=weights,
-                        reduction="mean"
-                    )
+                #     loss_intersect = F.binary_cross_entropy(
+                #         pred_intersect.float().clamp(1e-5, 1-1e-5),
+                #         tgt_intersect.float().clamp(1e-5, 1-1e-5),
+                #         weight=weights,
+                #         reduction="mean"
+                #     )
+                    
+                loss_occ = F.binary_cross_entropy_with_logits(
+                    pred_intersect, 
+                    tgt_intersect, 
+                    weight=weights,
+                    reduction='mean'
+                )
 
             # ---------------------------------------------------------
             # PART B: Loss on False Positives (Pred - GT)
             # ---------------------------------------------------------
             # These are voxels in your prediction that DO NOT exist in GT.
             # Since GT is truth, these must be empty (0.0).
-            pred_fp = p_occ_pred_before[~valid_mask]
+            pred_fp = logit_pred_before[~valid_mask]
             loss_fp = torch.tensor(0.0, device=self.device)
 
             if pred_fp.numel() > 0:
@@ -934,13 +924,19 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 
                 # Weighting: You might want to weigh this less than intersection
                 # but here we start with 1.0 (strict precision).
-                with autocast(enabled=False):
+                # with autocast(enabled=False):
 
-                    loss_fp = F.binary_cross_entropy(
-                        pred_fp.float().clamp(1e-5, 1-1e-5),
-                        tgt_fp.float(), 
-                        reduction="mean"
-                    )
+                #     loss_fp = F.binary_cross_entropy(
+                #         pred_fp.float().clamp(1e-5, 1-1e-5),
+                #         tgt_fp.float(), 
+                #         reduction="mean"
+                #     )
+                    
+                loss_fp = F.binary_cross_entropy_with_logits(
+                    pred_fp, 
+                    tgt_fp, 
+                    reduction='mean'
+                )
 
             # ---------------------------------------------------------
             # TOTAL OCCUPANCY LOSS & IoU
@@ -974,14 +970,14 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 loss_temp = torch.tensor(0.0, device=self.device)
             else:
                 prev_aligned, valid_mask_temp = self.align_probs_to_keys(
-                    self._prev_keys, self._prev_probs, self.vox.keys, default=0.0
+                    self._prev_keys, self._prev_probs, self.vox.keys, default=-10.0
                 )
                 
-                logit_now  = torch.logit(p_occ_pred_before.clamp(1e-5, 1-1e-5))
-                logit_prev = torch.logit(prev_aligned.clamp(1e-5, 1-1e-5))
+                # logit_now  = torch.logit(p_occ_pred_before.clamp(1e-5, 1-1e-5))
+                # logit_prev = torch.logit(prev_aligned.clamp(1e-5, 1-1e-5))
                 
-                logit_now  = logit_now[valid_mask_temp]
-                logit_prev = logit_prev[valid_mask_temp]
+                logit_now  = logit_pred_before[valid_mask_temp]
+                logit_prev = prev_aligned[valid_mask_temp]
                 
                 if logit_now.numel() == 0:
                     loss_temp = torch.tensor(0.0, device=self.device)
@@ -990,7 +986,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
             # update buffers for next step
             self._prev_keys  = self.vox.keys.detach().clone()
-            self._prev_probs = p_occ_pred_before.detach().clone()
+            self._prev_probs = logit_pred_before.detach().clone()
 
             # --- Loss: Others (Entropy / TV) ---
             loss_ent = torch.tensor(0.0, device=device)
@@ -1023,13 +1019,13 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
             # 2. PREDICTION STATS (Is my model confident or scared?)
             # "Active" means prediction > 0.5 (model thinks it's a wall)
-            num_pred_active = (pred_intersect > 0.5).sum().float()
+            num_pred_active = (pred_intersect > 0.0).sum().float()
             avg_prob_on_walls = pred_intersect[tgt_intersect > 0.5].mean() if num_pos_gt > 0 else torch.tensor(0.0)
             avg_prob_on_empty = pred_intersect[tgt_intersect < 0.5].mean()
 
             # 3. OVERLAP DIAGNOSTICS (Why is IoU low?)
-            intersection = ((pred_intersect > 0.5) & (tgt_intersect > 0.5)).sum().float()
-            union = ((pred_intersect > 0.5) | (tgt_intersect > 0.5)).sum().float()
+            intersection = ((pred_intersect > 0.0) & (tgt_intersect > 0.5)).sum().float()
+            union = ((pred_intersect > 0.0) | (tgt_intersect > 0.5)).sum().float()
 
             # 4. WEIGHT CHECK (What is my dynamic weight actually doing?)
             # If you used the dynamic formula, log what it calculated

@@ -191,7 +191,8 @@ class LatentToOccupancyDecoder(nn.Module):
         h = h + F.relu(self.fc2(h))  # tiny residual
         logit = self.fc3(h).squeeze(-1)
         logit = logit.clamp(-10.0, 10.0)
-        return torch.sigmoid(logit)
+        # return torch.sigmoid(logit)
+        return logit
 
 
 
@@ -298,7 +299,7 @@ class LatentVoxelGrid(nn.Module):
         gate_hidden_dim = int(feature_dim/2)
 
         # self.input_dim = 768
-        self.z_latent = torch.empty((0, feature_dim), dtype=self.dtype, device=self.device)
+        self.z_latent = torch.zeros((0, feature_dim), dtype=self.dtype, device=self.device)
         # self.z_proj = nn.Linear(self.input_dim, self.feature_dim)
         self.z_proj = nn.Identity()
         # update modules
@@ -384,7 +385,7 @@ class LatentVoxelGrid(nn.Module):
         def reset_buf(name, shape, dtype):
                     self.register_buffer(
                         name, 
-                        torch.empty(shape, dtype=dtype, device=current_device), 
+                        torch.zeros(shape, dtype=dtype, device=current_device), 
                         persistent=True
                     )
 
@@ -407,7 +408,7 @@ class LatentVoxelGrid(nn.Module):
 
 
         # ---- latent memory per voxel ----
-        self.z_latent = torch.empty((0, self.feature_dim), dtype=self.dtype, device=current_device)
+        self.z_latent = torch.zeros((0, self.feature_dim), dtype=self.dtype, device=current_device)
 
 
         # reset logical time
@@ -458,7 +459,7 @@ class LatentVoxelGrid(nn.Module):
     def _ensure_and_index(self, upd_keys: torch.Tensor) -> torch.Tensor:
         """Merge upd_keys into self.keys; realign all state; return positions of upd_keys in the new key set."""
         if upd_keys.numel() == 0:
-            return torch.empty(0, dtype=torch.int64, device=self.device)
+            return torch.zeros(0, dtype=torch.int64, device=self.device)
 
         all_keys = torch.cat([self.keys, upd_keys], dim=0)
         uk, inv = torch.unique(all_keys, sorted=True, return_inverse=True)
@@ -468,7 +469,7 @@ class LatentVoxelGrid(nn.Module):
 
         if uk.numel() != n_old:
             def grow_like(src: torch.Tensor, fill=0):
-                out = torch.empty(uk.shape[0], dtype=src.dtype, device=src.device)
+                out = torch.zeros(uk.shape[0], dtype=src.dtype, device=src.device)
                 if src.numel() > 0:
                     out[idx_old] = src
                 if uk.shape[0] > n_old:
@@ -577,14 +578,14 @@ class LatentVoxelGrid(nn.Module):
     # ---------- queries ----------
     def occupied_mask(self) -> torch.Tensor:
         if self.keys.numel() == 0:
-            return torch.empty(0, dtype=torch.bool, device=self.device)
+            return torch.zeros(0, dtype=torch.bool, device=self.device)
         lt_occ = self.vals_lt > self.p.occ_thresh
         st_occ = self.vals_st > (self.p.occ_thresh + self.p.st_margin)
         return lt_occ | st_occ
 
     def occupied_indices(self):
         if self.keys.numel() == 0:
-            return torch.empty(0, dtype=torch.int64, device=self.device)
+            return torch.zeros(0, dtype=torch.int64, device=self.device)
         return self.keys[self.occupied_mask()]
 
 
@@ -931,7 +932,7 @@ class LatentVoxelGrid(nn.Module):
         Returns (M,3) world centers for current keys (float32, device=self.device).
         """
         if self.keys.numel() == 0:
-            return torch.empty(0, 3, device=self.device, dtype=torch.float32)
+            return torch.zeros(0, 3, device=self.device, dtype=torch.float32)
         ijk = self._unhash_keys(self.keys).to(torch.float32)
         return self.origin + (ijk + 0.5) * self.p.voxel_size
 
@@ -945,7 +946,7 @@ class LatentVoxelGrid(nn.Module):
         """
         if self.z_latent.numel() == 0:
             #print("empty")
-            return torch.empty(0, device=self.device, dtype=torch.float32)
+            return torch.zeros(0, device=self.device, dtype=torch.float32)
         if with_xyz_cond:
             centers = self.voxel_centers()
             return self.decoder(self.z_latent, centers)
@@ -1156,7 +1157,7 @@ class LatentVoxelGrid(nn.Module):
     #             now = torch.tensor(self.epoch, dtype=self.seen_occ_epoch.dtype, device=self.device)
     #             if self.seen_occ_epoch.shape[0] != self.keys.shape[0]:
     #                 # grow aux arrays just in case
-    #                 self._ensure_and_index(torch.empty(0, dtype=torch.int64, device=self.device))
+    #                 self._ensure_and_index(torch.zeros(0, dtype=torch.int64, device=self.device))
     #             self.seen_occ_epoch[touched_idx] = now
 
 
@@ -1193,7 +1194,7 @@ class LatentVoxelGrid(nn.Module):
         keys_surf = self._hash_ijk(ijk)
 
         # --- 2. Identify Free Space Voxels (Air) ---
-        keys_free = torch.empty(0, dtype=torch.int64, device=dev)
+        keys_free = torch.zeros(0, dtype=torch.int64, device=dev)
         
         if carve_free and cam_centers is not None:
             cam_centers = cam_centers.to(dev, dt)
@@ -1333,5 +1334,5 @@ class LatentVoxelGrid(nn.Module):
             if touched_idx.numel() > 0:
                 now = torch.tensor(self.epoch, dtype=self.seen_occ_epoch.dtype, device=self.device)
                 if self.seen_occ_epoch.shape[0] != self.keys.shape[0]:
-                    self._ensure_and_index(torch.empty(0, dtype=torch.int64, device=self.device))
+                    self._ensure_and_index(torch.zeros(0, dtype=torch.int64, device=self.device))
                 self.seen_occ_epoch[touched_idx] = now
