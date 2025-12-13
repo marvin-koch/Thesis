@@ -903,7 +903,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 #         reduction="mean"
                 #     )
                     
-                loss_occ = F.binary_cross_entropy_with_logits(
+                loss_intersect = F.binary_cross_entropy_with_logits(
                     pred_intersect, 
                     tgt_intersect, 
                     weight=weights,
@@ -946,7 +946,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
             # --- Metrics: Global IoU (Including FP Hallucinations) ---
             # Valid/Intersect Part
-            pred_bin_int = (pred_intersect > 0.5)
+            pred_bin_int = (pred_intersect > 0.0)
             tgt_bin_int  = (tgt_intersect  > 0.5)
             
             tp = (pred_bin_int & tgt_bin_int).sum()
@@ -954,7 +954,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
             fn = (~pred_bin_int & tgt_bin_int).sum()
             
             # Hallucination Part (Preds outside GT are all FPs if > 0.5)
-            fp_hallucination = (pred_fp > 0.5).sum()
+            fp_hallucination = (pred_fp > 0.0).sum()
             
             total_fp = fp_int + fp_hallucination
             
@@ -1237,8 +1237,11 @@ class VoxelUpdaterSystem(pl.LightningModule):
             # p_occ_tgt = torch.sigmoid(self.vox_gt.vals_st)
             p_occ_tgt = torch.sigmoid(self.vox_gt.vals_st * 10.0)
 
-            p_occ_pred_before = self.vox.decode_occupancy()
+            logit_pred_before = self.vox.decode_occupancy()
 
+            if not torch.isfinite(logit_pred_before).all():
+                logit_pred_before = torch.nan_to_num(logit_pred_before, nan=0.001)
+            
             # 1. Align GT to Prediction
             p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys(
                 self.vox_gt.keys, p_occ_tgt, self.vox.keys, default=0.0
@@ -1247,91 +1250,101 @@ class VoxelUpdaterSystem(pl.LightningModule):
             # ---------------------------------------------------------
             # PART A: Intersection Loss
             # ---------------------------------------------------------
-            pred_intersect = p_occ_pred_before[valid_mask]
+            pred_intersect = logit_pred_before[valid_mask]
             tgt_intersect  = p_occ_tgt_aligned[valid_mask]
             
             loss_intersect = torch.tensor(0.0, device=self.device)
 
+
             if pred_intersect.numel() > 0:
-                # Positive Weighting
-                pos_mask = (tgt_intersect > 0.5)
-                num_pos = pos_mask.sum()
-                num_neg = (~pos_mask).sum()
-                
-                if num_pos > 0:
-                    pos_weight = (num_neg.float() / (num_pos.float() + 1e-8))
-                else:
-                    pos_weight = torch.tensor(1.0, device=self.device)
-
-                weights = torch.ones_like(tgt_intersect)
-                weights[pos_mask] = pos_weight
-                
-                with autocast(enabled=False):
-
-                    loss_intersect = F.binary_cross_entropy(
-                        pred_intersect.float().clamp(1e-5, 1-1e-5),
-                        tgt_intersect.float().clamp(1e-5, 1-1e-5),
-                        #weight=weights
-                    )
+               
+                loss_intersect = F.binary_cross_entropy_with_logits(
+                    pred_intersect, 
+                    tgt_intersect, 
+                    reduction='mean'
+                )
 
             # ---------------------------------------------------------
-            # PART B: False Positive Loss (Hallucinations)
+            # PART B: Loss on False Positives (Pred - GT)
             # ---------------------------------------------------------
-            pred_fp = p_occ_pred_before[~valid_mask]
+            # These are voxels in your prediction that DO NOT exist in GT.
+            # Since GT is truth, these must be empty (0.0).
+            pred_fp = logit_pred_before[~valid_mask]
             loss_fp = torch.tensor(0.0, device=self.device)
 
             if pred_fp.numel() > 0:
+                # Target is all zeros
                 tgt_fp = torch.zeros_like(pred_fp)
                 
-                with autocast(enabled=False):
+                # Weighting: You might want to weigh this less than intersection
+                # but here we start with 1.0 (strict precision).
+                # with autocast(enabled=False):
 
-                    loss_fp = F.binary_cross_entropy(
-                        pred_fp.float().clamp(1e-5, 1-1e-5),
-                        tgt_fp.float()
-                    )
+                #     loss_fp = F.binary_cross_entropy(
+                #         pred_fp.float().clamp(1e-5, 1-1e-5),
+                #         tgt_fp.float(), 
+                #         reduction="mean"
+                #     )
+                    
+                loss_fp = F.binary_cross_entropy_with_logits(
+                    pred_fp, 
+                    tgt_fp, 
+                    reduction='mean'
+                )
 
-            # Total Val Loss
+            # ---------------------------------------------------------
+            # TOTAL OCCUPANCY LOSS & IoU
+            # ---------------------------------------------------------
             fp_weight = 0.1
             loss_occ = loss_intersect + (fp_weight * loss_fp)
 
-            # ---------------------------------------------------------
-            # METRICS: Global IoU (Including Hallucinations)
-            # ---------------------------------------------------------
-            # Intersect part
-            pred_bin_int = (pred_intersect > 0.5)
+            # --- Metrics: Global IoU (Including FP Hallucinations) ---
+            # Valid/Intersect Part
+            pred_bin_int = (pred_intersect > 0.0)
             tgt_bin_int  = (tgt_intersect  > 0.5)
             
             tp = (pred_bin_int & tgt_bin_int).sum()
             fp_int = (pred_bin_int & ~tgt_bin_int).sum()
             fn = (~pred_bin_int & tgt_bin_int).sum()
             
-            # Hallucination part
-            fp_hallucination = (pred_fp > 0.5).sum()
+            # Hallucination Part (Preds outside GT are all FPs if > 0.5)
+            fp_hallucination = (pred_fp > 0.0).sum()
             
             total_fp = fp_int + fp_hallucination
-            occ_iou = tp / (tp + total_fp + fn + 1e-8)
             
+            occ_iou = tp / (tp + total_fp + fn + 1e-8)
             metrics_buffer["occ_iou"].append(occ_iou.item())
 
-            # --- Temporal Loss (Optional for Val, but good to track) ---
+            # -------------------------------------------------------------
+            # DUAL LOSS LOGIC END
+            # -------------------------------------------------------------
+
+            # --- Loss: Temporal ---
             if (t == 0) or (self._prev_keys is None):
                 loss_temp = torch.tensor(0.0, device=self.device)
             else:
                 prev_aligned, valid_mask_temp = self.align_probs_to_keys(
-                    self._prev_keys, self._prev_probs, self.vox.keys, default=0.0
+                    self._prev_keys, self._prev_probs, self.vox.keys, default=-10.0
                 )
-                logit_now  = torch.logit(p_occ_pred_before.clamp(1e-5, 1-1e-5))
-                logit_prev = torch.logit(prev_aligned.clamp(1e-5, 1-1e-5))
-                logit_now  = logit_now[valid_mask_temp]
-                logit_prev = logit_prev[valid_mask_temp]
-
+                
+                # logit_now  = torch.logit(p_occ_pred_before.clamp(1e-5, 1-1e-5))
+                # logit_prev = torch.logit(prev_aligned.clamp(1e-5, 1-1e-5))
+                
+                logit_now  = logit_pred_before[valid_mask_temp]
+                logit_prev = prev_aligned[valid_mask_temp]
+                
                 if logit_now.numel() == 0:
                     loss_temp = torch.tensor(0.0, device=self.device)
                 else:
                     loss_temp = F.smooth_l1_loss(logit_now, logit_prev, beta=0.1)
+                    
 
+       
+
+            # update buffers for next step
             self._prev_keys  = self.vox.keys.detach().clone()
-            self._prev_probs = p_occ_pred_before.detach().clone()
+            self._prev_probs = logit_pred_before.detach().clone()
+
         
             loss_t = cfg.lambda_occ * loss_occ + cfg.lambda_temp * loss_temp
             val_loss_total_seq += loss_t.detach()

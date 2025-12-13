@@ -989,6 +989,7 @@ class LatentVoxelGrid(nn.Module):
         centers = centers[z_mask]
         z_lat = self.z_latent[z_mask]
         probs = self.decoder(z_lat, centers if with_xyz_cond else None)  # (Mz,)
+        probs = torch.sigmoid(probs)
 
         # index into BEV grid
         x0, x1 = x_range
