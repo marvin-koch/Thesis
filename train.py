@@ -903,7 +903,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 #         reduction="mean"
                 #     )
                     
-                loss_occ = F.binary_cross_entropy_with_logits(
+                loss_intersect = F.binary_cross_entropy_with_logits(
                     pred_intersect, 
                     tgt_intersect, 
                     weight=weights,
@@ -946,7 +946,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
             # --- Metrics: Global IoU (Including FP Hallucinations) ---
             # Valid/Intersect Part
-            pred_bin_int = (pred_intersect > 0.5)
+            pred_bin_int = (pred_intersect > 0.0)
             tgt_bin_int  = (tgt_intersect  > 0.5)
             
             tp = (pred_bin_int & tgt_bin_int).sum()
