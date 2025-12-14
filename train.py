@@ -887,7 +887,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 
                 if num_pos > 0:
                     pos_weight = (num_neg.float() / (num_pos.float() + 1e-8)).to(self.device)
-                    pos_weight = pos_weight.clamp(min=1.0, max=20.0).to(self.device)
+                    pos_weight = pos_weight.clamp(min=5.0, max=20.0).to(self.device)
                 else:
                     pos_weight = torch.tensor(1.0, device=self.device)
 
@@ -941,7 +941,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
             # ---------------------------------------------------------
             # TOTAL OCCUPANCY LOSS & IoU
             # ---------------------------------------------------------
-            fp_weight = 0.1
+            fp_weight = 1.0
             loss_occ = loss_intersect + (fp_weight * loss_fp)
 
             # --- Metrics: Global IoU (Including FP Hallucinations) ---
@@ -1295,7 +1295,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
             # ---------------------------------------------------------
             # TOTAL OCCUPANCY LOSS & IoU
             # ---------------------------------------------------------
-            fp_weight = 0.1
+            fp_weight = 1.0
             loss_occ = loss_intersect + (fp_weight * loss_fp)
 
             # --- Metrics: Global IoU (Including FP Hallucinations) ---
@@ -1763,7 +1763,7 @@ def main():
         temp=0.5,
         feature_dim=64,
         occ_decoder_hidden=64,
-        lr=3e-4,
+        lr=1e-3,
         max_epochs=200,
         batch_size=1,
         num_workers=4,
@@ -1817,7 +1817,8 @@ def main():
 
 
     # 2. Load the checkpoint file manually
-    ckpt_path = "/cluster/scratch/kochmar/checkpoints/voxup-epoch=05-val_loss_total=21.8105.ckpt"
+    ckpt_path = "/cluster/scratch/kochmar/checkpoints/voxup-epoch=03-val_loss_total=nan.ckpt"
+    ckpt_path = "/cluster/scratch/kochmar/checkpoints/voxup-epoch=09-val_loss_total=21.1511.ckpt"
     checkpoint = torch.load(ckpt_path, map_location="cpu") # Load to CPU first to save GPU mem
     state_dict = checkpoint["state_dict"]
 
@@ -1847,7 +1848,7 @@ def main():
     for key in keys_to_remove:
         if key in state_dict:
             del state_dict[key]
-    keys = sys.load_state_dict(checkpoint["state_dict"], strict=False)
+    #keys = sys.load_state_dict(checkpoint["state_dict"], strict=False)
 
  
     trainer = pl.Trainer(
@@ -1869,6 +1870,8 @@ def main():
     ckpt_path = "/cluster/scratch/kochmar/checkpoints/voxup-epoch=11-val_loss_total=11.7345.ckpt"
     ckpt_path = "/cluster/scratch/kochmar/checkpoints/voxup-epoch=05-val_loss_total=21.8105.ckpt"
 
+    ckpt_path = "/cluster/scratch/kochmar/checkpoints/voxup-epoch=03-val_loss_total=nan.ckpt"
+    ckpt_path = "/cluster/scratch/kochmar/checkpoints/voxup-epoch=09-val_loss_total=21.1511.ckpt"
     trainer.fit(sys, dm)
 if __name__ == "__main__":
     main()

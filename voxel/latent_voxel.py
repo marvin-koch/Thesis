@@ -944,14 +944,15 @@ class LatentVoxelGrid(nn.Module):
         with_xyz_cond: pass centers to decoder if it expects xyz conditioning
         returns: (M,) probabilities aligned with self.keys
         """
+        t = 5.0
         if self.z_latent.numel() == 0:
             #print("empty")
             return torch.zeros(0, device=self.device, dtype=torch.float32)
         if with_xyz_cond:
             centers = self.voxel_centers()
-            return self.decoder(self.z_latent, centers)
+            return self.decoder(self.z_latent, centers) * t
         else:
-            return self.decoder(self.z_latent, None)
+            return self.decoder(self.z_latent, None) * t
 
     # --- rasterize to 2D BEV occupancy ---
     @torch.no_grad()

@@ -120,16 +120,120 @@ def _hp_wp_from_S_or_img(S: int, img_hw: Tuple[int, int], patch_hw: Tuple[int, i
 
 
 def _tokens_to_featmap(tokens_ksd: torch.Tensor,
+                       img_hw: tuple,
+                       patch_hw: tuple,
+                       target_hw: tuple = None) -> torch.Tensor:
+    """
+    Returns [D, H, W] (Channels First).
+    If target_hw is None, returns NATIVE PATCH RESOLUTION (Small).
+    """
+    # print(f">>> USING FIXED RESHAPE for Image {img_hw} <<<")
+    S, D = tokens_ksd.shape
+    Hnet, Wnet = img_hw
+    ph, pw = patch_hw
+
+    # 1. FORCE the grid size based on input image
+    # e.g. 288 / 16 = 18 patches height
+    Hp = Hnet // ph
+    Wp = Wnet // pw
+    N_grid = Hp * Wp
+
+    # 2. MATCH TOKENS (Strip CLS/Registers)
+    if S == N_grid:
+        valid_tokens = tokens_ksd
+    elif S > N_grid:
+        # Take the LAST N_grid tokens (skipping CLS at start)
+        valid_tokens = tokens_ksd[-N_grid:]
+    else:
+        # Pad if missing (Safety fallback)
+        diff = N_grid - S
+        valid_tokens = F.pad(tokens_ksd, (0, 0, 0, diff))
+
+    # 3. RESHAPE to [1, D, Hp, Wp]
+    # This creates the standard PyTorch (B, C, H, W) layout
+    try:
+        fm = valid_tokens.reshape(1, Hp, Wp, D).permute(0, 3, 1, 2).contiguous()
+    except Exception as e:
+        print(f"CRASH: Could not reshape {valid_tokens.shape} into {Hp}x{Wp}")
+        raise e
+
+    # 4. INTERPOLATE (ONLY IF REQUESTED)
+    # The Fix: If target_hw is None, we do NOT interpolate.
+    if target_hw is not None:
+        Ht, Wt = target_hw
+        # Sanity check: Avoid the 'Barcode' bug (width < 16)
+        if Ht > 16 and Wt > 16:
+            if (Hp, Wp) != (Ht, Wt):
+                fm = F.interpolate(fm, size=(Ht, Wt), mode="bilinear", align_corners=False)
+
+    # Return [D, H, W]
+    return fm[0].contiguous()
+
+"""
+def _tokens_to_featmap(tokens_ksd: torch.Tensor,
+                       img_hw: tuple,
+                       patch_hw: tuple,
+                       target_hw: tuple = None) -> torch.Tensor:
+
+    print(f">>> USING FIXED RESHAPE for Image {img_hw} <<<")
+    S, D = tokens_ksd.shape
+    Hnet, Wnet = img_hw
+    ph, pw = patch_hw
+
+    # 1. FORCE the grid size based on input image
+    # DUST3R / ViT usually works on 16x16 or 14x14 patches.
+    Hp = Hnet // ph
+    Wp = Wnet // pw
+    N_grid = Hp * Wp
+
+    # 2. DIAGNOSTIC PRINT (Only prints once per error)
+    if S != N_grid:
+        diff = S - N_grid
+        print(f"DEBUG: Image={Hnet}x{Wnet}, Patch={ph}x{pw} -> Grid={Hp}x{Wp} ({N_grid}). Actual Tokens={S}. Diff={diff}")
+
+    # 3. FIND THE RIGHT CROP
+    # We have S tokens. We need N_grid tokens.
+    # Usually the extra tokens are at the START (CLS, Registers).
+
+    if S == N_grid:
+        # Case A: Perfect match (No CLS)
+        valid_tokens = tokens_ksd
+    elif S > N_grid:
+        # Case B: Too many tokens.
+        # The extra ones are usually at the beginning (index 0, 1..).
+        # We take the LAST N_grid tokens (usually safe for DUST3R/ViT).
+        valid_tokens = tokens_ksd[-N_grid:]
+    else:
+        # Case C: Not enough tokens.
+        # This usually means patch_size is wrong (e.g. model is P14, code thinks P16).
+        # We cannot recover from this, but we can prevent the "Barcode".
+        # We pad with zeros to force the shape (Better than barcode, but still broken).
+        valid_tokens = F.pad(tokens_ksd, (0, 0, 0, N_grid - S))
+
+    # 4. RESHAPE (The anti-barcode step)
+    # [N_grid, D] -> [1, Hp, Wp, D] -> [1, D, Hp, Wp]
+    try:
+        fm = valid_tokens.reshape(1, Hp, Wp, D).permute(0, 3, 1, 2).contiguous()
+    except Exception as e:
+        print(f"CRASH: Could not reshape {valid_tokens.shape} into {Hp}x{Wp}")
+        raise e
+
+    # 5. INTERPOLATE
+    Ht, Wt = target_hw if target_hw is not None else (Hnet, Wnet)
+    if (Hp, Wp) != (Ht, Wt):
+        fm = F.interpolate(fm, size=(Ht, Wt), mode="bilinear", align_corners=False)
+
+    # Return [D, H, W]
+    #return fm[0].permute(1, 2, 0).contiguous()
+    return fm[0].contiguous()
+
+"""
+"""
+def _tokens_to_featmap(tokens_ksd: torch.Tensor,
                        img_hw: Tuple[int, int],
                        patch_hw: Tuple[int, int],
                        target_hw: Optional[Tuple[int, int]] = None) -> torch.Tensor:
-    """
-    tokens_ksd: [S, D]
-    img_hw: (Hnet, Wnet) actually fed to ViT
-    patch_hw: (ph, pw)
-    target_hw: upsample to this (H, W); if None, use img_hw
-    returns: [D, Ht, Wt]
-    """
+
     assert tokens_ksd.ndim == 2, f"tokens must be [S,D], got {tuple(tokens_ksd.shape)}"
     S, D = tokens_ksd.shape
     Hnet, Wnet = img_hw
@@ -140,6 +244,7 @@ def _tokens_to_featmap(tokens_ksd: torch.Tensor,
     if (Hp, Wp) != (Ht, Wt):
         fm = F.interpolate(fm, size=(Ht, Wt), mode="bilinear", align_corners=False)
     return fm[0].permute(1, 2, 0).contiguous()  # -> [H, W, D]
+"""
 
 
 # ---------------------------
@@ -185,6 +290,9 @@ class _TapLastDecoder:
 # ---------------------------
 # main function
 # ---------------------------
+
+
+
 def inference_with_features(
     pairs: List[Tuple[dict, dict]],
     model,
@@ -195,13 +303,139 @@ def inference_with_features(
 ):
     """
     Run stock DUSt3R inference AND return per-image feature maps.
-
-    Returns:
-      out: dict (identical to dust3r.inference output)
-      view_featmaps: List[Optional[Tensor [D,H,W]]] length N_local_images.
-                     Each entry is the average of that image's feature maps across all pairs that include it.
-                     Entries can be None if an image did not appear in any processed pair.
+    NOW FORCES NATIVE PATCH RESOLUTION (No resizing to points).
     """
+    if verbose:
+        print(f"[inference_with_featmaps] pairs={len(pairs)} batch_size={batch_size}")
+
+    if not pairs:
+        with torch.no_grad():
+            out = dust3r_inference(pairs, model, device, batch_size=batch_size, verbose=verbose)
+            return out, []
+
+    with _TapLastDecoder(model) as tap:
+        with torch.no_grad():
+            out = dust3r_inference(pairs, model, device, batch_size=batch_size, verbose=verbose)
+
+    dec1_all, dec2_all = tap.pop()  # [K,S,D] each
+
+    # Safety: ensure we captured something
+    if dec1_all is None or dec2_all is None:
+        if verbose:
+            print("[featmaps] No decoder tokens captured; returning empty feature maps.")
+        N_guess = 0
+        if "view1" in out and "idx" in out["view1"]:
+            v1_idx = _to_int_list(out["view1"]["idx"])
+            v2_idx = _to_int_list(out["view2"]["idx"])
+            if v1_idx and v2_idx:
+                N_guess = max(max(v1_idx), max(v2_idx)) + 1
+        return out, [None] * N_guess
+
+    # gather metadata
+    v1_idx = _to_int_list(out["view1"]["idx"])          # len K
+    v2_idx = _to_int_list(out["view2"]["idx"])
+    imgs1  = out["view1"]["img"]
+    imgs2  = out["view2"]["img"]
+
+    K = dec1_all.shape[0]
+
+    # patch size
+    try:
+        ph, pw = _patch_hw(getattr(model.patch_embed, "patch_size", 16))
+    except Exception:
+        ph, pw = 16, 16
+
+    # accumulators per local image
+    N = max(max(v1_idx), max(v2_idx)) + 1
+    feat_sums: List[Optional[torch.Tensor]] = [None] * N
+    feat_cnts: List[int] = [0] * N
+
+    # iterate pairs and accumulate per-image maps
+    for k in range(K):
+        # network input H,W from the actual tensor fed into the model
+        H1net, W1net = _as_hw(imgs1[k])
+        H2net, W2net = _as_hw(imgs2[k])
+
+        # -----------------------------------------------------------------
+        # CRITICAL FIX:
+        # Do NOT look at 'pred1_pts' or 'true_shape' for target size.
+        # We want raw patch features.
+        # -----------------------------------------------------------------
+
+        target_hw1 = None
+        target_hw2 = None
+
+        if projector is not None:
+            # Only if we are doing live training with a projector might we want resizing.
+            # But usually, keeping native resolution is safer.
+            # If you specifically need resizing for the projector, set it here.
+            # For now, let's keep it None to be safe.
+            pass
+
+        # Build feat maps (Returns Native Patch Grid [Hp, Wp, D])
+        fm1 = _tokens_to_featmap(dec1_all[k], (H1net, W1net), (ph, pw), target_hw=target_hw1)
+        fm2 = _tokens_to_featmap(dec2_all[k], (H2net, W2net), (ph, pw), target_hw=target_hw2)
+
+        # Optional: Project tokens if needed (for compression)
+        if projector is not None:
+            # Note: Projector expects [S, D]. We have [H, W, D].
+            # Flatten, project, reshape back.
+            H1, W1, D1 = fm1.shape
+            H2, W2, D2 = fm2.shape
+
+            flat1 = fm1.view(-1, D1)
+            flat2 = fm2.view(-1, D2)
+
+            tok1_small = projector(flat1) # [S, 64]
+            tok2_small = projector(flat2)
+
+            fm1 = tok1_small.view(H1, W1, -1)
+            fm2 = tok2_small.view(H2, W2, -1)
+
+        # Accumulate
+        i = v1_idx[k]
+        j = v2_idx[k]
+
+        if feat_sums[i] is None:
+            feat_sums[i] = fm1.clone()
+        else:
+            if feat_sums[i].shape != fm1.shape:
+                fm1 = F.interpolate(fm1.permute(2,0,1).unsqueeze(0), size=feat_sums[i].shape[:2], mode="bilinear", align_corners=False)[0].permute(1,2,0)
+            feat_sums[i] = feat_sums[i] + fm1
+        feat_cnts[i] += 1
+
+        if feat_sums[j] is None:
+            feat_sums[j] = fm2.clone()
+        else:
+            if feat_sums[j].shape != fm2.shape:
+                fm2 = F.interpolate(fm2.permute(2,0,1).unsqueeze(0), size=feat_sums[j].shape[:2], mode="bilinear", align_corners=False)[0].permute(1,2,0)
+            feat_sums[j] = feat_sums[j] + fm2
+        feat_cnts[j] += 1
+
+    # average per image
+    view_featmaps: List[Optional[torch.Tensor]] = []
+    for i in range(N):
+        if feat_sums[i] is None:
+            view_featmaps.append(None)
+        else:
+            view_featmaps.append(feat_sums[i] / max(1, feat_cnts[i]))
+
+    if verbose:
+        shapes = [None if fm is None else tuple(fm.shape) for fm in view_featmaps]
+        print(f"[featmaps] built {len(view_featmaps)} maps; sample shape(s): {shapes} ...")
+
+    return out, view_featmaps
+
+"""
+def inference_with_features(
+    pairs: List[Tuple[dict, dict]],
+    model,
+    device,
+    batch_size: int = 8,
+    verbose: bool = True,
+    projector=None
+):
+
     if verbose:
         print(f"[inference_with_featmaps] pairs={len(pairs)} batch_size={batch_size}")
 
@@ -343,6 +577,7 @@ def inference_with_features(
 
     return out, view_featmaps
 
+"""
 
 
 def clone(src, dst):
