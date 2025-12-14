@@ -1408,6 +1408,18 @@ class LatentVoxelGrid(nn.Module):
             pts_world = pts_world.to(dev, dt)
             f_pts = f_pts.to(dev, dt)
             
+            if max_range is not None and cam_centers is not None:
+                 # 1. Calculate distance for ALL points
+                d_all = torch.norm(pts_world - cam_centers, dim=1)
+                
+                # 2. Create mask
+                keep_range = d_all <= max_range
+                
+                # 3. Apply to everything
+                pts_world = pts_world[keep_range]
+                f_pts = f_pts[keep_range]
+                cam_centers = cam_centers[keep_range]
+            
             # --- 1. Identify Surface Voxels (Walls) ---
             # Keep duplicates here (N,) because we need them for feature pooling later
             ijk = self._world_to_ijk(pts_world)
@@ -1424,10 +1436,10 @@ class LatentVoxelGrid(nn.Module):
                 C_sub = cam_centers[::stride]
                 
                 # B. Max Range Filter (Critical for matching GT)
-                d_raw = torch.norm(P_sub - C_sub, dim=1)
-                mask_range = d_raw <= max_range
-                P_sub = P_sub[mask_range]
-                C_sub = C_sub[mask_range]
+                # d_raw = torch.norm(P_sub - C_sub, dim=1)
+                # mask_range = d_raw <= max_range
+                # P_sub = P_sub[mask_range]
+                # C_sub = C_sub[mask_range]
                 
                 # C. Random Cap (Critical for matching GT density)
                 if max_rays is not None and P_sub.shape[0] > max_rays:
