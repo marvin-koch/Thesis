@@ -1179,7 +1179,8 @@ class LatentVoxelGrid(nn.Module):
         carve_free: bool = True,    # <--- NEW SWITCH
         stride: int = 4,         # <--- NEW PARAMETER
         samples_per_voxel: float = 2.0, # Match GT density
-        max_rays: int = 10000          # Match GT cap (optional, for debugging)
+        max_rays: int = 10000,          # Match GT cap (optional, for debugging)
+        max_range:int = 12.0
     ):
         """
         Seed z_latent for all touched voxels using the *full* point cloud.
@@ -1207,6 +1208,13 @@ class LatentVoxelGrid(nn.Module):
             # 1. Apply Stride
             P_sub = pts_world[::stride]
             C_sub = cam_centers[::stride]
+            
+            # [NEW] Clip Max Range to match GT (e.g., 12.0m or 5.0m)
+            # GT generation uses max_range=12.0
+            d_raw = torch.norm(P_sub - C_sub, dim=1)
+            mask_range = d_raw < max_range
+            P_sub = P_sub[mask_range]
+            C_sub = C_sub[mask_range]
             
             # 2. OPTIONAL: Apply Random Cap (Match GT logic for debugging)
             if max_rays is not None and P_sub.shape[0] > max_rays:
