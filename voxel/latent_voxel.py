@@ -1177,7 +1177,9 @@ class LatentVoxelGrid(nn.Module):
         lt_level: float | None = None,
         z_whiten: bool = False,
         carve_free: bool = True,    # <--- NEW SWITCH
-        stride: int = 4         # <--- NEW PARAMETER
+        stride: int = 4,         # <--- NEW PARAMETER
+        samples_per_voxel: float = 2.0, # Match GT density
+        max_rays: int = 10000          # Match GT cap (optional, for debugging)
     ):
         """
         Seed z_latent for all touched voxels using the *full* point cloud.
@@ -1198,19 +1200,22 @@ class LatentVoxelGrid(nn.Module):
         # --- 2. Identify Free Space Voxels (Air) ---
         keys_free = torch.zeros(0, dtype=torch.int64, device=dev)
         
+        
         if carve_free and cam_centers is not None:
             cam_centers = cam_centers.to(dev, dt)
             
-            # Use a stride to save memory (we don't need every single ray for free space)
-            # A stride of 4 is usually sufficient to fill the volume
+            # 1. Apply Stride
             P_sub = pts_world[::stride]
             C_sub = cam_centers[::stride]
             
+            # 2. OPTIONAL: Apply Random Cap (Match GT logic for debugging)
+            if max_rays is not None and P_sub.shape[0] > max_rays:
+                 perm = torch.randperm(P_sub.shape[0], device=dev)[:max_rays]
+                 P_sub = P_sub[perm]
+                 C_sub = C_sub[perm]
+
             V = P_sub - C_sub
             dists = torch.norm(V, dim=1)
-            
-            # Stop 2 voxels before the wall to keep surface features clean
-            # We don't want to accidentally overwrite a wall voxel with "empty"
             dist_stop = dists - (self.p.voxel_size * 2.0)
             mask_valid = dist_stop > 0
             
@@ -1218,13 +1223,40 @@ class LatentVoxelGrid(nn.Module):
                 V = V[mask_valid]
                 C = C_sub[mask_valid]
                 dist_stop = dist_stop[mask_valid]
-                
-                # Normalize direction
                 V_norm = V / (torch.norm(V, dim=1, keepdim=True) + 1e-8)
                 
-                # Create sample steps along the rays
-                step_size = self.p.voxel_size
+                # --- FIX: HIGHER DENSITY SAMPLING ---
+                # Use samples_per_voxel=2.0 to catch diagonal voxels
+                step_size = self.p.voxel_size / samples_per_voxel 
                 max_steps = int(dist_stop.max() / step_size)
+                
+        # if carve_free and cam_centers is not None:
+        #     cam_centers = cam_centers.to(dev, dt)
+            
+        #     # Use a stride to save memory (we don't need every single ray for free space)
+        #     # A stride of 4 is usually sufficient to fill the volume
+        #     P_sub = pts_world[::stride]
+        #     C_sub = cam_centers[::stride]
+            
+        #     V = P_sub - C_sub
+        #     dists = torch.norm(V, dim=1)
+            
+        #     # Stop 2 voxels before the wall to keep surface features clean
+        #     # We don't want to accidentally overwrite a wall voxel with "empty"
+        #     dist_stop = dists - (self.p.voxel_size * 2.0)
+        #     mask_valid = dist_stop > 0
+            
+        #     if mask_valid.any():
+        #         V = V[mask_valid]
+        #         C = C_sub[mask_valid]
+        #         dist_stop = dist_stop[mask_valid]
+                
+        #         # Normalize direction
+        #         V_norm = V / (torch.norm(V, dim=1, keepdim=True) + 1e-8)
+                
+        #         # Create sample steps along the rays
+        #         step_size = self.p.voxel_size
+        #         max_steps = int(dist_stop.max() / step_size)
                 
                 if max_steps > 0:
                     t = torch.arange(max_steps, device=dev, dtype=dt) * step_size
