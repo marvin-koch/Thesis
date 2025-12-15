@@ -162,7 +162,7 @@ def build_gt_voxel_for_timestep(
 
         # 1. Scale Points
         predictions["world_points"] = raw_pts * scale_factor
-        tmw = tmw * scale_factor
+        tmw_scaled = tmw * scale_factor
         # 2. Scale Camera Positions (Translations)
         # Iterate over the batch of extrinsics to scale the translation vector
         # Extrinsic is typically [R | t]. Scaling t moves cameras apart.
@@ -176,7 +176,7 @@ def build_gt_voxel_for_timestep(
 
 
         camera_R = R_w2m @ Rmw
-        camera_t = t_w2m + tmw
+        camera_t = t_w2m + tmw_scaled
 
         frames_map, cam_centers_map, conf_map, images_map, _, (S, H, W), frame_ids = \
             build_frames_and_centers_vectorized_torch(
