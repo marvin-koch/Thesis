@@ -1191,6 +1191,7 @@ def filter_frames(
     # ---- Shapes ----
     S, H, W = P.shape[:3]
 
+    """
     # ---- Compute confidence threshold (percentile) efficiently ----
     if threshold <= 0.0:
         conf_threshold = float("-inf")  # effectively disabled; still keep >1e-5 below
@@ -1212,11 +1213,33 @@ def filter_frames(
         else:
             # torch.quantile expects tensor; clamp percentile into [0,1]
             q = max(0.0, min(1.0, threshold / 100.0))
+
             conf_threshold = torch.quantile(sample, q).item()
+
+    """
+        # ---- Compute confidence threshold (percentile) the SAME way as build_frames... ----
+    if threshold == 0.0:
+        conf_threshold = 0.0
+    else:
+        C_flat = C.reshape(-1)
+        if C_flat.numel() > 1_000_000:
+            # Random sample WITHOUT replacement (matches build_frames...)
+            indices = torch.randperm(C_flat.numel(), device=device)[:1_000_000]
+            C_sample = C_flat[indices]
+            C_finite = C_sample[torch.isfinite(C_sample)]
+        else:
+            C_finite = C_flat[torch.isfinite(C_flat)]
+
+        if C_finite.numel() > 0:
+            conf_threshold = torch.quantile(C_finite, threshold / 100.0).item()
+        else:
+            conf_threshold = 0.0
 
 
         
-    EXTR = predictions[EXTR_KEY]
+    #EXTR = predictions[EXTR_KEY]
+    EXTR = to_f32_tensor(predictions[EXTR_KEY])
+
     if not isinstance(EXTR, torch.Tensor):
         EXTR = torch.from_numpy(EXTR)
     # --- Pad extrinsics if needed ---

@@ -941,7 +941,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
             # ---------------------------------------------------------
             # TOTAL OCCUPANCY LOSS & IoU
             # ---------------------------------------------------------
-            fp_weight = 1.0
+            fp_weight = 0.1
             loss_occ = loss_intersect + (fp_weight * loss_fp)
 
             # --- Metrics: Global IoU (Including FP Hallucinations) ---
@@ -1295,7 +1295,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
             # ---------------------------------------------------------
             # TOTAL OCCUPANCY LOSS & IoU
             # ---------------------------------------------------------
-            fp_weight = 1.0
+            fp_weight = 0.1
             loss_occ = loss_intersect + (fp_weight * loss_fp)
 
             # --- Metrics: Global IoU (Including FP Hallucinations) ---

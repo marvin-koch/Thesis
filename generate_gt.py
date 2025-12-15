@@ -44,12 +44,7 @@ def save_sparse_voxel_grid(grid: TorchSparseVoxelGrid, path: str):
     n_total = keys.shape[0]
     n_occupied = (vals > 0.0).sum()
     n_empty = n_total - n_occupied
-    
-    print(f"\n[GT CHECK] {os.path.basename(path)}")
-    print(f"  Total Voxels:    {n_total}")
-    print(f"  Occupied Walls:  {n_occupied}")
-    print(f"  Empty Air:       {n_empty}")
-    
+   
     if n_total > 0:
         ratio = n_occupied / n_total
         print(f"  Wall Ratio:      {ratio:.2%}")
@@ -76,6 +71,7 @@ def build_gt_voxel_for_timestep(
     model: AsymmetricCroCo3DStereo,
     device: torch.device,
     voxel_size: float,
+    scale_factor = None 
 ) -> TorchSparseVoxelGrid:
     """
     Compute GT voxel grid for a single timestep (one list of imgs).
@@ -84,7 +80,7 @@ def build_gt_voxel_for_timestep(
     POINTS = "world_points"
     CONF   = "world_points_conf"
     threshold = 1.0
-    z_clip_map = (-1.0, 2.0)
+    z_clip_map = (-2.0, 3.0)
 
     # rotation to map world->metric frame (same as in your code)
     R_w2m_np = np.array([[0, 0, -1],
@@ -97,7 +93,7 @@ def build_gt_voxel_for_timestep(
     # --- DUSt3R prediction (Accelerated) ---
     # We use inference_mode for speed. Autocast is helpful but explicit casting above handles the hard crash.
     with torch.autocast("cuda", dtype=torch.bfloat16):
-        predictions = get_reconstructed_scene_no_opt(0, ".", imgs, model, device, False, 512, "", "linear", 50, 1, True, False, True, False, 0.05, "oneref", 1, 0)
+        predictions = get_reconstructed_scene_no_opt(0, ".", imgs, model, device, False, 512, "", "linear", 100, 1, True, False, True, False, 0.05, "oneref", 1, 0)
 
     # --- normalize images like in your inference_gt() ---
 #    for d in imgs:
@@ -117,13 +113,16 @@ def build_gt_voxel_for_timestep(
         # 🛑 SCALE FIX: Dollhouse -> Real House
         # ==============================
         raw_pts = predictions["world_points"]
-        # Calculate current scale (how big is the scene?)
-        current_size = torch.median(torch.norm(raw_pts, dim=1))
 
-        # Target 5.0 meters (typical room depth)
-        target_size = 5.0
+        if scale_factor == None:    
+            # Calculate current scale (how big is the scene?)
+            current_size = torch.median(torch.norm(raw_pts, dim=1))
 
-        scale_factor = target_size / (current_size + 1e-6)
+            # Target 5.0 meters (typical room depth)
+            target_size = 5.0
+
+
+            scale_factor = target_size / (current_size + 1e-6)
         print(f"[GT] Scaling Scene: {current_size:.2f}m -> 5.00m (Factor: {scale_factor:.2f}x)")
 
         # 1. Scale Points
@@ -208,7 +207,7 @@ def build_gt_voxel_for_timestep(
 
     # free some stuff
     del predictions, frames_map, cam_centers_map, conf_map, images_map
-    return vox_gt
+    return vox_gt, scale_factor
 
 
 def main():
@@ -232,12 +231,12 @@ def main():
     seqs = dataset.seq_paths
     print(f"[GT] Found {len(seqs)} sequences.")
 
-    out_root = os.path.join(dataset_root, "gt_voxels_per_timestep_005_v2")
+    out_root = os.path.join(dataset_root, "gt_voxels_per_timestep_005_v3")
     os.makedirs(out_root, exist_ok=True)
 
     #for seq_idx in range(len(seqs)):
-    #for seq_idx in range(99, -1, -1):
-    for seq_idx in range(48, len(seqs)):
+    for seq_idx in range(len(seqs) -1 , -1, -1):
+    #for seq_idx in range(len(seqs)):
         print(seq_idx)
         batch = dataset[seq_idx]        # __getitem__ returns dict with seq info
         seq_id = batch["seq_id"]
@@ -249,6 +248,7 @@ def main():
         print(f"\n[GT] Sequence {seq_idx+1}/{len(seqs)}: {seq_id} (T={T})")
 
 
+        scale_factor = None
         for t, imgs in enumerate(imgs_t):
             if t % 10 != 0:
                 continue
@@ -260,7 +260,7 @@ def main():
 
 
             print(f"[GT]   computing t={t}/{T-1}")
-            vox_gt = build_gt_voxel_for_timestep(imgs, model, device, voxel_size)
+            vox_gt, scale_factor = build_gt_voxel_for_timestep(imgs, model, device, voxel_size, scale_factor=scale_factor)
             save_sparse_voxel_grid(vox_gt, out_path)
 
     print("\n[GT] Done.")

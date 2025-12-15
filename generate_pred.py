@@ -14,7 +14,7 @@ from sklearn.decomposition import PCA
 # Config
 SEQ_LIST = "/cluster/scratch/kochmar/renders/seq_manifest.json"
 DATA_ROOT = "/cluster/scratch/kochmar/renders/"
-SAVE_ROOT = "/cluster/scratch/kochmar/renders/precomputed_cache/"
+SAVE_ROOT = "/cluster/scratch/kochmar/renders/precomputed_cache_v2/"
 WEIGHTS_PATH = "/cluster/home/kochmar/Thesis/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth"
 
 POINTS = "world_points"
@@ -65,7 +65,7 @@ def precompute():
     print(f"Starting precomputation for {len(seqs)} sequences...")
 
 
-    for seq_idx in (range(len(seqs)-1, -1, -1)):
+    for seq_idx in (range(len(seqs))):
         print(seq_idx)
         batch = dataset[seq_idx]        # __getitem__ returns dict with seq info
         seq_id = batch["seq_id"]
@@ -109,7 +109,7 @@ def precompute():
             if i < 1:
                 
 
-                predictions = get_reconstructed_scene_no_opt(i, ".", imgs, model, device, False, 512, "", "linear", 50, 1, True, False, True, False, 0.05, "oneref", 1, 0, projector=None)
+                predictions = get_reconstructed_scene_no_opt(i, ".", imgs, model, device, False, 512, "", "linear", 100, 1, True, False, True, False, 0.05, "oneref", 1, 0, projector=None)
 
                 keyframes = image_tensors.clone()
                                     
@@ -143,10 +143,10 @@ def precompute():
                 print("inference pred")
                 if not mst:
                     mst = True
-                    predictions = get_reconstructed_scene_no_opt(1, ".", imgs, model, device, False, 512, "", "linear", 50, 1, True, False, True, False, 0.05, "oneref", 1, 0, changed_gids=changed_idx, projector=None)
+                    predictions = get_reconstructed_scene_no_opt(1, ".", imgs, model, device, False, 512, "", "linear", 100, 1, True, False, True, False, 0.05, "oneref", 1, 0, changed_gids=changed_idx, projector=None)
                         
                 else:
-                    predictions = get_reconstructed_scene_no_opt(i, ".", imgs, model, device, False, 512, "", "linear", 50, 1, True, False, True, False, 0.05, "oneref", 1, 0, changed_gids=changed_idx, projector=None)
+                    predictions = get_reconstructed_scene_no_opt(i, ".", imgs, model, device, False, 512, "", "linear", 100, 1, True, False, True, False, 0.05, "oneref", 1, 0, changed_gids=changed_idx, projector=None)
 
             # Filter out heavy unneeded data before saving if necessary
             # But keep "view_feats", "world_points", "world_points_conf", "extrinsic", "intrinsic_K"
