@@ -71,7 +71,9 @@ def build_gt_voxel_for_timestep(
     model: AsymmetricCroCo3DStereo,
     device: torch.device,
     voxel_size: float,
-    scale_factor = None 
+    scale_factor = None,
+    Rmw=None,
+    tmw=None
 ) -> TorchSparseVoxelGrid:
     """
     Compute GT voxel grid for a single timestep (one list of imgs).
@@ -112,22 +114,55 @@ def build_gt_voxel_for_timestep(
         # ==============================
         # 🛑 SCALE FIX: Dollhouse -> Real House
         # ==============================
+    
+
+        # keep only needed keys
+        needed = {"images", "extrinsic", POINTS, CONF}
+        for k in list(predictions.keys()):
+            if k not in needed:
+                del predictions[k]
+
+        # --- align points ---
+        WPTS_m = rotate_points(predictions[POINTS], R_w2m, t_w2m)
+
+        if Rmw is None or tmw is None:
+            Rmw, tmw, _ = align_pointcloud_torch_fast(
+                WPTS_m,
+                inlier_dist=voxel_size * 0.75,
+            )
+        print("Rmw:", Rmw, "tmw:", tmw)
+            
+        WPTS_m = rotate_points(WPTS_m, Rmw, tmw)
+        predictions[POINTS] = WPTS_m
+        
+        
         raw_pts = predictions["world_points"]
 
-        if scale_factor == None:    
+        if scale_factor is None:    
             # Calculate current scale (how big is the scene?)
             current_size = torch.median(torch.norm(raw_pts, dim=1))
+            
+            # 1. Calculate Centroid (Robust to outliers)
+            valid_mask = torch.isfinite(raw_pts).all(dim=-1)
+            if valid_mask.any():
+                centroid = raw_pts[valid_mask].median(dim=0).values
+            else:
+                centroid = torch.zeros(3, device=device)
 
-            # Target 5.0 meters (typical room depth)
+            # 2. Measure Size relative to CENTROID (Fixes the "Origin" bug)
+            # This ensures we measure the ROOM size, not the distance to (0,0,0)
+            centered_pts = raw_pts - centroid
+            current_size = torch.median(torch.norm(centered_pts[valid_mask], dim=1))
+
+            # Target 5.0 meters
             target_size = 5.0
+            scale_factor = (target_size / (current_size + 1e-6)).item()
 
-
-            scale_factor = target_size / (current_size + 1e-6)
-        print(f"[GT] Scaling Scene: {current_size:.2f}m -> 5.00m (Factor: {scale_factor:.2f}x)")
+            print(f"[GT] Scaling Scene: {current_size:.2f}m -> 5.00m (Factor: {scale_factor:.2f}x)")
 
         # 1. Scale Points
         predictions["world_points"] = raw_pts * scale_factor
-
+        tmw = tmw * scale_factor
         # 2. Scale Camera Positions (Translations)
         # Iterate over the batch of extrinsics to scale the translation vector
         # Extrinsic is typically [R | t]. Scaling t moves cameras apart.
@@ -139,25 +174,6 @@ def build_gt_voxel_for_timestep(
                 predictions["extrinsic"][i][:3, 3] *= scale_factor
         # ==============================
 
-
-
-
-        # keep only needed keys
-        needed = {"images", "extrinsic", POINTS, CONF}
-        for k in list(predictions.keys()):
-            if k not in needed:
-                del predictions[k]
-
-        # --- align points ---
-        WPTS_m = rotate_points(predictions[POINTS], R_w2m, t_w2m)
-
-
-        Rmw, tmw, _ = align_pointcloud_torch_fast(
-            WPTS_m,
-            inlier_dist=voxel_size * 0.75,
-        )
-        WPTS_m = rotate_points(WPTS_m, Rmw, tmw)
-        predictions[POINTS] = WPTS_m
 
         camera_R = R_w2m @ Rmw
         camera_t = t_w2m + tmw
@@ -207,7 +223,7 @@ def build_gt_voxel_for_timestep(
 
     # free some stuff
     del predictions, frames_map, cam_centers_map, conf_map, images_map
-    return vox_gt, scale_factor
+    return vox_gt, scale_factor, Rmw, tmw
 
 
 def main():
@@ -249,6 +265,8 @@ def main():
 
 
         scale_factor = None
+        Rmw = None
+        tmw = None
         for t, imgs in enumerate(imgs_t):
             if t % 10 != 0:
                 continue
@@ -260,7 +278,7 @@ def main():
 
 
             print(f"[GT]   computing t={t}/{T-1}")
-            vox_gt, scale_factor = build_gt_voxel_for_timestep(imgs, model, device, voxel_size, scale_factor=scale_factor)
+            vox_gt, scale_factor, Rmw, tmw = build_gt_voxel_for_timestep(imgs, model, device, voxel_size, scale_factor=scale_factor, Rmw=Rmw, tmw=tmw)
             save_sparse_voxel_grid(vox_gt, out_path)
 
     print("\n[GT] Done.")
