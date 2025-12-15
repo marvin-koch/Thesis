@@ -175,7 +175,8 @@ def build_gt_voxel_for_timestep(
         # ==============================
 
 
-        camera_R = R_w2m @ Rmw
+        # camera_R = R_w2m @ Rmw
+        camera_R = Rmw @ R_w2m
         camera_t = t_w2m + tmw_scaled
 
         frames_map, cam_centers_map, conf_map, images_map, _, (S, H, W), frame_ids = \
