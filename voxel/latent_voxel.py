@@ -134,7 +134,7 @@ class LatentToOccupancyDecoder(nn.Module):
       - cond='xyz': p = sigma(MLP([z, pos_enc(center_xyz)]))
     """
     def __init__(self, latent_dim: int, hidden: int = 96, cond: str | None = None,
-                 xyz_pe_bands: int = 4):
+                 xyz_pe_bands: int = 6):
         super().__init__()
         self.cond = cond
         in_dim = latent_dim
@@ -181,7 +181,8 @@ class LatentToOccupancyDecoder(nn.Module):
         """
         if self.cond == 'xyz':
             assert centers_xyz is not None, "centers_xyz required when cond='xyz'"
-            pe = self._fourier_pe(centers_xyz)
+            norm_xyz = centers_xyz / 5.0  # Scale down roughly
+            pe = self._fourier_pe(norm_xyz)
             x = torch.cat([z, pe], dim=-1)
         else:
             x = z
@@ -320,7 +321,7 @@ class LatentVoxelGrid(nn.Module):
         self.routing_topk: int = 8      # voxels per point (after radius prefilter)
         
         
-        self.decoder = LatentToOccupancyDecoder(feature_dim)
+        self.decoder = LatentToOccupancyDecoder(feature_dim, cond="xyz")
         
         # 1. Initialize WHOLE network (Good for fc1, fc2 hidden layers)
         # This sets all biases to 0.0, including fc3
@@ -989,8 +990,9 @@ class LatentVoxelGrid(nn.Module):
             return torch.zeros(Hy, Hx, device=self.device), {"x0": x_range[0], "y0": y_range[0], "res": res_xy}
 
         centers = centers[z_mask]
+        norm_centers = centers / 5.0
         z_lat = self.z_latent[z_mask]
-        probs = self.decoder(z_lat, centers if with_xyz_cond else None)  # (Mz,)
+        probs = self.decoder(z_lat, norm_centers if with_xyz_cond else None)  # (Mz,)
         probs = torch.sigmoid(probs)
 
         # index into BEV grid
