@@ -1828,13 +1828,14 @@ def build_maps_from_latent_features(
         # Expand camera centers by frame_ids
         CONF_all = conf_map[0]
         
+        cameras = camera_centers[0][frame_ids]  # Smart indexing
         F_all = features[0]
         # Skip all the concatenation logic
-        keep = torch.isfinite(pts).all(dim=1) & torch.isfinite(CONF_all)
+        keep = torch.isfinite(pts).all(dim=1) & torch.isfinite(cameras).all(dim=1) & torch.isfinite(CONF_all)
+
         pts = pts[keep]
         CONF_all = CONF_all[keep]
         fts = F_all[keep]
-        cameras = camera_centers[0][frame_ids]  # Smart indexing
         cameras = cameras[keep]
 
 

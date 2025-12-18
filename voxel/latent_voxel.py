@@ -435,8 +435,8 @@ class LatentVoxelGrid(nn.Module):
                     
     # ---------- utilities ----------
     def _world_to_ijk(self, pts: torch.Tensor) -> torch.Tensor:
-        #rel = (pts - self.origin) / self.p.voxel_size
-        rel = (pts.float() - self.origin.float()) / float(self.p.voxel_size)
+        rel = (pts - self.origin) / self.p.voxel_size
+        #rel = (pts.float() - self.origin.float()) / float(self.p.voxel_size)
         return torch.floor(rel).to(torch.int64)
 
     @staticmethod
@@ -946,7 +946,7 @@ class LatentVoxelGrid(nn.Module):
         with_xyz_cond: pass centers to decoder if it expects xyz conditioning
         returns: (M,) probabilities aligned with self.keys
         """
-        t = 5.0
+        t = 1.0
         if self.z_latent.numel() == 0:
             #print("empty")
             return torch.zeros(0, device=self.device, dtype=torch.float32)
@@ -990,9 +990,8 @@ class LatentVoxelGrid(nn.Module):
             return torch.zeros(Hy, Hx, device=self.device), {"x0": x_range[0], "y0": y_range[0], "res": res_xy}
 
         centers = centers[z_mask]
-        norm_centers = centers / 5.0
         z_lat = self.z_latent[z_mask]
-        probs = self.decoder(z_lat, norm_centers if with_xyz_cond else None)  # (Mz,)
+        probs = self.decoder(z_lat, centers if with_xyz_cond else None)  # (Mz,)
         probs = torch.sigmoid(probs)
 
         # index into BEV grid

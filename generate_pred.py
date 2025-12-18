@@ -14,7 +14,7 @@ from sklearn.decomposition import PCA
 # Config
 SEQ_LIST = "/cluster/scratch/kochmar/renders/seq_manifest.json"
 DATA_ROOT = "/cluster/scratch/kochmar/renders/"
-SAVE_ROOT = "/cluster/scratch/kochmar/renders/precomputed_cache_v2/"
+SAVE_ROOT = "/cluster/scratch/kochmar/renders/precomputed_cache_v3/"
 WEIGHTS_PATH = "/cluster/home/kochmar/Thesis/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth"
 
 POINTS = "world_points"
@@ -160,11 +160,11 @@ def precompute():
                     del predictions[k]  # drop unneeded heavy stuff early
 
 
-            cpu_pred = {k: (v.detach().half().cpu() if torch.is_tensor(v) else v) for k, v in predictions.items()}
+            cpu_pred = {k: (v.detach().cpu() if torch.is_tensor(v) else v) for k, v in predictions.items()}
             
             # If view_feats is a list of tensors, move them too
             if "view_feats" in cpu_pred and isinstance(cpu_pred["view_feats"], list):
-                cpu_pred["view_feats"] = [f.detach().half().cpu() if f is not None else None for f in cpu_pred["view_feats"]]
+                cpu_pred["view_feats"] = [f.detach().cpu() if f is not None else None for f in cpu_pred["view_feats"]]
 
             #f_map = predictions["view_feats"][0] # Get first feature map
             #print(f"DEBUG: Saving tensor of shape {f_map.shape}")
