@@ -323,6 +323,8 @@ class LatentVoxelGrid(nn.Module):
         
         self.decoder = LatentToOccupancyDecoder(feature_dim, cond="xyz")
         
+        self.free_token = nn.Parameter(torch.randn(1, feature_dim) * 0.1)
+
         # 1. Initialize WHOLE network (Good for fc1, fc2 hidden layers)
         # This sets all biases to 0.0, including fc3
         self.apply(self.kaiming_init)
@@ -332,6 +334,7 @@ class LatentVoxelGrid(nn.Module):
         nn.init.constant_(self.decoder.fc3.bias, -3.0) 
         # Weight 0.0 -> Prevents random noise from overriding the bias
         nn.init.zeros_(self.decoder.fc3.weight)
+        
 
 
         
@@ -638,6 +641,35 @@ class LatentVoxelGrid(nn.Module):
 
         self._faiss_M = M
 
+
+
+    def generate_phantom_points(self, origins, terminations, n_samples=3):
+            """
+            origins: (N, 3) Camera centers corresponding to each point
+            terminations: (N, 3) The wall points found by depth
+            n_samples: How many phantom points to generate per ray
+            """
+            N = origins.shape[0]
+            
+            # 1. Create random ratios between 0.0 (camera) and 0.90 (near wall)
+            # We stop at 0.90 to avoid putting a phantom point inside the wall
+            ratios = torch.rand(N, n_samples, device=self.device) * 0.90
+            
+            # 2. Interpolate: P_phantom = Origin + t * (Wall - Origin)
+            # (N, 1, 3)
+            vec = (terminations - origins).unsqueeze(1) 
+            
+            # (N, n_samples, 3)
+            phantom_pts = origins.unsqueeze(1) + vec * ratios.unsqueeze(-1)
+            
+            # Flatten to (N*n_samples, 3)
+            phantom_pts = phantom_pts.view(-1, 3)
+            
+            # 3. Create features for them
+            # Expand the learned free_token to match the number of points
+            phantom_feats = self.free_token.expand(phantom_pts.shape[0], -1)
+            
+            return phantom_pts, phantom_feats
 
 
 
@@ -1506,6 +1538,21 @@ class LatentVoxelGrid(nn.Module):
             # This allocates memory for all keys. 
             # New voxels (including air) get z_latent initialized to 0.0.
             self._ensure_and_index(all_keys)
+            
+            # Initialize Free Space with the Learned Token
+            
+            idx_free = torch.searchsorted(self.keys, keys_free)
+            
+            # 2. Write the free_token into z_latent
+            # We do this BEFORE surface pooling so surface features overwrite 
+            # any accidental collisions (though set difference prevents this).
+            if idx_free.numel() > 0:
+                # Expand token to (N_free, D)
+                # Assumes self.free_token is (1, D)
+                token_expanded = self.free_token.expand(idx_free.shape[0], -1)
+                
+                # Write to latent storage
+                self.z_latent.index_copy_(0, idx_free, token_expanded)
 
             # --- 4. Feature Pooling (ONLY into Surface Voxels) ---
             # We need to map the original N points (keys_surf) to the new sparse grid indices
@@ -1565,7 +1612,8 @@ class LatentVoxelGrid(nn.Module):
                     # Decode everything (including air). 
                     centers = self.voxel_centers()
                     p_occ = self.decoder(self.z_latent, centers if getattr(self.decoder, "cond", None) == "xyz" else None)
-                    logit = torch.logit(p_occ.clamp(1e-5, 1-1e-5))
+                    logit = p_occ
+                    #logit = torch.logit(p_occ.clamp(1e-5, 1-1e-5))
                     
                     # Write to ALL allocated voxels (Walls + Air)
                     self.vals_lt[:] = logit
