@@ -1839,7 +1839,7 @@ def build_maps_from_latent_features(
         cameras = cameras[keep]
 
 
-        
+
 
     # 2) Integrate once (optionally in chunks to cap memory)
     if i == 0:
@@ -1847,19 +1847,27 @@ def build_maps_from_latent_features(
         tvox.initialize_latents_from_full_cloud(
             pts_world=pts, f_pts=fts, cam_centers=cameras)
     else:
-        if batch_chunk_points is None or pts.shape[0] <= batch_chunk_points:
+        pts_phantom, feats_phantom = tvox.generate_phantom_points(
+            cameras, 
+            pts, 
+            n_samples=3 
+        )
+    
+        pts_total = torch.cat([pts, pts_phantom], dim=0)
+        feats_total = torch.cat([fts, feats_phantom], dim=0)
+        if batch_chunk_points is None or pts_total.shape[0] <= batch_chunk_points:
             tvox.update_with_features(
-                                pts,  # (N,3)
-                                fts,      # (N,D)
+                                pts_total,  # (N,3)
+                                feats_total,      # (N,D)
                                 radius=radius)
-            print("INTEGRATED")
+            #print("INTEGRATED")
         else:
-            m = pts.shape[0]
+            m = pts_total.shape[0]
             for s in range(0, m, batch_chunk_points):
                 e = min(s + batch_chunk_points, m)
                 tvox.update_with_features(
-                            pts[s:e],  # (N,3)
-                            fts[s:e],      # (N,D)
+                            pts_total[s:e],  # (N,3)
+                            feats_total[s:e],      # (N,D)
                             radius=radius)
 
     
@@ -2089,5 +2097,6 @@ def export_occupied_voxels(vox, ply_path="voxels.ply", npy_path="voxels_ijk.npy"
     print(f"Saved {N} voxel centers → {ply_path}")
     print(f"Saved occupied IJK → {npy_path}")
     print(f"Saved meta → {meta_path}")
+
 
 
