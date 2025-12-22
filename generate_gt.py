@@ -101,7 +101,7 @@ def build_gt_voxel_for_timestep(
     POINTS = "world_points"
     CONF   = "world_points_conf"
     threshold = 1.0
-    z_clip_map = (-2.0, 3.0)
+    z_clip_map = (-3.0, 3.0)
 
     # rotation to map world->metric frame (same as in your code)
     R_w2m_np = np.array([[0, 0, -1],
@@ -198,6 +198,7 @@ def build_gt_voxel_for_timestep(
         # camera_R = R_w2m @ Rmw
         camera_R = Rmw @ R_w2m
         camera_t = t_w2m + tmw_scaled
+        z_clip_map = (scale_factor*z_clip_map[0], scale_factor*z_clip_map[1])
 
 
 
@@ -250,7 +251,7 @@ def build_gt_voxel_for_timestep(
 
 
 def main():
-    dataset_root = "/cluster/scratch/kochmar/frames/"   # same as in your TrainConfig
+    dataset_root = "/cluster/scratch/kochmar/frames2/"   # same as in your TrainConfig
     voxel_size = 0.2
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -272,12 +273,12 @@ def main():
     print(f"[GT] Found {len(seqs)} sequences.")
 
     out_root = os.path.join(dataset_root, "gt_voxels_per_timestep_01")
-    out_root_pose = os.path.join(dataset_root, "gt_pose")
+    out_root_pose = os.path.join(dataset_root, "gt_poses")
     os.makedirs(out_root, exist_ok=True)
 
     #for seq_idx in range(len(seqs)):
-    for seq_idx in range(81 , -1, -1):
-    #for seq_idx in range(0, len(seqs)):
+    #for seq_idx in range(81 , -1, -1):
+    for seq_idx in range(0, len(seqs)):
         print(seq_idx)
         batch = dataset[seq_idx]        # __getitem__ returns dict with seq info
         seq_id = batch["seq_id"]
@@ -307,7 +308,7 @@ def main():
             save_sparse_voxel_grid(vox_gt, out_path)
 
             out_path_pose = os.path.join(out_root_pose, f"{seq_id}_t0000_align.npz")
-            if os.path.exists(out_path):
+            if os.path.exists(out_path_pose):
                 print(f"[T0] {seq_id}: skip (exists)")
                 continue
             save_alignment_npz(out_path_pose, seq_id, scale_factor, Rmw, tmw)
