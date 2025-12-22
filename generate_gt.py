@@ -66,6 +66,25 @@ def save_sparse_voxel_grid(grid: TorchSparseVoxelGrid, path: str):
     )
     # print(f"[GT] Saved voxel grid to {path}")
 
+
+def save_alignment_npz(path, seq_id, scale_factor, Rmw, tmw):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    Rmw_np = Rmw.detach().float().cpu().numpy()
+    tmw_np = tmw.detach().float().cpu().numpy()
+    scale_np = np.array([scale_factor], dtype=np.float32)
+    tmw_scaled_np = (tmw.detach().float() * scale_factor).cpu().numpy()
+
+    np.savez_compressed(
+        path,
+        seq_id=str(seq_id),
+        scale=scale_np,
+        Rmw=Rmw_np,
+        tmw=tmw_np,
+        tmw_scaled=tmw_scaled_np,
+    )
+
+
 def build_gt_voxel_for_timestep(
     imgs,
     model: AsymmetricCroCo3DStereo,
@@ -159,6 +178,7 @@ def build_gt_voxel_for_timestep(
             scale_factor = (target_size / (current_size + 1e-6)).item()
 
             print(f"[GT] Scaling Scene: {current_size:.2f}m -> 5.00m (Factor: {scale_factor:.2f}x)")
+           
 
         # 1. Scale Points
         predictions["world_points"] = raw_pts * scale_factor
@@ -178,6 +198,8 @@ def build_gt_voxel_for_timestep(
         # camera_R = R_w2m @ Rmw
         camera_R = Rmw @ R_w2m
         camera_t = t_w2m + tmw_scaled
+
+
 
         frames_map, cam_centers_map, conf_map, images_map, _, (S, H, W), frame_ids = \
             build_frames_and_centers_vectorized_torch(
@@ -228,7 +250,7 @@ def build_gt_voxel_for_timestep(
 
 
 def main():
-    dataset_root = "/cluster/scratch/kochmar/renders/"   # same as in your TrainConfig
+    dataset_root = "/cluster/scratch/kochmar/frames/"   # same as in your TrainConfig
     voxel_size = 0.2
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -243,17 +265,19 @@ def main():
         dataset_root=dataset_root,
         size=512,
         verbose=False,
+        seq_list  = "/cluster/scratch/kochmar/frames/seq_manifest.json"
     )
 
     seqs = dataset.seq_paths
     print(f"[GT] Found {len(seqs)} sequences.")
 
-    out_root = os.path.join(dataset_root, "gt_voxels_per_timestep_01_v2")
+    out_root = os.path.join(dataset_root, "gt_voxels_per_timestep_01")
+    out_root_pose = os.path.join(dataset_root, "gt_pose")
     os.makedirs(out_root, exist_ok=True)
 
     #for seq_idx in range(len(seqs)):
-    #for seq_idx in range(len(seqs) -1 , -1, -1):
-    for seq_idx in range(67, len(seqs)):
+    for seq_idx in range(81 , -1, -1):
+    #for seq_idx in range(0, len(seqs)):
         print(seq_idx)
         batch = dataset[seq_idx]        # __getitem__ returns dict with seq info
         seq_id = batch["seq_id"]
@@ -281,6 +305,15 @@ def main():
             print(f"[GT]   computing t={t}/{T-1}")
             vox_gt, scale_factor, Rmw, tmw = build_gt_voxel_for_timestep(imgs, model, device, voxel_size, scale_factor=scale_factor, Rmw=Rmw, tmw=tmw)
             save_sparse_voxel_grid(vox_gt, out_path)
+
+            out_path_pose = os.path.join(out_root_pose, f"{seq_id}_t0000_align.npz")
+            if os.path.exists(out_path):
+                print(f"[T0] {seq_id}: skip (exists)")
+                continue
+            save_alignment_npz(out_path_pose, seq_id, scale_factor, Rmw, tmw)
+
+
+
 
     print("\n[GT] Done.")
 

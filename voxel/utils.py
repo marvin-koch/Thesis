@@ -1272,6 +1272,8 @@ def filter_frames(
         z = P[..., 2]
         valid = valid & (z >= z0) & (z <= z1)
 
+
+
     # ---- Flatten & gather only valid entries ----
     # Use reshape (contiguous-safe) after ensuring contiguous memory where needed
     P_all = P.reshape(S * H * W, 3)
@@ -1825,6 +1827,7 @@ def build_maps_from_latent_features(
     if frame_ids is not None:
         # All points are already concatenated
         pts = frames_xyz[0]
+        print(len(pts))
         # Expand camera centers by frame_ids
         CONF_all = conf_map[0]
         
@@ -1834,6 +1837,7 @@ def build_maps_from_latent_features(
         keep = torch.isfinite(pts).all(dim=1) & torch.isfinite(cameras).all(dim=1) & torch.isfinite(CONF_all)
 
         pts = pts[keep]
+        print(len(pts))
         CONF_all = CONF_all[keep]
         fts = F_all[keep]
         cameras = cameras[keep]
@@ -1844,6 +1848,7 @@ def build_maps_from_latent_features(
     # 2) Integrate once (optionally in chunks to cap memory)
     if i == 0:
         # Initialize voxel latents + (optionally) occupancy
+        print("here0")
         tvox.initialize_latents_from_full_cloud(
             pts_world=pts, f_pts=fts, cam_centers=cameras)
     else:
@@ -1856,12 +1861,14 @@ def build_maps_from_latent_features(
         pts_total = torch.cat([pts, pts_phantom], dim=0)
         feats_total = torch.cat([fts, feats_phantom], dim=0)
         if batch_chunk_points is None or pts_total.shape[0] <= batch_chunk_points:
+            print("here")
             tvox.update_with_features(
                                 pts_total,  # (N,3)
                                 feats_total,      # (N,D)
                                 radius=radius)
             #print("INTEGRATED")
         else:
+            print("herechunk")
             m = pts_total.shape[0]
             for s in range(0, m, batch_chunk_points):
                 e = min(s + batch_chunk_points, m)

@@ -146,7 +146,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters(cfg.__dict__)
         self.cfg = cfg
-        self.feature_dim = 32
+        self.feature_dim = self.cfg.feature_dim
         # ---- core components (replace with your actual imports) ----
         #self.voxel_size = 0.01
         self.voxel_size = self.cfg.voxel_size
@@ -372,7 +372,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
         POINTS = "world_points"
         CONF = "world_points_conf"
         threshold = 1.0     
-        z_clip_map = (-2.0, 3.0)   
+        z_clip_map = (-2.0, 3.0)  
 
         R_w2m = np.array([[0, 0, -1],
                         [-1, 0, 0],
@@ -588,7 +588,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
             bev_origin_xy=self.bev_origin_xy,
             z_clip_vox=(-np.inf, np.inf),
             z_band_bev=self.z_band_bev,
-            frame_ids=frame_ids
+            frame_ids=frame_ids,
+            radius= self.cfg.radius_m
         )
 
         self.vox = vox
@@ -2170,7 +2171,7 @@ def main():
         pose_file="gt_poses",
         seq_file="seq_manifest.json",
         voxel_size=0.2,
-        radius_m=0.5,
+        radius_m=1,
         topk=8,
         temp=0.5,
         feature_dim=64,
@@ -2207,7 +2208,7 @@ def main():
     #    cfg=cfg
     #)
     ckpt_cb = pl.callbacks.ModelCheckpoint(
-        dirpath="/cluster/scratch/kochmar/checkpoints/full2",       # Explicitly set a folder so you can find them
+        dirpath="/cluster/scratch/kochmar/checkpoints/full",       # Explicitly set a folder so you can find them
         monitor="val_loss_total",
         save_top_k=3,
         mode="min",
@@ -2229,6 +2230,7 @@ def main():
 
 
     # 2. Load the checkpoint file manually
+    """
     ckpt_path = "/cluster/scratch/kochmar/checkpoints/voxup-epoch=03-val_loss_total=nan.ckpt"
     checkpoint = torch.load(ckpt_path, map_location="cpu") # Load to CPU first to save GPU mem
     state_dict = checkpoint["state_dict"]
@@ -2260,6 +2262,7 @@ def main():
         if key in state_dict:
             del state_dict[key]
     #keys = sys.load_state_dict(checkpoint["state_dict"], strict=False)
+    """
 
  
     trainer = pl.Trainer(

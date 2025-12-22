@@ -12,9 +12,9 @@ import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 
 # Config
-SEQ_LIST = "/cluster/scratch/kochmar/renders/seq_manifest.json"
-DATA_ROOT = "/cluster/scratch/kochmar/renders/"
-SAVE_ROOT = "/cluster/scratch/kochmar/renders/precomputed_cache_v3/"
+SEQ_LIST = "/cluster/scratch/kochmar/frames/seq_manifest.json"
+DATA_ROOT = "/cluster/scratch/kochmar/frames/"
+SAVE_ROOT = "/cluster/scratch/kochmar/frames/precomputed_cache/"
 WEIGHTS_PATH = "/cluster/home/kochmar/Thesis/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth"
 
 POINTS = "world_points"
@@ -57,6 +57,7 @@ def precompute():
         dataset_root=DATA_ROOT,
         size=512,
         verbose=False,
+        seq_list  = "/cluster/scratch/kochmar/frames/seq_manifest.json"
     )
     seqs = dataset.seq_paths
     
