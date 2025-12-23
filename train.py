@@ -1785,6 +1785,12 @@ class VoxelUpdaterSystem(pl.LightningModule):
         
             self.vox.z_latent = self.vox.z_latent.detach()
             torch.cuda.empty_cache()
+            
+            save_dir = "debug_viz_val"
+            os.makedirs(save_dir, exist_ok=True)
+            fname = f"{save_dir}/step_{t}.ply"
+            self.export_debug_ply(fname, t)
+
 
         # Average over sequence
         val_loss_total = val_loss_total_seq #/ max(T, 1)
@@ -1804,6 +1810,96 @@ class VoxelUpdaterSystem(pl.LightningModule):
         return val_loss_total
     
     
+    def export_debug_ply(self, filename, step_idx):
+        """
+        Exports the current State vs GT to a color-coded PLY file.
+        Green = Correct Wall
+        Red   = False Positive (Ghost)
+        Blue  = False Negative (Missed Wall)
+        """
+        # 1. Get Prediction Data
+        # Decode occupancy
+        logit_pred = self.vox.decode_occupancy(with_xyz_cond=True)
+        prob_pred = torch.sigmoid(logit_pred)
+
+        # Threshold (what the model thinks is a wall)
+        mask_pred_occ = prob_pred > 0.5
+        keys_pred = self.vox.keys[mask_pred_occ]
+
+        # 2. Get GT Data
+        # Ensure we are looking at the same coordinate system
+        # (Assuming self.vox_gt is already loaded for this timestep)
+        logit_gt = self.vox_gt.vals_st
+        prob_gt = torch.sigmoid(logit_gt * 10.0) # Sharp GT
+        mask_gt_occ = prob_gt > 0.5
+        keys_gt = self.vox_gt.keys[mask_gt_occ]
+
+        if keys_pred.numel() == 0 and keys_gt.numel() == 0:
+            return
+
+        # 3. Find Intersection (True Positives)
+        # We use the unique keys logic
+        # Note: keys are int64 hashes
+
+        # Convert to sets for easy set logic (fast enough for <100k voxels)
+        # OR use tensor logic if strictly needed, but CPU set is easier for debug
+        set_pred = set(keys_pred.detach().cpu().numpy().tolist())
+        set_gt   = set(keys_gt.detach().cpu().numpy().tolist())
+
+        tp_keys = list(set_pred & set_gt)
+        fp_keys = list(set_pred - set_gt)
+        fn_keys = list(set_gt - set_pred)
+
+        # 4. Collect Points and Colors
+        all_points = []
+        all_colors = []
+        
+          # Helper to unhash and move to numpy
+        def process_keys(k_list, color):
+            if not k_list: return
+            k_tensor = torch.tensor(k_list, dtype=torch.int64, device=self.device)
+            xyz = self.vox._unhash_keys(k_tensor).float()
+            # Convert grid coords to world coords
+            xyz = self.vox.origin + (xyz + 0.5) * self.vox.p.voxel_size
+
+            pts = xyz.detach().cpu().numpy()
+            cols = np.tile(np.array(color), (pts.shape[0], 1))
+
+            all_points.append(pts)
+            all_colors.append(cols)
+
+        # GREEN for Match
+        process_keys(tp_keys, [0, 255, 0])
+        # RED for Ghost
+        process_keys(fp_keys, [255, 0, 0])
+        # BLUE for Missed
+        process_keys(fn_keys, [0, 0, 255])
+
+        if not all_points:
+            return
+
+        # 5. Concatenate and Write PLY
+        pts_final = np.concatenate(all_points, axis=0)
+        col_final = np.concatenate(all_colors, axis=0)
+
+        header = f"""ply
+        format ascii 1.0
+        element vertex {pts_final.shape[0]}
+        property float x
+        property float y
+        property float z
+        property uchar red
+        property uchar green
+        property uchar blue
+        end_header
+        """
+        with open(filename, "w") as f:
+            f.write(header)
+            for p, c in zip(pts_final, col_final):
+                f.write(f"{p[0]:.4f} {p[1]:.4f} {p[2]:.4f} {int(c[0])} {int(c[1])} {int(c[2])}\n")
+
+        print(f"Saved debug PLY: {filename}")
+
     def predict_step(self, batch: Dict, batch_idx: int, dataloader_idx: int = 0):
         device = self.device
 
