@@ -189,11 +189,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
         self.fp_weight = 0.0
 
     def configure_optimizers(self):
-        params = list(self.vox.sim_net.parameters()) + \
-                 list(self.vox.gru_cell.parameters()) + \
-                 list(self.vox.decoder.parameters()) + \
-                 list(self.projector.parameters()) + \
-                 list(self.vox.gate_mlp.parameters())
+    
+        params = list(self.vox.parameters()) + list(self.projector.parameters())
         # if your feature extractor is finetuned, extend params with extractor params
         
         # opt = torch.optim.AdamW(params, lr=self.cfg.lr, weight_decay=self.cfg.weight_decay)
@@ -366,13 +363,13 @@ class VoxelUpdaterSystem(pl.LightningModule):
             
             return out.reshape(pred_pts.shape)
 
-    def inference(self, i, imgs, mst, Rmw=None, tmw=None, predictions=None):
+    def inference(self, i, imgs, mst, Rmw=None, tmw=None, predictions=None, scale_factor=None):
 
 
         POINTS = "world_points"
         CONF = "world_points_conf"
         threshold = 1.0     
-        z_clip_map = (-2.0, 3.0)  
+        z_clip_map = (-3.0, 3.0)  
 
         R_w2m = np.array([[0, 0, -1],
                         [-1, 0, 0],
@@ -549,6 +546,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
         #camera_R = R_w2m @ Rmw
         camera_R = Rmw @ R_w2m
         camera_t = t_w2m + tmw
+        z_clip_map = (scale_factor*z_clip_map[0], scale_factor*z_clip_map[1])
         
         frames_map, conf_map, images_map, features_map, camera_centers, (S,H,W), frame_ids = filter_frames(
             predictions,
@@ -752,7 +750,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
   
 
 
-    def align_probs_to_keys_soft(self, vox_gt, gt_probs, vox_pred, r_vox=1, default=0.0):
+    def align_probs_to_keys_soft(self, vox_gt, gt_probs, vox_pred, r_vox=3, default=0.0):
         """
         r_vox=1 -> 27 neighbors. r_vox=2 -> 125 neighbors.
         Returns:
@@ -964,9 +962,12 @@ class VoxelUpdaterSystem(pl.LightningModule):
         tmw = d["tmw"]   # (3,)  float32
         Rmw = to_torch(Rmw, device=self.device)
         tmw = to_torch(tmw, device=self.device)
+        
+        scale_factor = float(d["scale"])
+        tmw_scaled = tmw * scale_factor
+
 
         mst = False
-        scale_factor = 0.0
         
 
         for t in range(T):
@@ -990,9 +991,9 @@ class VoxelUpdaterSystem(pl.LightningModule):
             predictions = torch.load(cache_path, map_location=self.device)
 
 
-            predictions["world_points"] = predictions["world_points"].to(dtype=torch.float32)
-            predictions["world_points_conf"] = predictions["world_points_conf"].to(dtype=torch.float32)
-            predictions["view_feats"] = [f.to(dtype=torch.float32) for f in predictions["view_feats"]]
+            # predictions["world_points"] = predictions["world_points"].to(dtype=torch.float32)
+            # predictions["world_points_conf"] = predictions["world_points_conf"].to(dtype=torch.float32)
+            # predictions["view_feats"] = [f.to(dtype=torch.float32) for f in predictions["view_feats"]]
 
 
 
@@ -1017,6 +1018,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
             raw_pts = predictions["world_points"]
 
+            """
             if t == 0:
                 # Calculate current scale (how big is the scene?)
                 current_size = torch.median(torch.norm(raw_pts, dim=1))
@@ -1038,10 +1040,11 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 scale_factor = (target_size / (current_size + 1e-6)).item()
 
                 print(f"[GT] Scaling Scene: {current_size:.2f}m -> 5.00m (Factor: {scale_factor:.2f}x)")
-
+            """
+            
+            
             # 1. Scale Points
             predictions["world_points"] = raw_pts * scale_factor
-            tmw = tmw * scale_factor
 
             #predictions[POINTS] = self.align_icp(predictions[POINTS], self.vox_gt, self.device)
 
@@ -1108,9 +1111,9 @@ class VoxelUpdaterSystem(pl.LightningModule):
             del projected_feats_map
         
             if not mst and t != 0:
-                bev, mst, _, _ = self.inference(1, imgs, mst, Rmw, tmw, predictions)
+                bev, mst, _, _ = self.inference(1, imgs, mst, Rmw, tmw_scaled, predictions, scale_factor)
             else:
-                bev, mst, _, _ = self.inference(t, imgs, mst, Rmw, tmw, predictions)
+                bev, mst, _, _ = self.inference(t, imgs, mst, Rmw, tmw_scaled, predictions, scale_factor)
         
             #with autocast(enabled=False):
             # (D) decode current occupancy
@@ -1118,7 +1121,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
             # p_occ_tgt  = torch.sigmoid(logit_gt)
             p_occ_tgt = torch.sigmoid(logit_gt * 10.0)
             
-            logit_pred_before = self.vox.decode_occupancy(with_xyz_cond=True)
+            logit_pred_before = self.vox.decode_occupancy(with_xyz_cond=False)
 
             if not torch.isfinite(logit_pred_before).all():
                 logit_pred_before = torch.nan_to_num(logit_pred_before, nan=0.001)
@@ -1347,6 +1350,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
 
             torch.cuda.empty_cache()
+            
         
         # ---- End of Sequence Loop ----
 
@@ -1367,34 +1371,23 @@ class VoxelUpdaterSystem(pl.LightningModule):
             # 3. Zero Gradients (Clear buffer for next accumulation cycle)
             opt.zero_grad(set_to_none=True)
    
-        # Check if the encoder/backbone is actually getting updates
-        for name, param in self.named_parameters():
-            if param.grad is not None:
-                grad_mean = param.grad.abs().mean().item()
-                if "encoder" in name or "backbone" in name:
-                    print(f"{name} grad: {grad_mean}")
-                    break
-        else:
-            print("WARNING: No gradients found for encoder!")
 
                 # 3. Aggregate Metrics (Mean over sequence)
-        def get_avg(name):
-            vals = metrics_buffer[name]
-            return sum(vals) / len(vals) if len(vals) > 0 else 0.0
+
 
         avg_loss_total = loss_total_seq# / max(T, 1)
 
         # 4. Log Averaged Metrics
         self.log_dict({
-            "loss/occ": get_avg("loss_occ"),
-            "loss/temp": get_avg("loss_temp"),
-            "loss/ent": get_avg("loss_ent"),
-            "loss/tv": get_avg("loss_tv"),
+            "loss/occ": self.get_avg(metrics_buffer, "loss_occ"),
+            "loss/temp": self.get_avg(metrics_buffer,"loss_temp"),
+            "loss/ent": self.get_avg(metrics_buffer,"loss_ent"),
+            "loss/tv": self.get_avg(metrics_buffer,"loss_tv"),
             "loss/total_avg": avg_loss_total,
-            "metric/occ_iou": get_avg("occ_iou"),
-            "metric/occ_recall": get_avg("occ_recall"),
-            "metric/occ_precision": get_avg("occ_precision"),           
-            "metric/occ_precision_inter": get_avg("occ_precision_inter"),
+            "metric/occ_iou": self.get_avg(metrics_buffer,"occ_iou"),
+            "metric/occ_recall": self.get_avg(metrics_buffer,"occ_recall"),
+            "metric/occ_precision": self.get_avg(metrics_buffer,"occ_precision"),           
+            "metric/occ_precision_inter": self.get_avg(metrics_buffer,"occ_precision_inter"),
             "stats/num_voxels": float(self.vox.keys.numel()),
             "grad_norm": grad_norm
         }, prog_bar=True, on_step=True, on_epoch=True, sync_dist=False)
@@ -1405,7 +1398,10 @@ class VoxelUpdaterSystem(pl.LightningModule):
         sch = self.lr_schedulers()
         if sch is not None:
             sch.step()
-
+            
+    def get_avg(self, metrics_buffer, name):
+        vals = metrics_buffer[name]
+        return sum(vals) / len(vals) if len(vals) > 0 else 0.0
     # -----------------------------------------------------------
     # ===> PASTE THIS FUNCTION HERE inside VoxelUpdaterSystem <===
     # -----------------------------------------------------------
@@ -1479,7 +1475,10 @@ class VoxelUpdaterSystem(pl.LightningModule):
         metrics_buffer = {
             "loss_occ": [],
             "loss_temp": [],
-            "occ_iou": []
+            "occ_iou": [],
+            "occ_precision":[],
+            "occ_precision_inter":[],
+            "occ_recall": []
         }
 
         seq_id = batch["seq_id"]
@@ -1501,16 +1500,19 @@ class VoxelUpdaterSystem(pl.LightningModule):
             
 
         d = np.load(os.path.join(pose_root, f"{seq_id}_t0000_align.npz"), allow_pickle=True)
+
+        
         Rmw = d["Rmw"]   # (3,3) float32
         tmw = d["tmw"]   # (3,)  float32
+        scale_factor = float(d["scale"])
         Rmw = to_torch(Rmw, device=self.device)
         tmw = to_torch(tmw, device=self.device)
+        tmw_scaled = tmw * scale_factor
 
 
 
 
         mst = False
-        scale_factor = 0.0
         for t in range(T):
             print("Val ", t)
             # #print(f"== Val Step {t} ==")
@@ -1531,10 +1533,11 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
             predictions = torch.load(cache_path, map_location=self.device)
 
+            """
             predictions["world_points"] = predictions["world_points"].to(dtype=torch.float32)
             predictions["world_points_conf"] = predictions["world_points_conf"].to(dtype=torch.float32)
             predictions["view_feats"] = [f.to(dtype=torch.float32) for f in predictions["view_feats"]]
-
+            """
 
 
             R_w2m = np.array([[0, 0, -1],
@@ -1560,6 +1563,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
 
             raw_pts = predictions["world_points"]
+            
+            """
             if t == 0:
                 # Calculate current scale (how big is the scene?)
                 current_size = torch.median(torch.norm(raw_pts, dim=1))
@@ -1582,11 +1587,12 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
                 print(f"[GT] Scaling Scene: {current_size:.2f}m -> 5.00m (Factor: {scale_factor:.2f}x)")
 
-
+            """
            
             # 1. Scale Points
             predictions["world_points"] = raw_pts * scale_factor
-            tmw = tmw * scale_factor
+            #tmw = tmw * scale_factor
+            
             #predictions[POINTS] = self.align_to_gt_centroid(predictions[POINTS], self.vox_gt, self.device)
             #predictions[POINTS] = self.align_icp(predictions[POINTS], self.vox_gt, self.device)
 
@@ -1599,26 +1605,32 @@ class VoxelUpdaterSystem(pl.LightningModule):
             elif isinstance(predictions["extrinsic"], list):
                 for i in range(len(predictions["extrinsic"])):
                     predictions["extrinsic"][i][:3, 3] *= scale_factor
-     
 
 
-                    
-            
+            stride = 1 if t == 0 else self.cfg.stride
+
             if "world_points_conf" in predictions:
-                # Assuming shape is [N_views, H, W] or similar. 
-                # Grab the last two dimensions.
+                predictions["world_points_conf"] = predictions["world_points_conf"][..., ::stride, ::stride]
+
+                # Get NEW smaller target size (e.g. 128x128)
                 conf_tensor = predictions["world_points_conf"]
-                
-                # Handle list vs tensor
                 if isinstance(conf_tensor, list):
-                    # Take the first non-None frame
-                    ref_frame = next(item for item in conf_tensor if item is not None)
-                    target_hw = ref_frame.shape[-2:] # (H, W)
+                    ref = next((x for x in conf_tensor if x is not None), None)
+                    target_hw = ref.shape[-2:] if ref is not None else (128, 128)
                 else:
-                    target_hw = conf_tensor.shape[-2:] # (H, W)
+                    target_hw = conf_tensor.shape[-2:]
             else:
-                # Fallback if somehow missing (unlikely)
-                target_hw = (512, 512)
+                target_hw = (512 // stride, 512 // stride)
+
+            if "world_points" in predictions:
+                predictions["world_points"] = predictions["world_points"][..., ::stride, ::stride, :]
+
+            if "images" in predictions:
+                img = predictions["images"]
+                if img.shape[-3] == 3 and img.shape[-1] != 3:
+                     img = img.permute(0, 2, 3, 1) # (S, 3, H, W) -> (S, H, W, 3)
+                predictions["images"] = img[..., ::stride, ::stride, :]
+                del img
 
             # --- PROCESS FEATURES ---
             raw_feats_list = predictions["view_feats"]
@@ -1634,9 +1646,9 @@ class VoxelUpdaterSystem(pl.LightningModule):
             
             with torch.enable_grad(): # (Keep grad enabled for inference/update parts if needed by model)
                 if not mst and t != 0:
-                    bev, mst, _, _ = self.inference(1, imgs, mst, Rmw, tmw, predictions)
+                    bev, mst, _, _ = self.inference(1, imgs, mst, Rmw, tmw_scaled, predictions, scale_factor)
                 else:
-                    bev, mst, _, _ = self.inference(t, imgs, mst, Rmw, tmw, predictions)
+                    bev, mst, _, _ = self.inference(t, imgs, mst, Rmw, tmw_scaled, predictions, scale_factor)
             
 
             # Validation Loss Calculation (No Autocast needed strictly, but good for consistency)
@@ -1723,10 +1735,18 @@ class VoxelUpdaterSystem(pl.LightningModule):
             fp_hallucination = (pred_fp > 0.0).sum()
             
             total_fp = fp_int + fp_hallucination
-            
-            occ_iou = tp / (tp + total_fp + fn + 1e-8)
-            metrics_buffer["occ_iou"].append(occ_iou.item())
+        
 
+
+            occ_iou = tp / (tp + total_fp + fn + 1e-8)
+            occ_recall = tp/ (tp + fn + 1e-8)
+            occ_precision = tp / (tp + total_fp + 1e-8)
+            occ_precision_inter = tp / (tp + fp_int + 1e-8)
+            metrics_buffer["occ_iou"].append(occ_iou.item())
+            metrics_buffer["occ_recall"].append(occ_recall.item())
+            metrics_buffer["occ_precision"].append(occ_precision.item())
+            metrics_buffer["occ_precision_inter"].append(occ_precision_inter.item())
+            
             # -------------------------------------------------------------
             # DUAL LOSS LOGIC END
             # -------------------------------------------------------------
@@ -1751,7 +1771,6 @@ class VoxelUpdaterSystem(pl.LightningModule):
                     loss_temp = F.smooth_l1_loss(logit_now, logit_prev, beta=0.1)
                     
 
-       
 
             # update buffers for next step
             self._prev_keys  = self.vox.keys.detach().clone()
@@ -1769,10 +1788,18 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
         # Average over sequence
         val_loss_total = val_loss_total_seq #/ max(T, 1)
-        avg_iou = sum(metrics_buffer["occ_iou"]) / len(metrics_buffer["occ_iou"]) if metrics_buffer["occ_iou"] else 0.0
 
         self.log("val_loss_total", val_loss_total, prog_bar=True, on_epoch=True, sync_dist=False)
-        self.log("val_metric/occ_iou", avg_iou, prog_bar=True, on_epoch=True, sync_dist=False)
+        
+        
+        
+        # 4. Log Averaged Metrics
+        self.log_dict({
+            "val_metric/occ_iou": self.get_avg(metrics_buffer,"occ_iou"),
+            "val_metric/occ_recall": self.get_avg(metrics_buffer,"occ_recall"),
+            "val_metric/occ_precision": self.get_avg(metrics_buffer,"occ_precision"),
+            "val_metric/occ_precision_inter": self.get_avg(metrics_buffer,"occ_precision_inter"),
+        }, prog_bar=True, on_epoch=True, sync_dist=False)
         
         return val_loss_total
     
@@ -2165,22 +2192,22 @@ def main():
     cfg = TrainConfig(
         # dataset_root="/Users/marvin/Documents/Thesis/repo/dataset_generation/habitat/",
         #dataset_root="/home/mpk40/Documents/data/",
-        dataset_root="/cluster/scratch/kochmar/renders/",
+        dataset_root="/cluster/scratch/kochmar/frames/",
         gt_voxels_file="gt_voxels_per_timestep_01_v2",
-        precomputed_cache_file="precomputed_cache_v2",
-        pose_file="gt_poses",
+        precomputed_cache_file="precomputed_cache",
+        pose_file="gt_poses_v2",
         seq_file="seq_manifest.json",
         voxel_size=0.2,
         radius_m=1,
         topk=8,
         temp=0.5,
-        feature_dim=64,
+        feature_dim=32,
         occ_decoder_hidden=64,
         lr=3e-4,
         max_epochs=200,
         batch_size=1,
         num_workers=4,
-        precision="32-true",
+        precision="bf16",
         skip=True,
         weight_decay=0.05,
         lambda_occ= 1.0,
