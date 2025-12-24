@@ -1658,7 +1658,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
             p_occ_tgt = torch.sigmoid(logit_gt * 10.0)
 
-            logit_pred_before = self.vox.decode_occupancy(with_xyz_cond=True)
+            logit_pred_before = self.vox.decode_occupancy(with_xyz_cond=False)
 
             if not torch.isfinite(logit_pred_before).all():
                 logit_pred_before = torch.nan_to_num(logit_pred_before, nan=0.001)
@@ -1819,7 +1819,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
         """
         # 1. Get Prediction Data
         # Decode occupancy
-        logit_pred = self.vox.decode_occupancy(with_xyz_cond=True)
+        logit_pred = self.vox.decode_occupancy(with_xyz_cond=False)
         prob_pred = torch.sigmoid(logit_pred)
 
         # Threshold (what the model thinks is a wall)
@@ -1923,6 +1923,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
         seq_id = batch["seq_id"]
         gt_root = os.path.join(self.cfg.dataset_root, self.cfg.gt_voxels_file)
         precomputed_root = os.path.join(self.cfg.dataset_root, self.cfg.precomputed_cache_file)
+        pose_root = os.path.join(self.cfg.dataset_root, self.cfg.pose_file)
 
         # Preload GT
         gt_seq = []
@@ -1936,9 +1937,20 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 vox_gt_t = None
             gt_seq.append(vox_gt_t)
             
+        d = np.load(os.path.join(pose_root, f"{seq_id}_t0000_align.npz"), allow_pickle=True)
+
+        
+        Rmw = d["Rmw"]   # (3,3) float32
+        tmw = d["tmw"]   # (3,)  float32
+        scale_factor = float(d["scale"])
+        Rmw = to_torch(Rmw, device=self.device)
+        tmw = to_torch(tmw, device=self.device)
+        tmw_scaled = tmw * scale_factor
+
         mst = False
-        Rmw = None
-        tmw = None
+        
+        bevs = []
+        bevs_gt = []
         for t in range(T):
             # #print(f"== Val Step {t} ==")
             imgs = batch["imgs_t"][t]
@@ -1954,22 +1966,31 @@ class VoxelUpdaterSystem(pl.LightningModule):
        
     
             predictions = torch.load(cache_path, map_location=self.device)
-            
+  
+            stride = 1 if t == 0 else self.cfg.stride
+
             if "world_points_conf" in predictions:
-                # Assuming shape is [N_views, H, W] or similar. 
-                # Grab the last two dimensions.
+                predictions["world_points_conf"] = predictions["world_points_conf"][..., ::stride, ::stride]
+
+                # Get NEW smaller target size (e.g. 128x128)
                 conf_tensor = predictions["world_points_conf"]
-                
-                # Handle list vs tensor
                 if isinstance(conf_tensor, list):
-                    # Take the first non-None frame
-                    ref_frame = next(item for item in conf_tensor if item is not None)
-                    target_hw = ref_frame.shape[-2:] # (H, W)
+                    ref = next((x for x in conf_tensor if x is not None), None)
+                    target_hw = ref.shape[-2:] if ref is not None else (128, 128)
                 else:
-                    target_hw = conf_tensor.shape[-2:] # (H, W)
+                    target_hw = conf_tensor.shape[-2:]
             else:
-                # Fallback if somehow missing (unlikely)
-                target_hw = (512, 512)
+                target_hw = (512 // stride, 512 // stride)
+
+            if "world_points" in predictions:
+                predictions["world_points"] = predictions["world_points"][..., ::stride, ::stride, :]
+
+            if "images" in predictions:
+                img = predictions["images"]
+                if img.shape[-3] == 3 and img.shape[-1] != 3:
+                     img = img.permute(0, 2, 3, 1) # (S, 3, H, W) -> (S, H, W, 3)
+                predictions["images"] = img[..., ::stride, ::stride, :]
+                del img
 
             # --- PROCESS FEATURES ---
             raw_feats_list = predictions["view_feats"]
@@ -1985,10 +2006,10 @@ class VoxelUpdaterSystem(pl.LightningModule):
             
             with torch.enable_grad(): # (Keep grad enabled for inference/update parts if needed by model)
                 if not mst and t != 0:
-                    bev, mst, _, _ = self.inference(1, imgs, mst, Rmw, tmw, predictions)
+                    bev, mst, _, _ = self.inference(1, imgs, mst, Rmw, tmw_scaled, predictions, scale_factor)
                 else:
-                    bev, mst, _, _ = self.inference(t, imgs, mst, Rmw, tmw, predictions)
-    
+                    bev, mst, _, _ = self.inference(t, imgs, mst, Rmw, tmw_scaled, predictions, scale_factor)
+            
     
 
             bev_spec = BevSpec(
@@ -2000,8 +2021,11 @@ class VoxelUpdaterSystem(pl.LightningModule):
             )
             
             bev_gt, meta = bev_from_voxels(self.vox_gt, bev_spec, include_free=True)
+            
+            bevs.append(bev)
+            bevs_gt.append(bev_gt)
         
-        return bev, bev_gt
+        return bevs, bevs_gt
 
         
         
@@ -2302,7 +2326,7 @@ def main():
         lr=3e-4,
         max_epochs=200,
         batch_size=1,
-        num_workers=4,
+        num_workers=2,
         precision="bf16",
         skip=True,
         weight_decay=0.05,
