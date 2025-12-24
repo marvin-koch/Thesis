@@ -1658,7 +1658,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
             p_occ_tgt = torch.sigmoid(logit_gt * 10.0)
 
-            logit_pred_before = self.vox.decode_occupancy(with_xyz_cond=True)
+            logit_pred_before = self.vox.decode_occupancy(with_xyz_cond=False)
 
             if not torch.isfinite(logit_pred_before).all():
                 logit_pred_before = torch.nan_to_num(logit_pred_before, nan=0.001)
