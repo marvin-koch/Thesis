@@ -258,13 +258,7 @@ class TorchSparseVoxelGrid:
                         idx_reset = idx_demote[not_occ_anymore]
                         # allow re-promotion
                         self.lt_promoted_flag[idx_reset] = 0
-                        # you may also want to soften historical evidence:
-                        # keep occ_epoch_count/view_bits_cum, or decay them:
-                        # self.occ_epoch_count[idx_reset] = torch.clamp(
-                        #     self.occ_epoch_count[idx_reset] - 1, min=0)
-                        # self.view_bits_cum[idx_reset] = 0
-                        # (choose policy you prefer)
-
+                       
         # 2) increment epoch index
         self.epoch += 1
 
@@ -317,7 +311,6 @@ class TorchSparseVoxelGrid:
         # --- NEW: mark seen this epoch for epoch-based promotion ---
         self.seen_occ_epoch[idx] = torch.tensor(self.epoch, dtype=self.seen_occ_epoch.dtype, device=self.device)
 
-        # NOTE: old "promote by pos_occ_count" removed; promotion happens in next_epoch()
 
     def _update_free_guarded_(self, idx: torch.Tensor):
         if idx.numel() == 0: return
@@ -345,84 +338,6 @@ class TorchSparseVoxelGrid:
                 torch.full_like(idx_carve, self.p.lt_free_scale * self.p.free_inc, dtype=self.vals_lt.dtype))
             self.vals_lt.clamp_(min=self.p.l_min, max=self.p.l_max)
 
-
-
-    # # ---------- integration (vectorized) ----------
-    # @torch.no_grad()
-    # def integrate_frame_torch(
-    #     self,
-    #     points_world: torch.Tensor,     # (N,3)
-    #     cam_center_world: torch.Tensor, # (3,)
-    #     *,
-    #     carve_free: bool = True,
-    #     max_range: float | None = 12.0,
-    #     z_clip: Tuple[float,float] | None = (-float('inf'), float('inf')),
-    #     ray_stride: int = 3,
-    #     max_free_rays: int | None = 40000,
-    #     samples_per_voxel: float = 1.05,
-    # ):
-    #     if points_world.numel() == 0:
-    #         return
-    #     dev, dt = self.device, self.dtype
-    #     pts = points_world.to(dev, dt)
-    #     cam = cam_center_world.to(dev, dt).reshape(1,3)
-
-    #     finite = torch.isfinite(pts).all(dim=1)
-    #     pts = pts[finite]
-    #     if pts.numel() == 0: return
-
-    #     if max_range is not None:
-    #         d = torch.linalg.norm(pts - cam, dim=1)
-    #         pts = pts[d <= max_range]
-    #     if z_clip is not None:
-    #         z0, z1 = z_clip
-    #         m = (pts[:,2] >= z0) & (pts[:,2] <= z1)
-    #         pts = pts[m]
-    #     if pts.numel() == 0: return
-
-    #     # Occupied endpoints
-    #     ijk_occ = self._world_to_ijk(pts)
-    #     keys_occ = torch.unique(self._hash_ijk(ijk_occ))
-    #     idx_occ = self._ensure_and_index(keys_occ)
-    #     self._update_occupied_guarded_(idx_occ, cam_center_world)
-
-    #     if not carve_free:
-    #         self.vals = self._display_vals(); return
-
-    #     # Free carving by sampled points along rays
-    #     pts_free = pts[::ray_stride] if ray_stride > 1 else pts
-    #     if (max_free_rays is not None) and (pts_free.shape[0] > max_free_rays):
-    #         ridx = torch.randperm(pts_free.shape[0], device=dev)[:max_free_rays]
-    #         pts_free = pts_free[ridx]
-    #     if pts_free.numel() == 0:
-    #         self.vals = self._display_vals(); return
-
-    #     vec = pts_free - cam
-    #     seg_len = torch.linalg.norm(vec, dim=1)
-    #     steps_per_ray = torch.clamp((seg_len / self.p.voxel_size * samples_per_voxel).ceil().to(torch.int32), min=1)
-    #     max_steps = int(steps_per_ray.max().item())
-
-    #     base = torch.arange(max_steps, device=dev, dtype=dt) + 0.5
-    #     t = base[None, :] / steps_per_ray.to(dt)[:, None]
-    #     t = torch.minimum(t,
-    #         torch.nextafter(torch.tensor(1.0, device=dev, dtype=dt),
-    #                         torch.tensor(0.0, device=dev, dtype=dt)))
-    #     mask = (t < 1.0)
-    #     samples = cam + t.unsqueeze(-1) * vec.unsqueeze(1)
-    #     samples = samples[mask]
-
-    #     ijk_free = self._world_to_ijk(samples)
-    #     keys_free = self._hash_ijk(ijk_free)
-    #     # exclude endpoint voxels
-    #     if keys_occ.numel() > 0 and keys_free.numel() > 0:
-    #         keep = ~torch.isin(keys_free, keys_occ)
-    #         keys_free = keys_free[keep]
-    #     if keys_free.numel() > 0:
-    #         keys_free = torch.unique(keys_free)
-    #         idx_free = self._ensure_and_index(keys_free)
-    #         self._update_free_guarded_(idx_free)
-
-    #     self.vals = self._display_vals()
 
     @torch.no_grad()
     def integrate_points_with_cameras(

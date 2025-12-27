@@ -35,13 +35,10 @@ from preprocess_images.filter_images import changed_images
 import os, shutil, json
 
 # --- crash-safe profiling helpers ---
-import traceback
-from torch.profiler import profile, ProfilerActivity
-import gc
+
 import torch.serialization as serialization
 import argparse
 
-import wandb
 from pytorch_lightning.loggers import WandbLogger
 
 serialization.add_safe_globals([argparse.Namespace])
@@ -249,121 +246,6 @@ class VoxelUpdaterSystem(pl.LightningModule):
         proj = proj.permute(1, 2, 0) 
         return proj
     
-    def align_to_gt_centroid(self,src_pts, tgt_grid, device):
-        """
-        Aligns using Median and MAD. Robust to 'blobs' of noise that shift the Mean.
-        """
-        if tgt_grid.keys.numel() == 0:
-            return src_pts
-
-        # 1. Get GT Points
-        tgt_ijk = tgt_grid._unhash_keys(tgt_grid.keys)
-        tgt_pts = (tgt_grid.origin + (tgt_ijk.float() + 0.5) * float(tgt_grid.p.voxel_size)).float()
-
-        # 2. Get Pred Points
-        src_flat = src_pts.reshape(-1, 3)
-        src_valid = src_flat[torch.isfinite(src_flat).all(dim=1)].float()
-
-        if src_valid.numel() == 0: return src_pts
-
-        # --- ROBUST ALIGNMENT (Median) ---
-        # 3. Center: Use Median instead of Mean (ignores outlier blobs)
-        src_center = src_valid.median(dim=0).values
-        tgt_center = tgt_pts.median(dim=0).values
-
-        # 4. Scale: Use Median Absolute Deviation (MAD)
-        #    (Standard Deviation is heavily skewed by far outliers)
-        src_dist = torch.norm(src_valid - src_center, dim=1)
-        tgt_dist = torch.norm(tgt_pts - tgt_center, dim=1)
-
-        src_mad = src_dist.median()
-        tgt_mad = tgt_dist.median()
-
-        scale_fix = (tgt_mad / (src_mad + 1e-8)).item()
-
-        print(f"[Align] Robust Scale: {scale_fix:.3f}")
-
-        # 5. Apply
-        aligned_pts = (src_pts - src_center) * scale_fix + tgt_center
-
-        return aligned_pts
-    
-    def align_icp(self, pred_pts, gt_grid, device, max_iters=10):
-        """
-        Refines alignment using ICP.
-        strictly enforces float32 to avoid SVD crashes in BF16 mode.
-        """
-        if gt_grid.keys.numel() == 0:
-            return pred_pts
-
-        # 1. Disable Autocast to prevent SVD errors
-        with torch.cuda.amp.autocast(enabled=False):
-            
-            # 2. Prepare GT (Force Float32)
-            gt_ijk = gt_grid._unhash_keys(gt_grid.keys)
-            gt_origin = gt_grid.origin.float() # Ensure origin is float32
-            gt_pts = gt_origin + (gt_ijk.float() + 0.5) * float(gt_grid.p.voxel_size)
-            
-            # 3. Prepare Source (Force Float32)
-            # We keep a mask to map back later
-            src_raw = pred_pts.reshape(-1, 3)
-            mask = torch.isfinite(src_raw).all(dim=1)
-            src = src_raw[mask].float()  # <--- Crucial cast
-            
-            if src.shape[0] == 0: 
-                return pred_pts
-
-            # Subsample for speed
-            if src.shape[0] > 10000:
-                perm = torch.randperm(src.shape[0], device=device)[:10000]
-                cur_src = src[perm].clone() # Already float32
-            else:
-                cur_src = src.clone()
-
-            full_src = src.clone()
-            
-            # 4. ICP Loop
-            for i in range(max_iters):
-                # A. Nearest Neighbors
-                # (Both inputs are float32, so dists is float32)
-                dists = torch.cdist(cur_src, gt_pts) 
-                min_vals, min_idxs = torch.min(dists, dim=1)
-                
-                valid_pairs = min_vals < 0.20
-                if valid_pairs.sum() < 100:
-                    break
-                    
-                p = cur_src[valid_pairs]
-                q = gt_pts[min_idxs[valid_pairs]]
-                
-                # B. Procrustes (Covariance)
-                mu_p = p.mean(dim=0)
-                mu_q = q.mean(dim=0)
-                
-                # H will strictly be float32 now
-                H = (p - mu_p).T @ (q - mu_q)
-                
-                # C. SVD (Safe on float32)
-                U, _, Vt = torch.linalg.svd(H)
-                R = Vt.T @ U.T
-                
-                if torch.det(R) < 0:
-                    Vt[2, :] *= -1
-                    R = Vt.T @ U.T
-                    
-                # D. Apply Rotation
-                cur_src = (cur_src - mu_p) @ R.T + mu_q
-                full_src = (full_src - mu_p) @ R.T + mu_q
-
-            # 5. Cast back to original dtype (BFloat16) for the rest of the network
-            original_dtype = pred_pts.dtype
-            out = torch.full_like(pred_pts, float('nan'))
-            out_flat = out.reshape(-1, 3)
-            
-            # Place the float32 results back, casting them to bf16
-            out_flat[mask] = full_src.to(original_dtype)
-            
-            return out.reshape(pred_pts.shape)
 
     def inference(self, i, imgs, mst, Rmw=None, tmw=None, predictions=None, scale_factor=None):
 
@@ -888,7 +770,6 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 total_norm += p.grad.detach().norm(2).item() ** 2
         return total_norm ** 0.5
     
-    
 
     
     def training_step(self, batch: Dict, batch_idx: int):
@@ -1401,56 +1282,6 @@ class VoxelUpdaterSystem(pl.LightningModule):
         if sch is not None:
             sch.step()
             
-    def get_avg(self, metrics_buffer, name):
-        vals = metrics_buffer[name]
-        return sum(vals) / len(vals) if len(vals) > 0 else 0.0
-    # -----------------------------------------------------------
-    # ===> PASTE THIS FUNCTION HERE inside VoxelUpdaterSystem <===
-    # -----------------------------------------------------------
-    def on_load_checkpoint(self, checkpoint):
-        state_dict = checkpoint["state_dict"]
-        # Check if the checkpoint contains voxel keys
-        if "vox.keys" in state_dict:
-            saved_keys = state_dict["vox.keys"]
-            target_size = saved_keys.shape[0]
-            current_size = self.vox.keys.shape[0]
-
-            if target_size != current_size:
-                #print(f"[Checkpoint Load] Resizing voxel grid buffers from {current_size} to {target_size}...")
-
-                # List of all sparse buffers in your VoxelGrid
-                buffer_names = [
-                    "keys", "vals_st", "vals_lt", "vals",
-                    "hit_count", "pos_occ_count", "neg_free_count",
-                    "last_occ_epoch", "last_free_epoch", "view_bits",
-                    "seen_occ_epoch", "seen_view_bits_e", "occ_epoch_count",
-                    "view_bits_cum", "lt_promoted_flag"
-                ]
-
-                # Resize every buffer to match the checkpoint shape
-                for name in buffer_names:
-                    full_key = f"vox.{name}"
-                    if full_key in state_dict:
-                        saved_tensor = state_dict[full_key]
-                        current_buffer = getattr(self.vox, name)
-
-                        # Create a new zero-tensor with the shape from checkpoint
-                        new_buffer = torch.zeros(
-                            saved_tensor.shape,
-                            dtype=current_buffer.dtype,
-                            device=self.device
-                        )
-                        setattr(self.vox, name, new_buffer)
-
-                # Resize Latents
-                if "vox.z_latent" in state_dict:
-                    saved_z = state_dict["vox.z_latent"]
-                    self.vox.z_latent = torch.zeros(
-                        saved_z.shape,
-                        dtype=self.vox.z_latent.dtype,
-                        device=self.device
-                    )
-    
     
     def validation_step(self, batch: Dict, batch_idx: int):
         device = self.device
@@ -1811,96 +1642,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
         
         return val_loss_total
     
-    
-    def export_debug_ply(self, filename, step_idx):
-        """
-        Exports the current State vs GT to a color-coded PLY file.
-        Green = Correct Wall
-        Red   = False Positive (Ghost)
-        Blue  = False Negative (Missed Wall)
-        """
-        # 1. Get Prediction Data
-        # Decode occupancy
-        logit_pred = self.vox.decode_occupancy(with_xyz_cond=False)
-        prob_pred = torch.sigmoid(logit_pred)
 
-        # Threshold (what the model thinks is a wall)
-        mask_pred_occ = prob_pred > 0.5
-        keys_pred = self.vox.keys[mask_pred_occ]
-
-        # 2. Get GT Data
-        # Ensure we are looking at the same coordinate system
-        # (Assuming self.vox_gt is already loaded for this timestep)
-        logit_gt = self.vox_gt.vals_st
-        prob_gt = torch.sigmoid(logit_gt * 10.0) # Sharp GT
-        mask_gt_occ = prob_gt > 0.5
-        keys_gt = self.vox_gt.keys[mask_gt_occ]
-
-        if keys_pred.numel() == 0 and keys_gt.numel() == 0:
-            return
-
-        # 3. Find Intersection (True Positives)
-        # We use the unique keys logic
-        # Note: keys are int64 hashes
-
-        # Convert to sets for easy set logic (fast enough for <100k voxels)
-        # OR use tensor logic if strictly needed, but CPU set is easier for debug
-        set_pred = set(keys_pred.detach().cpu().numpy().tolist())
-        set_gt   = set(keys_gt.detach().cpu().numpy().tolist())
-
-        tp_keys = list(set_pred & set_gt)
-        fp_keys = list(set_pred - set_gt)
-        fn_keys = list(set_gt - set_pred)
-
-        # 4. Collect Points and Colors
-        all_points = []
-        all_colors = []
-        
-          # Helper to unhash and move to numpy
-        def process_keys(k_list, color):
-            if not k_list: return
-            k_tensor = torch.tensor(k_list, dtype=torch.int64, device=self.device)
-            xyz = self.vox._unhash_keys(k_tensor).float()
-            # Convert grid coords to world coords
-            xyz = self.vox.origin + (xyz + 0.5) * self.vox.p.voxel_size
-
-            pts = xyz.detach().cpu().numpy()
-            cols = np.tile(np.array(color), (pts.shape[0], 1))
-
-            all_points.append(pts)
-            all_colors.append(cols)
-
-        # GREEN for Match
-        process_keys(tp_keys, [0, 255, 0])
-        # RED for Ghost
-        process_keys(fp_keys, [255, 0, 0])
-        # BLUE for Missed
-        process_keys(fn_keys, [0, 0, 255])
-
-        if not all_points:
-            return
-
-        # 5. Concatenate and Write PLY
-        pts_final = np.concatenate(all_points, axis=0)
-        col_final = np.concatenate(all_colors, axis=0)
-
-        header = f"""ply
-        format ascii 1.0
-        element vertex {pts_final.shape[0]}
-        property float x
-        property float y
-        property float z
-        property uchar red
-        property uchar green
-        property uchar blue
-        end_header
-        """
-        with open(filename, "w") as f:
-            f.write(header)
-            for p, c in zip(pts_final, col_final):
-                f.write(f"{p[0]:.4f} {p[1]:.4f} {p[2]:.4f} {int(c[0])} {int(c[1])} {int(c[2])}\n")
-
-        print(f"Saved debug PLY: {filename}")
 
     def predict_step(self, batch: Dict, batch_idx: int, dataloader_idx: int = 0):
         device = self.device
@@ -2029,7 +1771,147 @@ class VoxelUpdaterSystem(pl.LightningModule):
         
         return bevs, bevs_gt
 
+
+    def on_load_checkpoint(self, checkpoint):
+        state_dict = checkpoint["state_dict"]
+        # Check if the checkpoint contains voxel keys
+        if "vox.keys" in state_dict:
+            saved_keys = state_dict["vox.keys"]
+            target_size = saved_keys.shape[0]
+            current_size = self.vox.keys.shape[0]
+
+            if target_size != current_size:
+                #print(f"[Checkpoint Load] Resizing voxel grid buffers from {current_size} to {target_size}...")
+
+                # List of all sparse buffers in your VoxelGrid
+                buffer_names = [
+                    "keys", "vals_st", "vals_lt", "vals",
+                    "hit_count", "pos_occ_count", "neg_free_count",
+                    "last_occ_epoch", "last_free_epoch", "view_bits",
+                    "seen_occ_epoch", "seen_view_bits_e", "occ_epoch_count",
+                    "view_bits_cum", "lt_promoted_flag"
+                ]
+
+                # Resize every buffer to match the checkpoint shape
+                for name in buffer_names:
+                    full_key = f"vox.{name}"
+                    if full_key in state_dict:
+                        saved_tensor = state_dict[full_key]
+                        current_buffer = getattr(self.vox, name)
+
+                        # Create a new zero-tensor with the shape from checkpoint
+                        new_buffer = torch.zeros(
+                            saved_tensor.shape,
+                            dtype=current_buffer.dtype,
+                            device=self.device
+                        )
+                        setattr(self.vox, name, new_buffer)
+
+                # Resize Latents
+                if "vox.z_latent" in state_dict:
+                    saved_z = state_dict["vox.z_latent"]
+                    self.vox.z_latent = torch.zeros(
+                        saved_z.shape,
+                        dtype=self.vox.z_latent.dtype,
+                        device=self.device
+                    )
         
+    def get_avg(self, metrics_buffer, name):
+        vals = metrics_buffer[name]
+        return sum(vals) / len(vals) if len(vals) > 0 else 0.0
+    
+    
+     
+    def export_debug_ply(self, filename, step_idx):
+        """
+        Exports the current State vs GT to a color-coded PLY file.
+        Green = Correct Wall
+        Red   = False Positive (Ghost)
+        Blue  = False Negative (Missed Wall)
+        """
+        # 1. Get Prediction Data
+        # Decode occupancy
+        logit_pred = self.vox.decode_occupancy(with_xyz_cond=False)
+        prob_pred = torch.sigmoid(logit_pred)
+
+        # Threshold (what the model thinks is a wall)
+        mask_pred_occ = prob_pred > 0.5
+        keys_pred = self.vox.keys[mask_pred_occ]
+
+        # 2. Get GT Data
+        # Ensure we are looking at the same coordinate system
+        # (Assuming self.vox_gt is already loaded for this timestep)
+        logit_gt = self.vox_gt.vals_st
+        prob_gt = torch.sigmoid(logit_gt * 10.0) # Sharp GT
+        mask_gt_occ = prob_gt > 0.5
+        keys_gt = self.vox_gt.keys[mask_gt_occ]
+
+        if keys_pred.numel() == 0 and keys_gt.numel() == 0:
+            return
+
+        # 3. Find Intersection (True Positives)
+        # We use the unique keys logic
+        # Note: keys are int64 hashes
+
+        # Convert to sets for easy set logic (fast enough for <100k voxels)
+        # OR use tensor logic if strictly needed, but CPU set is easier for debug
+        set_pred = set(keys_pred.detach().cpu().numpy().tolist())
+        set_gt   = set(keys_gt.detach().cpu().numpy().tolist())
+
+        tp_keys = list(set_pred & set_gt)
+        fp_keys = list(set_pred - set_gt)
+        fn_keys = list(set_gt - set_pred)
+
+        # 4. Collect Points and Colors
+        all_points = []
+        all_colors = []
+        
+          # Helper to unhash and move to numpy
+        def process_keys(k_list, color):
+            if not k_list: return
+            k_tensor = torch.tensor(k_list, dtype=torch.int64, device=self.device)
+            xyz = self.vox._unhash_keys(k_tensor).float()
+            # Convert grid coords to world coords
+            xyz = self.vox.origin + (xyz + 0.5) * self.vox.p.voxel_size
+
+            pts = xyz.detach().cpu().numpy()
+            cols = np.tile(np.array(color), (pts.shape[0], 1))
+
+            all_points.append(pts)
+            all_colors.append(cols)
+
+        # GREEN for Match
+        process_keys(tp_keys, [0, 255, 0])
+        # RED for Ghost
+        process_keys(fp_keys, [255, 0, 0])
+        # BLUE for Missed
+        process_keys(fn_keys, [0, 0, 255])
+
+        if not all_points:
+            return
+
+        # 5. Concatenate and Write PLY
+        pts_final = np.concatenate(all_points, axis=0)
+        col_final = np.concatenate(all_colors, axis=0)
+
+        header = f"""ply
+        format ascii 1.0
+        element vertex {pts_final.shape[0]}
+        property float x
+        property float y
+        property float z
+        property uchar red
+        property uchar green
+        property uchar blue
+        end_header
+        """
+        with open(filename, "w") as f:
+            f.write(header)
+            for p, c in zip(pts_final, col_final):
+                f.write(f"{p[0]:.4f} {p[1]:.4f} {p[2]:.4f} {int(c[0])} {int(c[1])} {int(c[2])}\n")
+
+        print(f"Saved debug PLY: {filename}")
+    
         
 # dataset_auto.py
 import os, re, random
