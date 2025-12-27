@@ -1274,6 +1274,7 @@ def filter_frames(
 
 
 
+
     # ---- Flatten & gather only valid entries ----
     # Use reshape (contiguous-safe) after ensuring contiguous memory where needed
     P_all = P.reshape(S * H * W, 3)
@@ -1817,7 +1818,7 @@ def build_maps_from_latent_features(
     # new (optional) tuning/throughput controls:
     device: str = "cpu",
 
-    batch_chunk_points: int | None = None,  # e.g., 2_000_000 to limit RAM
+    batch_chunk_points: int = 500000,  # e.g., 2_000_000 to limit RAM
     frame_ids: Optional[torch.Tensor] = None,  # NEW
     radius=0.25,
 
@@ -1827,7 +1828,7 @@ def build_maps_from_latent_features(
     if frame_ids is not None:
         # All points are already concatenated
         pts = frames_xyz[0]
-        print(len(pts))
+        print("Beg", len(pts))
         # Expand camera centers by frame_ids
         CONF_all = conf_map[0]
         
@@ -1837,7 +1838,7 @@ def build_maps_from_latent_features(
         keep = torch.isfinite(pts).all(dim=1) & torch.isfinite(cameras).all(dim=1) & torch.isfinite(CONF_all)
 
         pts = pts[keep]
-        print(len(pts))
+        print("Keep finite", len(pts))
         CONF_all = CONF_all[keep]
         fts = F_all[keep]
         cameras = cameras[keep]
@@ -1995,8 +1996,29 @@ def rotate_points(points, R, t):
     return result
 
 
+def _to_numpy_float32(x):
+    # torch Tensor -> numpy float32 (CPU)
+    if torch.is_tensor(x):
+        x = x.detach()
+        if x.is_cuda:
+            x = x.cpu()
+        # convert half/bf16 to float32 so numpy+matplotlib can handle it
+        if x.dtype in (torch.bfloat16, torch.float16, torch.float32, torch.float64):
+            x = x.float()  # float32
+        else:
+            x = x.float()
+        return x.numpy()
+
+    # numpy/array-like -> numpy float32
+    x = np.asarray(x)
+    if x.dtype != np.float32:
+        x = x.astype(np.float32, copy=False)
+    return x
+
 def save_bev_png(bev: np.ndarray, meta: dict, path: str = "bev.png"):
     """Save the BEV to a PNG with axes in meters."""
+    bev = _to_numpy_float32(bev)  # ✅ convert here
+
     H, W = bev.shape
     res = float(meta.get("resolution", 0.10))
     ox, oy = meta.get("origin_xy", (0.0, 0.0))
@@ -2014,6 +2036,8 @@ def save_bev_png(bev: np.ndarray, meta: dict, path: str = "bev.png"):
 
 def save_bev(bev: np.ndarray, meta: dict, png_path="bev.png", npy_path="bev.npy", meta_path="bev_meta.json"):
     # keep your current PNG
+    bev = _to_numpy_float32(bev)  # ✅ convert once
+
     save_bev_png(bev, meta, png_path)
     # save raw values + metadata for evaluation
     np.save(npy_path, bev)

@@ -2,14 +2,15 @@
 import os
 import torch
 import pytorch_lightning as pl
-from voxel.utils import *
+
 
 from train import TrainConfig, HabitatDataModule, VoxelUpdaterSystem
+from voxel.utils import *
 
 
 def main():
-    ckpt_path = "/cluster/scratch/kochmar/checkpoints/voxup-epoch=03-val_loss_total=5.8081.ckpt"
-    out_dir = "/cluster/scratch/kochmar/predict_outputs"
+    ckpt_path = "/cluster/scratch/kochmar/checkpoints/full/voxup-epoch=07-val_loss_total=12.8810.ckpt"
+    out_dir = "/cluster/scratch/kochmar/predict_outputs/"
     os.makedirs(out_dir, exist_ok=True)
 
     # IMPORTANT: cfg must match what the checkpoint expects (feature_dim, voxel_size, etc.)
@@ -28,7 +29,7 @@ def main():
         lr=3e-4,
         max_epochs=200,
         batch_size=1,
-        num_workers=2,
+        num_workers=0,
         precision="bf16",
         skip=True,
         weight_decay=0.05,

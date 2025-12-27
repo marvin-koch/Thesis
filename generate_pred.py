@@ -78,11 +78,11 @@ def precompute():
         mst = False
 
         for i in range(T):
-            if i % 10 != 0:
+            if i % 5 != 0:
                 continue
 
             save_path = os.path.join(seq_dir, f"t{i:04d}.pt")
-            if os.path.exists(save_path):
+            if os.path.exists(save_path) and i != 0 and i != 5:
                 print("Skip, already exists")
                 #PUT THIS BACK
                 #continue

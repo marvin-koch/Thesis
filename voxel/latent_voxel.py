@@ -70,7 +70,7 @@ class FeatureVoxelSimilarity(nn.Module):
     This allows the network to LEARN the valid spatial radius based on feature context.
     It can learn to tolerate misalignment if feature similarity is high.
     """
-    def __init__(self, feat_dim: int, hidden_dim: int = 64, pe_bands: int = 4):
+    def __init__(self, feat_dim: int, hidden_dim: int = 16, pe_bands: int = 4):
         super().__init__()
 
         self.pe_bands = pe_bands
@@ -131,7 +131,7 @@ class FeatureVoxelSimilarity(nn.Module):
 
 class FeatureVoxelSimilarity2(nn.Module):
 
-    def __init__(self, feat_dim: int, proj_dim: int = 16, use_cosine: bool = True):
+    def __init__(self, feat_dim: int, proj_dim: int = 32, use_cosine: bool = True):
         super().__init__()
         # use bias=False so projections are pure linear embeddings
         self.f_proj = nn.Linear(feat_dim, proj_dim, bias=False)
@@ -398,7 +398,7 @@ class LatentVoxelGrid(nn.Module):
 
         # routing controls
         self.routing_tau: float = 0.5   # temperature for softmax
-        self.routing_topk: int = 16      # voxels per point (after radius prefilter)
+        self.routing_topk: int = 16     # voxels per point (after radius prefilter)
         
         
         self.decoder = LatentToOccupancyDecoder(feature_dim, cond=None)
@@ -793,7 +793,7 @@ class LatentVoxelGrid(nn.Module):
             r_vox = int(math.ceil(radius / max(vox, 1e-8))) + int(neighbor_pad)
             r_vox = min(r_vox, int(r_vox_cap))
             K_ball_bound = (2 * r_vox + 1) ** 3
-            K_ball_cap   = 16
+            K_ball_cap   = 32
             K_ball = min(M, K_ball_bound, K_ball_cap)
         else:
             K_ball = 0
@@ -829,6 +829,7 @@ class LatentVoxelGrid(nn.Module):
         j_idx = torch.cat(all_j_parts, dim=0)
         h = (i_idx.to(torch.int64) << 32) | j_idx.to(torch.int64)
         h_u = torch.unique(h)
+
         i_idx = (h_u >> 32).to(torch.long)
         j_idx = (h_u & ((1 << 32) - 1)).to(torch.long)
         idx_upd = got_mass.nonzero(as_tuple=False).squeeze(-1)  # touched voxels (U,)
@@ -863,10 +864,9 @@ class LatentVoxelGrid(nn.Module):
 
        
         
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
 
             # 3) sim
-            sim_flat = self.sim_net(f_sel, z_sel, delta)
+        sim_flat = self.sim_net(f_sel, z_sel, delta)
             # sim_flat = fast_sim_mlp_pairs(self.sim_net, i_idx, j_idx, f_proj_all, self.z_latent, delta)
         #torch.cuda.synchronize()
 
@@ -1013,6 +1013,9 @@ class LatentVoxelGrid(nn.Module):
             z_new = torch.nan_to_num(z_new, nan=0.0, posinf=0.0, neginf=0.0)
 
         self.z_latent.index_copy_(0, idx_upd, z_new)
+
+        del f_sel, z_sel, u_sel, sim_flat, f_pts, pts_world, z_new, sim_flat_f32
+        torch.cuda.empty_cache()
             
             # self.z_latent = self.gru_cell(x_in, self.z_latent)
         #torch.cuda.synchronize()
@@ -1217,6 +1220,99 @@ class LatentVoxelGrid(nn.Module):
         else:
             return self.decoder(self.z_latent, None) * t
 
+    @torch.no_grad()
+    def to_bev(
+        self,
+        x_range: tuple[float, float],
+        y_range: tuple[float, float],
+        res_xy: float,
+        z_min: float,
+        z_max: float,
+        agg: str = "max",
+        with_xyz_cond: bool = False,
+        occ_thresh: float = 0.5,  # Threshold for Occupied vs Free
+    ) -> tuple[np.ndarray, dict]:
+        """
+        Produce a BEV occupancy grid compatible with standard utils.
+        Returns:
+          bev: (Hy, Hx) numpy int8 array with values {-1, 0, 100}
+          meta: dict with origin/resolution for plotting
+        """
+        # 1. Setup Grid Dimensions
+        x0, x1 = x_range
+        y0, y1 = y_range
+        Hx = int((x1 - x0) / res_xy)
+        Hy = int((y1 - y0) / res_xy)
+
+        # Initialize with -1.0 to represent 'Unknown' (standard convention)
+        bev = torch.full((Hy, Hx), -1.0, device=self.device, dtype=torch.float32)
+        meta = {"x0": x0, "y0": y0, "res": res_xy, "width": Hx, "height": Hy}
+
+        # 2. Get Centers & Decode Probabilities
+        centers = self.voxel_centers()
+        if centers.numel() == 0:
+            return np.full((Hy, Hx), -1, dtype=np.int8), meta
+
+        z = centers[:, 2]
+        z_mask = (z >= z_min) & (z <= z_max)
+        if not z_mask.any():
+            return np.full((Hy, Hx), -1, dtype=np.int8), meta
+
+        centers = centers[z_mask]
+        z_lat = self.z_latent[z_mask]
+
+        # Decode: z_latent -> probability [0.0, 1.0]
+        probs = self.decoder(z_lat, centers if with_xyz_cond else None)
+        probs = torch.sigmoid(probs)
+
+        # 3. Project to Grid
+        gx = ((centers[:, 0] - x0) / res_xy).floor().to(torch.long)
+        gy = ((centers[:, 1] - y0) / res_xy).floor().to(torch.long)
+
+        keep = (gx >= 0) & (gx < Hx) & (gy >= 0) & (gy < Hy)
+        gx, gy, probs = gx[keep], gy[keep], probs[keep]
+
+        if probs.numel() == 0:
+            return np.full((Hy, Hx), -1, dtype=np.int8), meta
+
+        # 4. Rasterize
+        idx = gy * Hx + gx
+        flat = bev.view(-1)
+
+        if agg == "max":
+            # scatter_reduce 'amax' updates -1.0 with higher probabilities (0.0 to 1.0)
+            flat.scatter_reduce_(0, idx, probs, reduce="amax", include_self=True)
+        elif agg == "mean":
+            # For mean, we need a separate zero-initialized buffer
+            flat_sum = torch.zeros_like(flat)
+            flat_cnt = torch.zeros_like(flat)
+            flat_sum.scatter_add_(0, idx, probs)
+            flat_cnt.scatter_add_(0, idx, torch.ones_like(probs))
+
+            # Write means into bev, leaving untouched as -1.0
+            mask = flat_cnt > 0
+            flat[mask] = flat_sum[mask] / flat_cnt[mask]
+        else:
+            raise ValueError("agg must be 'max' or 'mean'")
+
+        # 5. Convert to Standard Integer Format (-1, 0, 100)
+        bev_np = bev.cpu().numpy()
+        out_map = np.full_like(bev_np, -1, dtype=np.int8)
+
+        # Identify cells that were updated (value > -0.5)
+        # Note: Valid probabilities are >= 0.0. Unknowns are -1.0.
+        known_mask = bev_np > -0.5
+
+        # Apply Thresholds
+        occupied_mask = (bev_np > occ_thresh) & known_mask
+        free_mask = (bev_np <= occ_thresh) & known_mask
+
+        out_map[free_mask] = 0       # Free
+        out_map[occupied_mask] = 100 # Occupied
+
+        return out_map, meta
+
+    """
     # --- rasterize to 2D BEV occupancy ---
     @torch.no_grad()
     def to_bev(
@@ -1229,13 +1325,8 @@ class LatentVoxelGrid(nn.Module):
         agg: str = "max",
         with_xyz_cond: bool = False,
     ) -> tuple[torch.Tensor, dict]:
-        """
-        Produce a BEV occupancy grid by aggregating decoded voxel probs in a Z band.
 
-        Returns:
-          bev: (Hy, Hx) float in [0,1]
-          meta: dict with origin/resolution for plotting
-        """
+
         centers = self.voxel_centers()
         if centers.numel() == 0:
             Hx = int((x_range[1]-x_range[0]) / res_xy)
@@ -1287,6 +1378,7 @@ class LatentVoxelGrid(nn.Module):
             raise ValueError("agg must be 'max' or 'mean'")
 
         return bev, {"x0": x0, "y0": y0, "res": res_xy}
+    """
 
 
 

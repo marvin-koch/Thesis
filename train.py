@@ -81,7 +81,9 @@ def load_sparse_voxel_grid(path, device):
     )
     vox_gt.keys = keys
     vox_gt.vals_st = vals
+    vox_gt.vals_lt = vals
     vox_gt.vals = vals
+
 
     return vox_gt
 
@@ -182,9 +184,9 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
         self.automatic_optimization = False   # <<< add this
         
-        self.bev_window_m=(10.0, 10.0)
-        self.bev_origin_xy=(-2.0, -2.0)
-        self.z_band_bev=(0.02, 0.8)
+        self.bev_window_m=(100.0, 100.0)
+        self.bev_origin_xy=(-15.0, -15.0)
+        self.z_band_bev=(0.02, 10)
 
         self.fp_weight = 0.0
 
@@ -585,7 +587,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
             bev_window_m=self.bev_window_m, # local 20x20 m
             bev_origin_xy=self.bev_origin_xy,
             z_clip_vox=(-np.inf, np.inf),
-            z_band_bev=self.z_band_bev,
+            z_band_bev=(self.z_band_bev[0]-100, self.z_band_bev[1]+100),
             frame_ids=frame_ids,
             radius= self.cfg.radius_m
         )
@@ -947,7 +949,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
         for t in range(T):
             if self.cfg.skip:
-                t = t*10 # Adjust indexing if skipping
+                t = t*5 # Adjust indexing if skipping
             
             gt_path = os.path.join(gt_root, f"{seq_id}_t{t:04d}_gt.npz")
             print(gt_path)
@@ -981,7 +983,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
             
             
            
-            p = t *10
+            p = t *5
             cache_path = os.path.join(precomputed_root, seq_id, f"t{p:04d}.pt")
             if not os.path.exists(cache_path):
                 print("Missing cache:", cache_path)
@@ -1490,7 +1492,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
         gt_seq = []
         for t in range(T):
             if self.cfg.skip:
-                t = t * 10
+                t = t * 5
             gt_path = os.path.join(gt_root, f"{seq_id}_t{t:04d}_gt.npz")
             if os.path.exists(gt_path):
                 vox_gt_t = load_sparse_voxel_grid(gt_path, device)
@@ -1522,7 +1524,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
             if self.vox_gt is None:
                 continue
             
-            p = t *10
+            p = t *5
             cache_path = os.path.join(precomputed_root, seq_id, f"t{p:04d}.pt")
             if not os.path.exists(cache_path):
                 print("No cache path")
@@ -1959,7 +1961,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
             if self.vox_gt is None:
                 continue
             
-            p = t *10
+            p = t * 10
             cache_path = os.path.join(precomputed_root, seq_id, f"t{p:04d}.pt")
             if not os.path.exists(cache_path):
                 continue
@@ -2017,7 +2019,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 width_m=float(self.bev_window_m[0]),
                 height_m=float(self.bev_window_m[1]),
                 origin_xy=self.bev_origin_xy,
-                z_band=self.z_band_bev,
+                z_band=(self.z_band_bev[0], self.z_band_bev[1]),
             )
             
             bev_gt, meta = bev_from_voxels(self.vox_gt, bev_spec, include_free=True)
@@ -2168,7 +2170,7 @@ class HabitatSeqDataset(Dataset):
 
         imgs_t: List[List[Dict]] = []
         for t, td in enumerate(t_dirs):
-            if t % 10 != 0 and self.skip:
+            if t % 5 != 0 and self.skip:
                 continue
             imgs = self._load_timestep(td)
             if imgs:
@@ -2326,7 +2328,7 @@ def main():
         lr=3e-4,
         max_epochs=200,
         batch_size=1,
-        num_workers=2,
+        num_workers=0,
         precision="bf16",
         skip=True,
         weight_decay=0.05,
@@ -2377,8 +2379,8 @@ def main():
 
 
     # 2. Load the checkpoint file manually
-    """
     ckpt_path = "/cluster/scratch/kochmar/checkpoints/voxup-epoch=03-val_loss_total=nan.ckpt"
+    ckpt_path = "/cluster/scratch/kochmar/checkpoints/full/voxup-epoch=15-val_loss_total=12.6657.ckpt"
     checkpoint = torch.load(ckpt_path, map_location="cpu") # Load to CPU first to save GPU mem
     state_dict = checkpoint["state_dict"]
 
@@ -2409,7 +2411,7 @@ def main():
         if key in state_dict:
             del state_dict[key]
     #keys = sys.load_state_dict(checkpoint["state_dict"], strict=False)
-    """
+    
 
  
     trainer = pl.Trainer(
@@ -2426,9 +2428,9 @@ def main():
         logger=wandb_logger,
     )
     #print(">>> before trainer.fit()", flush=True)
-    ckpt_path = "/cluster/scratch/kochmar/checkpoints/voxup-epoch=03-val_loss_total=5.8081.ckpt"
+    ckpt_path = "/cluster/scratch/kochmar/checkpoints/full/voxup-epoch=03-val_loss_total=27.0149.ckpt"
 
-    #trainer.fit(sys, dm,ckpt_path=ckpt_path)
-    trainer.fit(sys, dm)
+    trainer.fit(sys, dm,ckpt_path=ckpt_path)
+    #trainer.fit(sys, dm)
 if __name__ == "__main__":
     main()
