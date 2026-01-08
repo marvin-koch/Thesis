@@ -1768,6 +1768,15 @@ class VoxelUpdaterSystem(pl.LightningModule):
             
             bevs.append(bev)
             bevs_gt.append(bev_gt)
+            
+            
+            self.vox.z_latent = self.vox.z_latent.detach()
+            torch.cuda.empty_cache()
+            
+            save_dir = "debug_viz_pred"
+            os.makedirs(save_dir, exist_ok=True)
+            fname = f"{save_dir}/step_{t}.ply"
+            self.export_debug_ply(fname, t)
         
         return bevs, bevs_gt
 
