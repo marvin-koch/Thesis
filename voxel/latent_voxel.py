@@ -1160,7 +1160,7 @@ class LatentVoxelGrid(nn.Module):
             return self.decoder(self.z_latent, None) * t
 
     @torch.no_grad()
-    def to_bev(
+    def to_bev2(
         self,
         x_range: tuple[float, float],
         y_range: tuple[float, float],
@@ -1184,7 +1184,7 @@ class LatentVoxelGrid(nn.Module):
         Hy = int((y1 - y0) / res_xy)
 
         # Initialize with -1.0 to represent 'Unknown' (standard convention)
-        bev = torch.full((Hy, Hx), -1.0, device=self.device, dtype=torch.float32)
+        bev = torch.full((Hy, Hx), -1.0, device=self.device)
         meta = {"x0": x0, "y0": y0, "res": res_xy, "width": Hx, "height": Hy}
 
         # 2. Get Centers & Decode Probabilities
@@ -1203,12 +1203,17 @@ class LatentVoxelGrid(nn.Module):
         # Decode: z_latent -> probability [0.0, 1.0]
         probs = self.decoder(z_lat, centers if with_xyz_cond else None)
         probs = torch.sigmoid(probs)
+        probs = probs.to(dtype=bev.dtype)   # match float32 destination
+        print(f"DEBUG: Probs Min: {probs.min().item():.4f}, Max: {probs.max().item():.4f}, Mean: {probs.mean().item():.4f}")
+
+
 
         # 3. Project to Grid
         gx = ((centers[:, 0] - x0) / res_xy).floor().to(torch.long)
         gy = ((centers[:, 1] - y0) / res_xy).floor().to(torch.long)
 
         keep = (gx >= 0) & (gx < Hx) & (gy >= 0) & (gy < Hy)
+        print(len(keep))
         gx, gy, probs = gx[keep], gy[keep], probs[keep]
 
         if probs.numel() == 0:
@@ -1251,6 +1256,94 @@ class LatentVoxelGrid(nn.Module):
 
         return out_map, meta
 
+    @torch.no_grad()
+    def to_bev(
+        self,
+        x_range: tuple[float, float],
+        y_range: tuple[float, float],
+        res_xy: float,
+        z_min: float,
+        z_max: float,
+        agg: str = "max",
+        with_xyz_cond: bool = False,
+        occ_thresh: float = 0.5,
+    ) -> tuple[np.ndarray, dict]:
+
+        # --- 1. Setup Grid ---
+        x0, x1 = x_range
+        y0, y1 = y_range
+        Hx = int((x1 - x0) / res_xy)
+        Hy = int((y1 - y0) / res_xy)
+        print(f"DEBUG: BEV Grid Size: ({Hx}, {Hy}) | Origin: ({x0}, {y0}) | Res: {res_xy}")
+
+        # Initialize with -1.0 (Unknown)
+        bev = torch.full((Hy, Hx), -1.0, device=self.device, dtype=torch.float32)
+        meta = {"x0": x0, "y0": y0, "res": res_xy, "width": Hx, "height": Hy}
+
+        # --- 2. Get Centers ---
+        centers = self.voxel_centers()
+        if centers.numel() == 0:
+            print("DEBUG: No voxel centers found (grid empty).")
+            return np.full((Hy, Hx), -1, dtype=np.int8), meta
+
+        print(f"DEBUG: Total Voxels: {centers.shape[0]}")
+
+        # --- 3. Filter Z-Band ---
+        z = centers[:, 2]
+        z_mask = (z >= z_min) & (z <= z_max)
+        if not z_mask.any():
+            print(f"DEBUG: All voxels filtered by Z-band ({z_min} to {z_max}). Max Z found: {z.max():.2f}")
+            return np.full((Hy, Hx), -1, dtype=np.int8), meta
+
+        centers = centers[z_mask]
+        z_lat = self.z_latent[z_mask]
+        print(f"DEBUG: Voxels in Z-band: {centers.shape[0]}")
+
+        # --- 4. Decode ---
+        probs = self.decoder(z_lat, centers if with_xyz_cond else None)
+        probs = torch.sigmoid(probs)
+        probs = probs.to(dtype=bev.dtype)   # match float32 destination
+        print(f"DEBUG: Probabilities -> Min: {probs.min():.4f}, Max: {probs.max():.4f}")
+
+        # --- 5. Project to 2D ---
+        gx = ((centers[:, 0] - x0) / res_xy).floor().to(torch.long)
+        gy = ((centers[:, 1] - y0) / res_xy).floor().to(torch.long)
+
+        print(f"DEBUG: Projected X range: [{gx.min()}, {gx.max()}] (Valid: 0-{Hx-1})")
+        print(f"DEBUG: Projected Y range: [{gy.min()}, {gy.max()}] (Valid: 0-{Hy-1})")
+
+        keep = (gx >= 0) & (gx < Hx) & (gy >= 0) & (gy < Hy)
+        gx, gy, probs = gx[keep], gy[keep], probs[keep]
+
+        if probs.numel() == 0:
+            print("DEBUG: ALL points filtered out by X/Y bounds! Check 'bev_window_m' and 'bev_origin_xy'.")
+            return np.full((Hy, Hx), -1, dtype=np.int8), meta
+
+        print(f"DEBUG: Points keeping for Rasterization: {probs.numel()}")
+
+        # --- 6. Rasterize ---
+        idx = gy * Hx + gx
+        flat = bev.view(-1)
+        flat.scatter_reduce_(0, idx, probs, reduce="amax", include_self=True)
+
+        # --- 7. Convert to Int ---
+        bev_np = bev.cpu().numpy()
+
+        # Check raw values in the grid before thresholding
+        print(f"DEBUG: Max value in BEV grid before threshold: {bev_np.max():.4f}")
+
+        out_map = np.full_like(bev_np, -1, dtype=np.int8)
+
+        known_mask = bev_np > -0.5
+        occupied_mask = (bev_np > occ_thresh) & known_mask
+        free_mask = (bev_np <= occ_thresh) & known_mask
+
+        out_map[free_mask] = 0
+        out_map[occupied_mask] = 100
+
+        print(f"DEBUG: Final Map Counts -> Free: {np.sum(free_mask)}, Occ: {np.sum(occupied_mask)}")
+
+        return out_map, meta
     """
     # --- rasterize to 2D BEV occupancy ---
     @torch.no_grad()

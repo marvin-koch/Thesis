@@ -2241,7 +2241,7 @@ def main():
     ckpt_cb = pl.callbacks.ModelCheckpoint(
         dirpath="/cluster/scratch/kochmar/checkpoints/full",       # Explicitly set a folder so you can find them
         monitor="val_loss_total",
-        save_top_k=3,
+        save_top_k=5,
         mode="min",
         filename="voxup-{epoch:02d}-{val_loss_total:.4f}" # Match the key logged in validation_step
     )
@@ -2262,7 +2262,7 @@ def main():
 
     # 2. Load the checkpoint file manually
     ckpt_path = "/cluster/scratch/kochmar/checkpoints/voxup-epoch=03-val_loss_total=nan.ckpt"
-    ckpt_path = "/cluster/scratch/kochmar/checkpoints/full/voxup-epoch=15-val_loss_total=12.6657.ckpt"
+    ckpt_path = "/cluster/scratch/kochmar/checkpoints/full/voxup-epoch=05-val_loss_total=27.0719.ckpt"
     checkpoint = torch.load(ckpt_path, map_location="cpu") # Load to CPU first to save GPU mem
     state_dict = checkpoint["state_dict"]
 
@@ -2310,9 +2310,9 @@ def main():
         logger=wandb_logger,
     )
     #print(">>> before trainer.fit()", flush=True)
-    ckpt_path = "/cluster/scratch/kochmar/checkpoints/full/voxup-epoch=03-val_loss_total=27.0149.ckpt"
+    ckpt_path = "/cluster/scratch/kochmar/checkpoints/full/voxup-epoch=03-val_loss_total=26.5246.ckpt"
 
-    trainer.fit(sys, dm,ckpt_path=ckpt_path)
+    trainer.fit(sys, dm, ckpt_path=ckpt_path)
     #trainer.fit(sys, dm)
 if __name__ == "__main__":
     main()

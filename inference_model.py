@@ -10,7 +10,8 @@ from voxel.utils import *
 
 def main():
     ckpt_path = "/cluster/scratch/kochmar/checkpoints/full/voxup-epoch=07-val_loss_total=12.8810.ckpt"
-    out_dir = "/cluster/scratch/kochmar/predict_outputs/"
+    ckpt_path = "/cluster/scratch/kochmar/checkpoints/full/voxup-epoch=03-val_loss_total=27.0149.ckpt"
+    out_dir = "/cluster/scratch/kochmar/predict_outputs_2/"
     os.makedirs(out_dir, exist_ok=True)
 
     # IMPORTANT: cfg must match what the checkpoint expects (feature_dim, voxel_size, etc.)

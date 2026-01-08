@@ -1334,7 +1334,7 @@ def build_maps_from_latent_features(
         z_min=z_min,
         z_max=z_max,
         agg="max",
-        with_xyz_cond=True,
+        with_xyz_cond=False,
     )
     # bev, meta = bev_from_voxels(tvox, bev_spec, include_free=True)
     return tvox, bev, meta
