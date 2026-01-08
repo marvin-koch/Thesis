@@ -1675,6 +1675,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
             if self.cfg.skip:
                 t = t * 10
             gt_path = os.path.join(gt_root, f"{seq_id}_t{t:04d}_gt.npz")
+            print(gt_path)
+
             if os.path.exists(gt_path):
                 vox_gt_t = load_sparse_voxel_grid(gt_path, device)
             else:
