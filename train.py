@@ -1673,7 +1673,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
         gt_seq = []
         for t in range(T):
             if self.cfg.skip:
-                t = t * 10
+                t = t * 5
             gt_path = os.path.join(gt_root, f"{seq_id}_t{t:04d}_gt.npz")
             print(gt_path)
 
@@ -1705,13 +1705,40 @@ class VoxelUpdaterSystem(pl.LightningModule):
             if self.vox_gt is None:
                 continue
             
-            p = t * 10
+            p = t * 5
             cache_path = os.path.join(precomputed_root, seq_id, f"t{p:04d}.pt")
             if not os.path.exists(cache_path):
                 continue
        
     
             predictions = torch.load(cache_path, map_location=self.device)
+            
+            
+            
+
+            R_w2m = np.array([[0, 0, -1],
+                            [-1, 0, 0],
+                            [0, -1, 0]], dtype=np.float32)
+            t_w2m = np.zeros(3, dtype=np.float32)
+
+            R_w2m = to_torch(R_w2m, device=self.device)
+            t_w2m = to_torch(t_w2m, device=self.device)
+
+            # 2. Rotate Points to World Frame (using Rmw/tmw from outside loop)
+            # Note: Rmw/tmw are defined before the loop in predict_step
+            WPTS_m = rotate_points(predictions["world_points"], R_w2m, t_w2m)
+            predictions["world_points"] = rotate_points(WPTS_m, Rmw, tmw)
+
+            # 3. Apply Scaling
+            raw_pts = predictions["world_points"]
+            predictions["world_points"] = raw_pts * scale_factor
+
+            # 4. Scale Camera Extrinsics
+            if isinstance(predictions["extrinsic"], torch.Tensor):
+                predictions["extrinsic"][:, :3, 3] *= scale_factor
+            elif isinstance(predictions["extrinsic"], list):
+                for i in range(len(predictions["extrinsic"])):
+                    predictions["extrinsic"][i][:3, 3] *= scale_factor
   
             stride = 1 if t == 0 else self.cfg.stride
 
