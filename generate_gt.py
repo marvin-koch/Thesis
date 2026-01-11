@@ -278,12 +278,12 @@ def schedule_pairs(changed_gids, local2gid, pairs, budget,
             continue
         run_set.add(e)
 
-    # for i in changed_local:
-    #     if len(run_set) > budget: break
-    #     e = pick_one_for_image_extra(i, tau_mst, tau_extra)
-    #     if e is None:
-    #         continue
-    #     run_set.add(e)
+    for i in changed_local:
+        if len(run_set) > budget: break
+        e = pick_one_for_image_extra(i, tau_mst, tau_extra)
+        if e is None:
+            continue
+        run_set.add(e)
 
 
         # # Optional: refresh the single stalest MST edge globally (drift control)
@@ -556,7 +556,7 @@ def get_reconstructed_scene(
         pairs=pairs,          # full pair list (vi, vj)
         budget=B*B,
         tau_mst=0.0,          # be lenient on MST edges
-        tau_extra=0.5,        # stricter on non-MST
+        tau_extra=0.2,        # stricter on non-MST
         max_count=4,
         refresh_one_stale_mst=True
     )
@@ -790,7 +790,7 @@ def get_reconstructed_scene(
             scene._set_depthmap(n, depth * scale)
 
         # 7) short refine without re-init
-        _ = scene.compute_global_alignment(init=None, niter=niter/20, schedule=schedule, lr=1e-2) #5e-2
+        _ = scene.compute_global_alignment(init=None, niter=niter, schedule=schedule, lr=1e-2) #5e-2
 
 
     # Read subset outputs
