@@ -10,13 +10,13 @@ from voxel.utils import *
 
 def main():
     ckpt_path = "/cluster/scratch/kochmar/checkpoints/full/voxup-epoch=07-val_loss_total=12.8810.ckpt"
-    ckpt_path = "/cluster/scratch/kochmar/checkpoints/full/voxup-epoch=03-val_loss_total=27.0149.ckpt"
-    out_dir = "/cluster/scratch/kochmar/predict_outputs_2/"
+    ckpt_path = "/cluster/scratch/kochmar/checkpoints/full/voxup-epoch=11-val_loss_total=11.0512.ckpt"
+    out_dir = "/cluster/scratch/kochmar/predict_outputs/"
     os.makedirs(out_dir, exist_ok=True)
 
     # IMPORTANT: cfg must match what the checkpoint expects (feature_dim, voxel_size, etc.)
     cfg = TrainConfig(
-        dataset_root="/cluster/scratch/kochmar/frames/",
+        dataset_root="/cluster/scratch/kochmar/renders/",
         gt_voxels_file="gt_voxels_per_timestep_01_v2",
         precomputed_cache_file="precomputed_cache",
         pose_file="gt_poses_v2",
@@ -46,7 +46,7 @@ def main():
         num_workers=cfg.num_workers,
         size=512,
         verbose=False,
-        train_val_split=0.2,  # doesn't matter if you pass your own loader below
+        train_val_split=0.02,  # doesn't matter if you pass your own loader below
         skip=True,
         seq_list=os.path.join(cfg.dataset_root, cfg.seq_file),
     )
@@ -75,9 +75,11 @@ def main():
     # outputs is a list: one entry per sequence (batch). Your predict_step returns (bev, bev_gt).
     for i, out in enumerate(outputs):
         if out is None:
+            print("out is None")
             continue
         bevs, bevs_gt = out
         for j, (bev, bev_gt) in enumerate(zip(bevs, bevs_gt)):
+            print(j)
             save_bev(bev, meta, out_dir + f"bev_{i}_{j}.png", out_dir + f"bev_{i}_{j}_np.npy", out_dir + f"bev_{i}_{j}_meta.json")
             save_bev(bev_gt, meta, out_dir + f"bev_{i}_{j}_gt.png", out_dir + f"bev_{i}_{j}_gt_np.npy", out_dir + f"bev_{i}_{j}_gt_meta.json")
 

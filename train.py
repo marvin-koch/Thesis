@@ -54,6 +54,10 @@ from voxel.voxel import TorchSparseVoxelGrid, VoxelParams
 from sklearn.decomposition import PCA
 
 import matplotlib.pyplot as plt
+import PIL
+
+
+STEP = 20
 
 def load_sparse_voxel_grid(path, device):
     data = np.load(path)
@@ -181,9 +185,10 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
         self.automatic_optimization = False   # <<< add this
         
-        self.bev_window_m=(100.0, 100.0)
-        self.bev_origin_xy=(-15.0, -15.0)
-        self.z_band_bev=(0.02, 10)
+        self.bev_window_m=(50.0, 50.0)
+        self.bev_origin_xy=(-25.0, -25.0)
+        self.z_band_bev=(1.0, 3.0)
+        #self.z_band_bev=(-0.9, 2.0)
 
         self.fp_weight = 0.0
 
@@ -252,7 +257,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
         POINTS = "world_points"
         CONF = "world_points_conf"
-        threshold = 1.0     
+        threshold = 1.0 
+        threshold = 2.0 
         z_clip_map = (-3.0, 3.0)  
 
         R_w2m = np.array([[0, 0, -1],
@@ -469,7 +475,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
             bev_window_m=self.bev_window_m, # local 20x20 m
             bev_origin_xy=self.bev_origin_xy,
             z_clip_vox=(-np.inf, np.inf),
-            z_band_bev=(self.z_band_bev[0]-100, self.z_band_bev[1]+100),
+            z_band_bev=(self.z_band_bev[0], self.z_band_bev[1]),
             frame_ids=frame_ids,
             radius= self.cfg.radius_m
         )
@@ -830,7 +836,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
         for t in range(T):
             if self.cfg.skip:
-                t = t*5 # Adjust indexing if skipping
+                t = t*STEP # Adjust indexing if skipping
             
             gt_path = os.path.join(gt_root, f"{seq_id}_t{t:04d}_gt.npz")
             print(gt_path)
@@ -864,7 +870,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
             
             
            
-            p = t *5
+            p = t * STEP
             cache_path = os.path.join(precomputed_root, seq_id, f"t{p:04d}.pt")
             if not os.path.exists(cache_path):
                 print("Missing cache:", cache_path)
@@ -1323,7 +1329,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
         gt_seq = []
         for t in range(T):
             if self.cfg.skip:
-                t = t * 5
+                t = t * STEP
             gt_path = os.path.join(gt_root, f"{seq_id}_t{t:04d}_gt.npz")
             if os.path.exists(gt_path):
                 vox_gt_t = load_sparse_voxel_grid(gt_path, device)
@@ -1355,7 +1361,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
             if self.vox_gt is None:
                 continue
             
-            p = t *5
+            p = t * STEP
             cache_path = os.path.join(precomputed_root, seq_id, f"t{p:04d}.pt")
             if not os.path.exists(cache_path):
                 print("No cache path")
@@ -1673,7 +1679,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
         gt_seq = []
         for t in range(T):
             if self.cfg.skip:
-                t = t * 5
+                t = t * STEP
             gt_path = os.path.join(gt_root, f"{seq_id}_t{t:04d}_gt.npz")
             print(gt_path)
 
@@ -1705,7 +1711,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
             if self.vox_gt is None:
                 continue
             
-            p = t * 5
+            p = t * STEP
             cache_path = os.path.join(precomputed_root, seq_id, f"t{p:04d}.pt")
             if not os.path.exists(cache_path):
                 continue
@@ -2075,14 +2081,30 @@ class HabitatSeqDataset(Dataset):
 
     def _list_timesteps(self, seq_dir: str) -> List[str]:
         # timesteps are immediate subfolders; if none, treat the seq_dir itself as one timestep
-        t_dirs = _list_dirs(seq_dir)
-        return t_dirs if t_dirs else [seq_dir]
+        all_dirs = _list_dirs(seq_dir)
+        valid_dirs = []
+        for d in all_dirs:
+            base = os.path.basename(d)
+            if base.startswith("time") or base.isdigit():
+                valid_dirs.append(d)
+
+        # If no subfolders found, maybe the seq_dir itself is the timestep?
+        return valid_dirs if valid_dirs else [seq_dir]
 
     def _load_timestep(self, t_dir: str) -> List[Dict]:
         img_paths = _list_imgs(t_dir)
         if len(img_paths) < self.min_images_per_timestep:
             return []
-        return li(img_paths, size=self.size, verbose=self.verbose)
+
+        try:
+            # Attempt to load images using dust3r utils
+            return li(img_paths, size=self.size, verbose=False)
+        except (PIL.UnidentifiedImageError, OSError, Exception) as e:
+            # --- CRASH PROTECTION ---
+            # If a file is corrupt (e.g., cam_9.jpg), print a warning and SKIP this timestep.
+            print(f"\n[WARN] Corrupted data in {t_dir}")
+            print(f"       Skipping this timestep. Error: {e}")
+            return []
 
     def __getitem__(self, idx: int) -> Dict:
         seq_dir = self.seq_paths[idx]
@@ -2090,7 +2112,7 @@ class HabitatSeqDataset(Dataset):
 
         imgs_t: List[List[Dict]] = []
         for t, td in enumerate(t_dirs):
-            if t % 5 != 0 and self.skip:
+            if t % STEP != 0 and self.skip:
                 continue
             imgs = self._load_timestep(td)
             if imgs:
@@ -2234,7 +2256,7 @@ def main():
     cfg = TrainConfig(
         # dataset_root="/Users/marvin/Documents/Thesis/repo/dataset_generation/habitat/",
         #dataset_root="/home/mpk40/Documents/data/",
-        dataset_root="/cluster/scratch/kochmar/frames/",
+        dataset_root="/cluster/scratch/kochmar/renders/",
         gt_voxels_file="gt_voxels_per_timestep_01_v2",
         precomputed_cache_file="precomputed_cache",
         pose_file="gt_poses_v2",
@@ -2348,7 +2370,7 @@ def main():
         logger=wandb_logger,
     )
     #print(">>> before trainer.fit()", flush=True)
-    ckpt_path = "/cluster/scratch/kochmar/checkpoints/full/voxup-epoch=03-val_loss_total=26.5246.ckpt"
+    ckpt_path = "/cluster/scratch/kochmar/checkpoints/full/voxup-epoch=11-val_loss_total=11.0512.ckpt"
 
     trainer.fit(sys, dm, ckpt_path=ckpt_path)
     #trainer.fit(sys, dm)

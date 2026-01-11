@@ -42,7 +42,7 @@ def build_manifest(dataset_root, check_gt=False):
         base = os.path.basename(dirpath)
 
         # Only consider dirs named like "time0", "time1", ...
-        if not base.startswith("time"):
+        if not (base.startswith("time") or base.isdigit()):
             continue
 
         if not has_image(filenames):

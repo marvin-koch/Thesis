@@ -58,7 +58,7 @@ GA_CACHE = {
     "pw_adaptors": None
 }
 
-step = 5
+step = 1
 
 def to_torch(x, device="cuda"):
     """Convert to PyTorch tensor if not already."""
@@ -807,7 +807,7 @@ def get_reconstructed_scene(
     conf = [c.detach().cpu().numpy() if torch.is_tensor(c) else c for c in scene.im_conf]
     scene_imgs = [img.detach().cpu().numpy() if torch.is_tensor(img) else img for img in scene.imgs]
 
-    # 3) slice cameras/intrinsics to changed frames only
+    # 3) slice cameras/intrinsics to changed renders only
     Twc_sub = Twc_sub[changed_gids]                 # (Mchg,4,4) cam->world
     K_sub   = K_sub[changed_gids]                   # (Mchg,3,3)
 
@@ -1081,7 +1081,7 @@ def build_gt_voxel_for_timestep(
 
 
 
-        frames_map, cam_centers_map, conf_map, images_map, _, (S, H, W), frame_ids = \
+        renders_map, cam_centers_map, conf_map, images_map, _, (S, H, W), frame_ids = \
             build_frames_and_centers_vectorized_torch(
                 predictions,
                 POINTS=POINTS,
@@ -1093,7 +1093,7 @@ def build_gt_voxel_for_timestep(
                 return_flat=True,
             )
             
-        total_points = sum(f.shape[0] for f in frames_map)
+        total_points = sum(f.shape[0] for f in renders_map)
         print(f"  [Points] Survivors after filtering/clipping: {total_points}")
         if total_points < 100:
             print("  🔴 CRITICAL: Almost no points left! Check your z_clip_map or threshold.")
@@ -1106,7 +1106,7 @@ def build_gt_voxel_for_timestep(
         )
 
         vox_gt, bev, meta = build_maps_from_points_and_centers_torch(
-            frames_map,
+            renders_map,
             cam_centers_map,
             conf_map,
             vox_gt,
@@ -1125,12 +1125,12 @@ def build_gt_voxel_for_timestep(
     # vox_gt.next_epoch()  # optional for bookkeeping
 
     # free some stuff
-    del predictions, frames_map, cam_centers_map, conf_map, images_map
+    del predictions, renders_map, cam_centers_map, conf_map, images_map
     return vox_gt, scale_factor, Rmw, tmw
 
 
 def main():
-    dataset_root = "/cluster/scratch/kochmar/frames/"   # same as in your TrainConfig
+    dataset_root = "/cluster/scratch/kochmar/eval/"   # same as in your TrainConfig
     voxel_size = 0.2
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -1146,7 +1146,7 @@ def main():
         dataset_root=dataset_root,
         size=512,
         verbose=False,
-        seq_list  = "/cluster/scratch/kochmar/frames/seq_manifest.json"
+        seq_list  = "/cluster/scratch/kochmar/eval/seq_manifest.json"
     )
 
     seqs = dataset.seq_paths
@@ -1156,8 +1156,8 @@ def main():
     out_root_pose = os.path.join(dataset_root, "gt_poses_v2")
     os.makedirs(out_root, exist_ok=True)
 
-    #for seq_idx in range(len(seqs)):
-    for seq_idx in range(len(seqs)-1 , -1, -1):
+    for seq_idx in range(len(seqs)):
+    #for seq_idx in range(len(seqs)-1 , -1, -1):
     #for seq_idx in range(0, len(seqs)):
         print(seq_idx)
         batch = dataset[seq_idx]        # __getitem__ returns dict with seq info
@@ -1191,6 +1191,8 @@ def main():
             if os.path.exists(out_path_pose):
                 print(f"[T0] {seq_id}: skip (exists)")
                 continue
+
+
             save_alignment_npz(out_path_pose, seq_id, scale_factor, Rmw, tmw)
 
 

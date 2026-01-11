@@ -12,9 +12,9 @@ import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 
 # Config
-SEQ_LIST = "/cluster/scratch/kochmar/frames/seq_manifest.json"
-DATA_ROOT = "/cluster/scratch/kochmar/frames/"
-SAVE_ROOT = "/cluster/scratch/kochmar/frames/precomputed_cache/"
+SEQ_LIST = "/cluster/scratch/kochmar/eval/seq_manifest.json"
+DATA_ROOT = "/cluster/scratch/kochmar/eval/"
+SAVE_ROOT = "/cluster/scratch/kochmar/eval/precomputed_cache/"
 WEIGHTS_PATH = "/cluster/home/kochmar/Thesis/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth"
 
 POINTS = "world_points"
@@ -57,11 +57,11 @@ def precompute():
         dataset_root=DATA_ROOT,
         size=512,
         verbose=False,
-        seq_list  = "/cluster/scratch/kochmar/frames/seq_manifest.json"
+        seq_list  = "/cluster/scratch/kochmar/eval/seq_manifest.json"
     )
     seqs = dataset.seq_paths
     
-    keyframes = []
+    keyrenders = []
 
     print(f"Starting precomputation for {len(seqs)} sequences...")
 
@@ -78,14 +78,14 @@ def precompute():
         mst = False
 
         for i in range(T):
-            if i % 5 != 0:
+            if i % 1 != 0:
                 continue
 
             save_path = os.path.join(seq_dir, f"t{i:04d}.pt")
-            if os.path.exists(save_path) and i != 0 and i != 5:
+            if os.path.exists(save_path) and i != 0 and i != 10:
                 print("Skip, already exists")
                 #PUT THIS BACK
-                #continue
+                continue
 
             imgs = batch["imgs_t"][i]
                     
@@ -112,13 +112,13 @@ def precompute():
 
                 predictions = get_reconstructed_scene_no_opt(i, ".", imgs, model, device, False, 512, "", "linear", 100, 1, True, False, True, False, 0.05, "oneref", 1, 0, projector=None)
 
-                keyframes = image_tensors.clone()
+                keyrenders = image_tensors.clone()
                                     
 
             else:
             
 
-                changed_idx = changed_images(image_tensors, keyframes, thresh=0.000005)
+                changed_idx = changed_images(image_tensors, keyrenders, thresh=0.000005)
                 
                 print(changed_idx)
 
@@ -135,7 +135,7 @@ def precompute():
                 index_map = {new: old for new, old in enumerate(changed_idx)}
                         
                 idx_t = torch.tensor(changed_idx, device=device, dtype=torch.long)
-                keyframes.index_copy_(0, idx_t, image_tensors.index_select(0, idx_t))
+                keyrenders.index_copy_(0, idx_t, image_tensors.index_select(0, idx_t))
                 
                 
                 print("final changed idx:", changed_idx)

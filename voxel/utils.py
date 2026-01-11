@@ -19,6 +19,7 @@ from voxel.align import *
 import glob
 import os
 import json
+import pathlib
 from pathlib import Path
 
 from vggt.utils.load_fn import load_and_preprocess_images
@@ -1470,6 +1471,7 @@ def save_bev_png(bev: np.ndarray, meta: dict, path: str = "bev.png"):
     plt.title("BEV")
     plt.colorbar(label="occupancy value")
     plt.tight_layout()
+    print("savfig ", path)
     plt.savefig(path, dpi=200)
     plt.close()
     print(f"Saved {path}")
@@ -1478,10 +1480,11 @@ def save_bev(bev: np.ndarray, meta: dict, png_path="bev.png", npy_path="bev.npy"
     # keep your current PNG
     bev = _to_numpy_float32(bev)  # ✅ convert once
 
+    print("saving ", png_path)
     save_bev_png(bev, meta, png_path)
     # save raw values + metadata for evaluation
     np.save(npy_path, bev)
-    import json, pathlib
+
     pathlib.Path(meta_path).write_text(json.dumps(meta, indent=2))
 
 
