@@ -10,16 +10,16 @@ from voxel.utils import *
 
 def main():
     ckpt_path = "/cluster/scratch/kochmar/checkpoints/full/voxup-epoch=07-val_loss_total=12.8810.ckpt"
-    ckpt_path = "/cluster/scratch/kochmar/checkpoints/full/voxup-epoch=11-val_loss_total=11.0512.ckpt"
-    out_dir = "/cluster/scratch/kochmar/predict_outputs/"
+    ckpt_path = "/cluster/scratch/kochmar/checkpoints/full/voxup-epoch=07-val_loss_total=10.9045.ckpt"
+    out_dir = "/cluster/scratch/kochmar/predict_outputs_eval/"
     os.makedirs(out_dir, exist_ok=True)
 
     # IMPORTANT: cfg must match what the checkpoint expects (feature_dim, voxel_size, etc.)
     cfg = TrainConfig(
-        dataset_root="/cluster/scratch/kochmar/renders/",
-        gt_voxels_file="gt_voxels_per_timestep_01_v2",
+        dataset_root="/cluster/scratch/kochmar/eval/",
+        gt_voxels_file="gt_voxels_per_timestep_01",
         precomputed_cache_file="precomputed_cache",
-        pose_file="gt_poses_v2",
+        pose_file="gt_poses",
         seq_file="seq_manifest.json",
         voxel_size=0.2,
         radius_m=1,
@@ -46,7 +46,7 @@ def main():
         num_workers=cfg.num_workers,
         size=512,
         verbose=False,
-        train_val_split=0.02,  # doesn't matter if you pass your own loader below
+        train_val_split=0.1,  # doesn't matter if you pass your own loader below
         skip=True,
         seq_list=os.path.join(cfg.dataset_root, cfg.seq_file),
     )

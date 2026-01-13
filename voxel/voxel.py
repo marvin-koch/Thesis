@@ -447,4 +447,14 @@ class TorchSparseVoxelGrid:
         return centers.detach().cpu().numpy()
 
 
+    # --- voxel centers helper ---
+    def voxel_centers(self) -> torch.Tensor:
+        """
+        Returns (M,3) world centers for current keys (float32, device=self.device).
+        """
+        if self.keys.numel() == 0:
+            return torch.zeros(0, 3, device=self.device, dtype=torch.float32)
+        ijk = self._unhash_keys(self.keys).to(torch.float32)
+        return self.origin + (ijk + 0.5) * self.p.voxel_size
+
 

@@ -57,7 +57,7 @@ import matplotlib.pyplot as plt
 import PIL
 
 
-STEP = 20
+STEP = 1
 
 def load_sparse_voxel_grid(path, device):
     data = np.load(path)
@@ -187,8 +187,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
         
         self.bev_window_m=(50.0, 50.0)
         self.bev_origin_xy=(-25.0, -25.0)
-        self.z_band_bev=(1.0, 3.0)
-        #self.z_band_bev=(-0.9, 2.0)
+        #self.z_band_bev=(1.0, 3.0)
+        self.z_band_bev=(-1.0, 2.0)
 
         self.fp_weight = 0.0
 
@@ -475,7 +475,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
             bev_window_m=self.bev_window_m, # local 20x20 m
             bev_origin_xy=self.bev_origin_xy,
             z_clip_vox=(-np.inf, np.inf),
-            z_band_bev=(self.z_band_bev[0], self.z_band_bev[1]),
+            #z_band_bev=(self.z_band_bev[0], self.z_band_bev[1]),
+            z_band_bev=(self.z_band_bev[0] - 0.4, self.z_band_bev[1]),
             frame_ids=frame_ids,
             radius= self.cfg.radius_m
         )
@@ -1629,6 +1630,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
             os.makedirs(save_dir, exist_ok=True)
             fname = f"{save_dir}/step_{t}.ply"
             self.export_debug_ply(fname, t)
+            self.export_separated_ply(t, save_dir="debug_viz_val")
 
 
         # Average over sequence
@@ -1649,7 +1651,276 @@ class VoxelUpdaterSystem(pl.LightningModule):
         return val_loss_total
     
 
+    def predict_step(self, batch: Dict, batch_idx: int, dataloader_idx: int = 0):
+        device = self.device
 
+        self.vox.reset_state()
+        self.vox = self.vox.to(self.device)
+
+        # Initialize an empty GT grid structure
+        self.vox_gt = TorchSparseVoxelGrid(
+            origin_xyz=np.zeros(3, dtype=np.float32),
+            params=VoxelParams(voxel_size=self.voxel_size, promote_hits=2),
+            device=self.device
+        )
+
+        # Buffers for temporal consistency
+        self._prev_keys = None
+        self._prev_probs = None
+
+        # --- METRICS BUFFER ---
+        # Initialize all keys so get_avg doesn't crash if a sequence has no dynamic events
+        metrics_buffer = {
+            "occ_iou": [],
+            "occ_precision": [],
+            "occ_precision_inter": [],
+            "occ_recall": [],
+            "dyn_iou": [],
+            "dyn_recall_appearing": [],
+            "dyn_recall_disappearing": [],
+            "dyn_ghost_rate": []
+        }
+
+        T = batch["timesteps"]
+        seq_id = batch["seq_id"]
+
+        gt_root = os.path.join(self.cfg.dataset_root, self.cfg.gt_voxels_file)
+        precomputed_root = os.path.join(self.cfg.dataset_root, self.cfg.precomputed_cache_file)
+        pose_root = os.path.join(self.cfg.dataset_root, self.cfg.pose_file)
+
+        # Preload GT
+        gt_seq = []
+        for t in range(T):
+            if self.cfg.skip:
+                t = t * STEP
+            gt_path = os.path.join(gt_root, f"{seq_id}_t{t:04d}_gt.npz")
+
+            if os.path.exists(gt_path):
+                vox_gt_t = load_sparse_voxel_grid(gt_path, device)
+            else:
+                # print(f"Warning: GT missing for {gt_path}")
+                vox_gt_t = None
+            gt_seq.append(vox_gt_t)
+
+        d = np.load(os.path.join(pose_root, f"{seq_id}_t0000_align.npz"), allow_pickle=True)
+
+        Rmw = d["Rmw"]   # (3,3) float32
+        tmw = d["tmw"]   # (3,)  float32
+        scale_factor = float(d["scale"])
+        Rmw = to_torch(Rmw, device=self.device)
+        tmw = to_torch(tmw, device=self.device)
+        tmw_scaled = tmw * scale_factor
+
+        mst = False
+
+        bevs = []
+        bevs_gt = []
+
+        print(f"\n=== Starting Prediction for Seq: {seq_id} (T={T}) ===")
+
+        for t in range(T):
+            # print(f"Step {t}...")
+            imgs = batch["imgs_t"][t]
+
+            self.vox_gt = gt_seq[t]
+            if self.vox_gt is None:
+                continue
+
+            p = t * STEP
+            cache_path = os.path.join(precomputed_root, seq_id, f"t{p:04d}.pt")
+            if not os.path.exists(cache_path):
+                continue
+
+            predictions = torch.load(cache_path, map_location=self.device)
+
+            R_w2m = np.array([[0, 0, -1],
+                            [-1, 0, 0],
+                            [0, -1, 0]], dtype=np.float32)
+            t_w2m = np.zeros(3, dtype=np.float32)
+
+            R_w2m = to_torch(R_w2m, device=self.device)
+            t_w2m = to_torch(t_w2m, device=self.device)
+
+            # 2. Rotate Points to World Frame
+            WPTS_m = rotate_points(predictions["world_points"], R_w2m, t_w2m)
+            predictions["world_points"] = rotate_points(WPTS_m, Rmw, tmw)
+
+            # 3. Apply Scaling
+            raw_pts = predictions["world_points"]
+            predictions["world_points"] = raw_pts * scale_factor
+
+            # 4. Scale Camera Extrinsics
+            if isinstance(predictions["extrinsic"], torch.Tensor):
+                predictions["extrinsic"][:, :3, 3] *= scale_factor
+            elif isinstance(predictions["extrinsic"], list):
+                for i in range(len(predictions["extrinsic"])):
+                    predictions["extrinsic"][i][:3, 3] *= scale_factor
+
+            stride = 1 if t == 0 else self.cfg.stride
+
+            if "world_points_conf" in predictions:
+                predictions["world_points_conf"] = predictions["world_points_conf"][..., ::stride, ::stride]
+                conf_tensor = predictions["world_points_conf"]
+                if isinstance(conf_tensor, list):
+                    ref = next((x for x in conf_tensor if x is not None), None)
+                    target_hw = ref.shape[-2:] if ref is not None else (128, 128)
+                else:
+                    target_hw = conf_tensor.shape[-2:]
+            else:
+                target_hw = (512 // stride, 512 // stride)
+
+            if "world_points" in predictions:
+                predictions["world_points"] = predictions["world_points"][..., ::stride, ::stride, :]
+
+            if "images" in predictions:
+                img = predictions["images"]
+                if img.shape[-3] == 3 and img.shape[-1] != 3:
+                     img = img.permute(0, 2, 3, 1) # (S, 3, H, W) -> (S, H, W, 3)
+                predictions["images"] = img[..., ::stride, ::stride, :]
+                del img
+
+            # --- PROCESS FEATURES ---
+            raw_feats_list = predictions["view_feats"]
+            projected_feats_map = []
+
+            for f_raw in raw_feats_list:
+                f_proj = self.apply_projector_to_map(f_raw, target_hw=target_hw)
+                projected_feats_map.append(f_proj)
+
+            predictions["view_feats"] = projected_feats_map
+            del projected_feats_map
+
+            with torch.enable_grad():
+                if not mst and t != 0:
+                    bev, mst, _, _ = self.inference(1, imgs, mst, Rmw, tmw_scaled, predictions, scale_factor)
+                else:
+                    bev, mst, _, _ = self.inference(t, imgs, mst, Rmw, tmw_scaled, predictions, scale_factor)
+
+            # ---------------------------------------------------------
+            # METRICS CALCULATION
+            # ---------------------------------------------------------
+            # 1. Prepare Ground Truth
+            logit_gt = self.vox_gt.vals_st.clamp(-10.0, 10.0)
+            p_occ_tgt = torch.sigmoid(logit_gt * 10.0) # Sharp GT
+
+            # 2. Decode Prediction
+            logit_pred_before = self.vox.decode_occupancy(with_xyz_cond=False)
+            if not torch.isfinite(logit_pred_before).all():
+                logit_pred_before = torch.nan_to_num(logit_pred_before, nan=0.001)
+
+            # 3. Align GT keys to Prediction keys
+            p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys_soft(
+                self.vox_gt, p_occ_tgt, self.vox, default=0.0
+            )
+
+            # 4. Standard IoU Calculation
+            pred_intersect = logit_pred_before[valid_mask]
+            tgt_intersect  = p_occ_tgt_aligned[valid_mask]
+            pred_fp = logit_pred_before[~valid_mask]
+
+            pred_bin_int = (pred_intersect > 0.0) # Logit > 0 is Prob > 0.5
+            tgt_bin_int  = (tgt_intersect  > 0.5)
+
+            tp = (pred_bin_int & tgt_bin_int).sum()
+            fp_int = (pred_bin_int & ~tgt_bin_int).sum()
+            fn = (~pred_bin_int & tgt_bin_int).sum()
+
+            fp_hallucination = (pred_fp > 0.0).sum()
+            total_fp = fp_int + fp_hallucination
+
+            occ_iou = tp / (tp + total_fp + fn + 1e-8)
+            occ_recall = tp / (tp + fn + 1e-8)
+            occ_precision = tp / (tp + total_fp + 1e-8)
+            occ_precision_inter = tp / (tp + fp_int + 1e-8)
+
+            metrics_buffer["occ_iou"].append(occ_iou.item())
+            metrics_buffer["occ_recall"].append(occ_recall.item())
+            metrics_buffer["occ_precision"].append(occ_precision.item())
+            metrics_buffer["occ_precision_inter"].append(occ_precision_inter.item())
+
+            # ---------------------------------------------------------
+            # DYNAMIC METRICS (The New Part)
+            # ---------------------------------------------------------
+            # Compare Current GT (t) vs Previous GT (t-1)
+            if t > 0 and gt_seq[t-1] is not None:
+                vox_gt_prev = gt_seq[t-1]
+
+                # Align Prev GT to Current Keys
+                p_occ_prev_aligned, _ = self.align_probs_to_keys_soft(
+                    vox_gt_prev,
+                    torch.sigmoid(vox_gt_prev.vals_st * 10.0),
+                    self.vox,
+                    default=0.0
+                )
+
+                # Define Masks
+                gt_curr = (tgt_intersect > 0.5)
+                # Note: We align Previous GT to Current Keys, so we use valid_mask of current keys
+                gt_prev = (p_occ_prev_aligned[valid_mask] > 0.5)
+
+                mask_appearing    = (~gt_prev & gt_curr)  # Empty -> Occupied
+                mask_disappearing = (gt_prev & ~gt_curr)  # Occupied -> Empty
+                mask_dynamic      = (gt_prev != gt_curr)
+
+                # A. Appearing Recall (Do we see new objects?)
+                if mask_appearing.sum() > 0:
+                    pred_appearing = (pred_intersect[mask_appearing] > 0.0)
+                    metrics_buffer["dyn_recall_appearing"].append(pred_appearing.float().mean().item())
+
+                # B. Disappearing / Ghosting (Do we clear old objects?)
+                if mask_disappearing.sum() > 0:
+                    pred_ghosts = (pred_intersect[mask_disappearing] > 0.0)
+                    metrics_buffer["dyn_ghost_rate"].append(pred_ghosts.float().mean().item())
+                    metrics_buffer["dyn_recall_disappearing"].append((~pred_ghosts).float().mean().item())
+
+                # C. Dynamic IoU
+                if mask_dynamic.sum() > 0:
+                    pred_dyn = (pred_intersect[mask_dynamic] > 0.0)
+                    gt_dyn   = gt_curr[mask_dynamic]
+                    intersection = (pred_dyn & gt_dyn).sum()
+                    union        = (pred_dyn | gt_dyn).sum()
+                    metrics_buffer["dyn_iou"].append((intersection / (union + 1e-8)).item())
+
+            # ---------------------------------------------------------
+            # END METRICS
+            # ---------------------------------------------------------
+
+            bev_spec = BevSpec(
+                resolution=self.vox_gt.p.voxel_size,
+                width_m=float(self.bev_window_m[0]),
+                height_m=float(self.bev_window_m[1]),
+                origin_xy=self.bev_origin_xy,
+                z_band=(self.z_band_bev[0], self.z_band_bev[1]),
+            )
+
+            bev_gt, meta = bev_from_voxels(self.vox_gt, bev_spec, include_free=True)
+
+            bevs.append(bev)
+            bevs_gt.append(bev_gt)
+
+            self.vox.z_latent = self.vox.z_latent.detach()
+            torch.cuda.empty_cache()
+
+        # --- FINAL SUMMARY PRINT ---
+        print("-" * 60)
+        print(f"SEQUENCE REPORT: {seq_id}")
+        print("-" * 60)
+        print(f"  Standard Metrics:")
+        print(f"    IoU:                 {self.get_avg(metrics_buffer, 'occ_iou'):.4f}")
+        print(f"    Recall:              {self.get_avg(metrics_buffer, 'occ_recall'):.4f}")
+        print(f"    Precision:           {self.get_avg(metrics_buffer, 'occ_precision'):.4f}")
+        print("-" * 60)
+        print(f"  Dynamic Metrics (Changes Only):")
+        print(f"    Dynamic IoU:         {self.get_avg(metrics_buffer, 'dyn_iou'):.4f}")
+        print(f"    Appearing Recall:    {self.get_avg(metrics_buffer, 'dyn_recall_appearing'):.4f}  (High = Fast reaction to new objects)")
+        print(f"    Disappearing Recall: {self.get_avg(metrics_buffer, 'dyn_recall_disappearing'):.4f}  (High = Good cleanup)")
+        print(f"    Ghost Rate:          {self.get_avg(metrics_buffer, 'dyn_ghost_rate'):.4f}  (High = Objects leave trails)")
+        print("-" * 60)
+        print("\n")
+
+        return bevs, bevs_gt
+
+    """
     def predict_step(self, batch: Dict, batch_idx: int, dataloader_idx: int = 0):
         device = self.device
 
@@ -1812,10 +2083,12 @@ class VoxelUpdaterSystem(pl.LightningModule):
             os.makedirs(save_dir, exist_ok=True)
             fname = f"{save_dir}/step_{t}.ply"
             self.export_debug_ply(fname, t)
+            self.export_separated_ply(t, save_dir="debug_viz_pred")
         
         return bevs, bevs_gt
 
 
+    """
     def on_load_checkpoint(self, checkpoint):
         state_dict = checkpoint["state_dict"]
         # Check if the checkpoint contains voxel keys
@@ -1866,6 +2139,81 @@ class VoxelUpdaterSystem(pl.LightningModule):
     
     
      
+    def export_separated_ply(self, step_idx, save_dir="debug_viz"):
+        """
+        Exports GT and Prediction to separate PLY files.
+        - GT: Green points (step_X_gt.ply)
+        - Pred: Red points (step_X_pred.ply)
+        """
+        os.makedirs(save_dir, exist_ok=True)
+
+        # -----------------------------
+        # 1. Export Ground Truth (Green)
+        # -----------------------------
+        # GT uses vals_st directly
+        mask_gt = self.vox_gt.occupied_mask()
+
+        if mask_gt.any():
+            # Get centers of occupied GT voxels
+            centers_gt = self.vox_gt.voxel_centers()[mask_gt].detach().cpu().numpy()
+
+            # Create Green colors (0, 255, 0)
+            colors_gt = np.zeros_like(centers_gt)
+            colors_gt[:, 1] = 255
+
+            self._write_ply(
+                os.path.join(save_dir, f"step_{step_idx}_gt.ply"),
+                centers_gt,
+                colors_gt
+            )
+
+        # -----------------------------
+        # 2. Export Prediction (Red)
+        # -----------------------------
+        # Pred needs decoding from latent state
+        logits_pred = self.vox.decode_occupancy(with_xyz_cond=False)
+        probs_pred = torch.sigmoid(logits_pred)
+
+        # Threshold at 0.5 (or custom threshold)
+        mask_pred = probs_pred > 0.5
+
+        if mask_pred.any():
+            # Get centers of predicted occupied voxels
+            centers_pred = self.vox.voxel_centers()[mask_pred].detach().cpu().numpy()
+
+            # Create Red colors (255, 0, 0)
+            colors_pred = np.zeros_like(centers_pred)
+            colors_pred[:, 0] = 255
+
+            self._write_ply(
+                os.path.join(save_dir, f"step_{step_idx}_pred.ply"),
+                centers_pred,
+                colors_pred
+            )
+
+        print(f"[Viz] Saved separated PLYs to {save_dir}/step_{step_idx}_*.ply")
+
+    def _write_ply(self, filename, points, colors):
+        """Helper to write colored PLY file"""
+        if len(points) == 0:
+            return
+
+        header = f"""ply
+        format ascii 1.0
+        element vertex {len(points)}
+        property float x
+        property float y
+        property float z
+        property uchar red
+        property uchar green
+        property uchar blue
+        end_header
+        """
+        with open(filename, "w") as f:
+            f.write(header)
+            for p, c in zip(points, colors):
+                f.write(f"{p[0]:.4f} {p[1]:.4f} {p[2]:.4f} {int(c[0])} {int(c[1])} {int(c[2])}\n")
+
     def export_debug_ply(self, filename, step_idx):
         """
         Exports the current State vs GT to a color-coded PLY file.
@@ -2257,9 +2605,9 @@ def main():
         # dataset_root="/Users/marvin/Documents/Thesis/repo/dataset_generation/habitat/",
         #dataset_root="/home/mpk40/Documents/data/",
         dataset_root="/cluster/scratch/kochmar/renders/",
-        gt_voxels_file="gt_voxels_per_timestep_01_v2",
+        gt_voxels_file="gt_voxels_per_timestep_01",
         precomputed_cache_file="precomputed_cache",
-        pose_file="gt_poses_v2",
+        pose_file="gt_poses",
         seq_file="seq_manifest.json",
         voxel_size=0.2,
         radius_m=1,
@@ -2321,8 +2669,9 @@ def main():
 
 
     # 2. Load the checkpoint file manually
-    ckpt_path = "/cluster/scratch/kochmar/checkpoints/voxup-epoch=03-val_loss_total=nan.ckpt"
-    ckpt_path = "/cluster/scratch/kochmar/checkpoints/full/voxup-epoch=05-val_loss_total=27.0719.ckpt"
+    #ckpt_path = "/cluster/scratch/kochmar/checkpoints/voxup-epoch=03-val_loss_total=nan.ckpt"
+    #ckpt_path = "/cluster/scratch/kochmar/checkpoints/full/voxup-epoch=05-val_loss_total=27.0719.ckpt"
+    ckpt_path = "/cluster/scratch/kochmar/checkpoints/full/voxup-epoch=05-val_loss_total=11.2481.ckpt"
     checkpoint = torch.load(ckpt_path, map_location="cpu") # Load to CPU first to save GPU mem
     state_dict = checkpoint["state_dict"]
 
@@ -2370,9 +2719,9 @@ def main():
         logger=wandb_logger,
     )
     #print(">>> before trainer.fit()", flush=True)
-    ckpt_path = "/cluster/scratch/kochmar/checkpoints/full/voxup-epoch=11-val_loss_total=11.0512.ckpt"
+    #ckpt_path = "/cluster/scratch/kochmar/checkpoints/full/voxup-epoch=05-val_loss_total=11.2481.ckpt"
 
-    trainer.fit(sys, dm, ckpt_path=ckpt_path)
-    #trainer.fit(sys, dm)
+    #trainer.fit(sys, dm, ckpt_path=ckpt_path)
+    trainer.fit(sys, dm)
 if __name__ == "__main__":
     main()

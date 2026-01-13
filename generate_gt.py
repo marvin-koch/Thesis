@@ -1152,8 +1152,8 @@ def main():
     seqs = dataset.seq_paths
     print(f"[GT] Found {len(seqs)} sequences.")
 
-    out_root = os.path.join(dataset_root, "gt_voxels_per_timestep_01_v2")
-    out_root_pose = os.path.join(dataset_root, "gt_poses_v2")
+    out_root = os.path.join(dataset_root, "gt_voxels_per_timestep_01")
+    out_root_pose = os.path.join(dataset_root, "gt_poses")
     os.makedirs(out_root, exist_ok=True)
 
     for seq_idx in range(len(seqs)):
