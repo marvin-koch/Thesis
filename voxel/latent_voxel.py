@@ -221,7 +221,8 @@ class LatentToOccupancyDecoder(nn.Module):
         self.fc2 = nn.Linear(hidden, hidden)
         self.fc3 = nn.Linear(hidden, 1)
 
-        nn.init.constant_(self.fc3.bias, -3.0)      
+        #nn.init.constant_(self.fc3.bias, -3.0)      
+        nn.init.constant_(self.fc3.bias, 0.0)      
         nn.init.zeros_(self.fc3.weight)
           
     def _fourier_pe(self, xyz: torch.Tensor) -> torch.Tensor:
@@ -370,6 +371,21 @@ class LatentVoxelGrid(nn.Module):
         self.z_proj = nn.Identity()
         # update modules
         self.gru_cell = nn.GRUCell(input_size=feature_dim, hidden_size=feature_dim)
+        self.input_gain = nn.Parameter(torch.tensor(1.0))
+
+
+        bias_ih = self.gru_cell.bias_ih
+        bias_hh = self.gru_cell.bias_hh
+
+        # 2. Force the Update Gate (middle chunk) to be positive (+1.0)
+        # This sets the default behavior to "Update" (Forget history), preventing freezing.
+        # Set Update gate bias (indices dim to 2*dim) to +1.0
+        with torch.no_grad():
+            # 1. Initialize all biases to 0 first
+            self.gru_cell.bias_ih.zero_()
+            self.gru_cell.bias_hh.zero_()
+            bias_ih[feature_dim : 2*feature_dim].fill_(1.0)
+            bias_hh[feature_dim : 2*feature_dim].fill_(1.0)
         
         self.update_mlp = nn.Sequential(
             nn.Linear(2* feature_dim, 2*feature_dim),
@@ -415,6 +431,9 @@ class LatentVoxelGrid(nn.Module):
         nn.init.constant_(self.decoder.fc3.bias, -3.0) 
         # Weight 0.0 -> Prevents random noise from overriding the bias
         nn.init.zeros_(self.decoder.fc3.weight)
+
+
+
         
 
 
@@ -675,6 +694,9 @@ class LatentVoxelGrid(nn.Module):
         return self.keys[self.occupied_mask()]
 
 
+    def generate_phantom_points_none(self, origins, terminations, n_samples=3):
+        return torch.empty((0, 3), device=self.device), torch.empty((0, self.feature_dim), device=self.device)
+
     def generate_phantom_points(self, origins, terminations, n_samples=3):
             """
             origins: (N, 3) Camera centers corresponding to each point
@@ -685,8 +707,10 @@ class LatentVoxelGrid(nn.Module):
             
             # 1. Create random ratios between 0.0 (camera) and 0.90 (near wall)
             # We stop at 0.90 to avoid putting a phantom point inside the wall
-            ratios = torch.rand(N, n_samples, device=self.device) * 0.90
-            
+
+            #ratios = torch.rand(N, n_samples, device=self.device) * 0.90
+            ratios = torch.rand(N, n_samples, device=self.device) * 0.85
+           
             # 2. Interpolate: P_phantom = Origin + t * (Wall - Origin)
             # (N, 1, 3)
             vec = (terminations - origins).unsqueeze(1) 
@@ -705,7 +729,7 @@ class LatentVoxelGrid(nn.Module):
 
 
 
-    def update_with_features(self,
+    def update_with_features2(self,
                             pts_world: torch.Tensor,  # (N,3)
                             f_pts: torch.Tensor,      # (N,D)
                             radius: float = 0.25,
@@ -941,7 +965,10 @@ class LatentVoxelGrid(nn.Module):
 
         combined = torch.cat([z_sel, u_sel], dim=-1) # (U, 2D)
         delta = self.update_mlp(combined)
-        z_new = delta
+
+        #z_new = z_sel + delta
+        z_new = self.gru_cell(delta, z_sel)
+        #z_new = delta
 
 
 
@@ -962,7 +989,7 @@ class LatentVoxelGrid(nn.Module):
         #print("Gru took", time.time() - start, "seconds!")
 
             
-    def update_with_features2(self,
+    def update_with_features(self,
                             pts_world: torch.Tensor,  # (N,3)
                             f_pts: torch.Tensor,      # (N,D)
                             radius: float = 0.25,     # <--- Increase this! (e.g., 0.20 -> 0.40)
@@ -994,7 +1021,8 @@ class LatentVoxelGrid(nn.Module):
             r_vox = int(math.ceil(radius / max(vox, 1e-8))) + int(neighbor_pad)
             r_vox = min(r_vox, int(r_vox_cap))
             K_ball_bound = (2 * r_vox + 1) ** 3
-            K_ball_cap   = 256  # <--- Increased Cap to handle larger radius
+            K_ball_cap   = 32  # <--- Increased Cap to handle larger radius
+            K_ball_cap   = 16  # <--- Increased Cap to handle larger radius
             K_ball = min(M, K_ball_bound, K_ball_cap)
         else:
             K_ball = 0
@@ -1094,8 +1122,12 @@ class LatentVoxelGrid(nn.Module):
         #    z_new = self.gru_cell(x_in, z_sel)
 
         combined = torch.cat([z_sel, u_sel], dim=-1) # (U, 2D)
-        delta = self.update_mlp(combined)
-        z_new = delta
+        delta = self.update_mlp(combined) * self.input_gain
+
+        
+        #z_new = delta
+        z_new = self.gru_cell(delta, z_sel)
+
 
 
         if not torch.isfinite(z_new).all():

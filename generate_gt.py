@@ -258,7 +258,83 @@ def pick_one_for_image_extra(i, tau_mst, tau_extra):
             return e
     return None
 
+# Replace schedule_pairs in test_voxel_dust3r_fast_no_opt_iter.py
+
 def schedule_pairs(changed_gids, local2gid, pairs, budget,
+                tau_mst=0.0, tau_extra=0.4, max_count=4, refresh_one_stale_mst=True):
+
+    # 1. Identify changed images
+    changed_local = sorted(list({i for i, gid in local2gid.items() if gid in changed_gids}))
+
+    run_set = set()     # Stores edges (vi_idx, vj_idx)
+    edge_lut = []
+
+    # 2. Define a helper to get all potential edges for an image
+    #    (Combines MST list + Extra list)
+    def get_candidate_edges(idx):
+        candidates = []
+        # Priority 1: MST edges (high structure)
+        if idx in GA_CACHE["incident_mst"]:
+            candidates.extend(GA_CACHE["incident_mst"][idx])
+        # Priority 2: Extra edges (more constraints)
+        if idx in GA_CACHE["incident_extra"]:
+             candidates.extend(GA_CACHE["incident_extra"][idx])
+        return candidates
+
+    # 3. Round-Robin Greedy Fill
+    #    We cycle through all changed images, picking 1 new edge for each,
+    #    then repeat until we hit the global budget.
+
+    passes = 0
+    max_passes = 5  # Cap to prevent infinite loops if graph is small
+
+    while len(run_set) < budget and passes < max_passes:
+        added_anything = False
+
+        for i in changed_local:
+            if len(run_set) >= budget: break
+
+            candidates = get_candidate_edges(i)
+
+            # Find the first candidate we haven't used yet
+            picked = None
+            for edge in candidates:
+                # 'edge' is typically a tuple (u, v)
+                # Check if this edge (or its reverse) is already scheduled
+                if edge not in run_set and (edge[1], edge[0]) not in run_set:
+                    picked = edge
+                    break
+
+            if picked:
+                run_set.add(picked)
+                added_anything = True
+
+        if not added_anything:
+            break # We exhausted all possible edges for these images
+
+        passes += 1
+
+    # 4. Convert run_set to output format aligned with 'pairs'
+    pairs_to_run = []
+    run_mask = []
+
+    # We need to map the (i,j) tuples back to the index in the 'pairs' list
+    # The simplest way is to iterate the full pairs list and check membership
+    for idx, (vi, vj) in enumerate(pairs):
+        i, j = vi["idx"], vj["idx"]
+
+        # Check if this pair (in either direction) was selected
+        if (i, j) in run_set or (j, i) in run_set:
+            pairs_to_run.append((vi, vj))
+            edge_lut.append(idx)
+            run_mask.append(True)
+        else:
+            run_mask.append(False)
+
+    print(f"Scheduled {len(pairs_to_run)} pairs (Budget: {budget})")
+    return pairs_to_run, run_mask, edge_lut
+
+def schedule_pairs_2(changed_gids, local2gid, pairs, budget,
                 tau_mst=0.0, tau_extra=0.4, max_count=4, refresh_one_stale_mst=True):
     """
     returns: pairs_to_run, run_mask (aligned with `pairs`), edge_lut (indices into `pairs`)
@@ -549,7 +625,7 @@ def get_reconstructed_scene(
 
 
 
-    B = max(1, len(imgs))  # hard cap
+    B = max(1, len(imgs)) * 10  # hard cap
     pairs_to_run, run_mask, edge_lut = schedule_pairs(
         changed_gids=changed_gids,
         local2gid=local2gid,
@@ -980,6 +1056,8 @@ def build_gt_voxel_for_timestep(
     CONF   = "world_points_conf"
     threshold = 1.0
     z_clip_map = (-3.0, 3.0)
+    #z_clip_map = (-0.1, 0.3)
+
 
     # rotation to map world->metric frame (same as in your code)
     R_w2m_np = np.array([[0, 0, -1],
@@ -1059,6 +1137,7 @@ def build_gt_voxel_for_timestep(
             print(f"[GT] Scaling Scene: {current_size:.2f}m -> 5.00m (Factor: {scale_factor:.2f}x)")
            
 
+        #scale_factor = 1.0
         # 1. Scale Points
         predictions["world_points"] = raw_pts * scale_factor
         tmw_scaled = tmw * scale_factor
@@ -1132,6 +1211,7 @@ def build_gt_voxel_for_timestep(
 def main():
     dataset_root = "/cluster/scratch/kochmar/eval/"   # same as in your TrainConfig
     voxel_size = 0.2
+    #voxel_size = 0.01
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
@@ -1146,18 +1226,19 @@ def main():
         dataset_root=dataset_root,
         size=512,
         verbose=False,
-        seq_list  = "/cluster/scratch/kochmar/eval/seq_manifest.json"
+        seq_list  = dataset_root + "seq_manifest.json"
     )
 
     seqs = dataset.seq_paths
     print(f"[GT] Found {len(seqs)} sequences.")
 
-    out_root = os.path.join(dataset_root, "gt_voxels_per_timestep_01")
-    out_root_pose = os.path.join(dataset_root, "gt_poses")
+    out_root = os.path.join(dataset_root, "gt_voxels_per_timestep_new")
+    out_root_pose = os.path.join(dataset_root, "gt_poses_new")
     os.makedirs(out_root, exist_ok=True)
 
-    for seq_idx in range(len(seqs)):
+    for seq_idx in range(0, len(seqs)):
     #for seq_idx in range(len(seqs)-1 , -1, -1):
+    #for seq_idx in range(116 , -1, -1):
     #for seq_idx in range(0, len(seqs)):
         print(seq_idx)
         batch = dataset[seq_idx]        # __getitem__ returns dict with seq info

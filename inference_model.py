@@ -11,17 +11,25 @@ from voxel.utils import *
 def main():
     ckpt_path = "/cluster/scratch/kochmar/checkpoints/full/voxup-epoch=07-val_loss_total=12.8810.ckpt"
     ckpt_path = "/cluster/scratch/kochmar/checkpoints/full/voxup-epoch=07-val_loss_total=10.9045.ckpt"
-    out_dir = "/cluster/scratch/kochmar/predict_outputs_eval/"
+    ckpt_path = "/cluster/scratch/kochmar/checkpoints/full2/voxup-epoch=09-val_loss_total=8.8623.ckpt"
+    ckpt_path = "/cluster/scratch/kochmar/checkpoints/full3/voxup-epoch=07-val_loss_total=8.8636.ckpt"
+    ckpt_path = "/cluster/scratch/kochmar/checkpoints/full4/voxup-epoch=39-val_loss_total=9.4226.ckpt"
+    ckpt_path = "/cluster/scratch/kochmar/checkpoints/full4/voxup-epoch=19-val_loss_total=9.0813.ckpt"
+    ckpt_path = "/cluster/scratch/kochmar/checkpoints/full5/voxup-epoch=14-val_loss_total=7.6249.ckpt"
+    out_dir = "/cluster/scratch/kochmar/predict_outputs_new/"
     os.makedirs(out_dir, exist_ok=True)
+
+    STEP = 20
 
     # IMPORTANT: cfg must match what the checkpoint expects (feature_dim, voxel_size, etc.)
     cfg = TrainConfig(
-        dataset_root="/cluster/scratch/kochmar/eval/",
-        gt_voxels_file="gt_voxels_per_timestep_01",
+        dataset_root="/cluster/scratch/kochmar/renders/",
+        gt_voxels_file="gt_voxels_per_timestep_new",
         precomputed_cache_file="precomputed_cache",
-        pose_file="gt_poses",
+        pose_file="gt_poses_new",
         seq_file="seq_manifest.json",
         voxel_size=0.2,
+        #voxel_size=0.01,
         radius_m=1,
         topk=8,
         temp=0.5,
@@ -46,9 +54,10 @@ def main():
         num_workers=cfg.num_workers,
         size=512,
         verbose=False,
-        train_val_split=0.1,  # doesn't matter if you pass your own loader below
+        train_val_split=0.08,  # doesn't matter if you pass your own loader below
         skip=True,
         seq_list=os.path.join(cfg.dataset_root, cfg.seq_file),
+        step=STEP
     )
     dm.setup("predict")
 

@@ -1297,7 +1297,8 @@ def build_maps_from_latent_features(
         pts_phantom, feats_phantom = tvox.generate_phantom_points(
             cameras, 
             pts, 
-            n_samples=3 
+            n_samples=2 
+            #n_samples=1
         )
     
         pts_total = torch.cat([pts, pts_phantom], dim=0)

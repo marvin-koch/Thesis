@@ -57,7 +57,7 @@ import matplotlib.pyplot as plt
 import PIL
 
 
-STEP = 1
+STEP = 20
 
 def load_sparse_voxel_grid(path, device):
     data = np.load(path)
@@ -88,8 +88,34 @@ def load_sparse_voxel_grid(path, device):
 
     return vox_gt
 
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.8, gamma=2.0, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
 
+    def forward(self, inputs, targets):
+        # BCEWithLogitsLoss combines Sigmoid and BCE.
+        bce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
+        pt = torch.exp(-bce_loss)  # pt is the probability of the true class
 
+        # --- THE CRITICAL FIX ---
+        # alpha_t is a vector the same size as targets.
+        # If target is 1 (Wall): weight = 0.8
+        # If target is 0 (Empty): weight = 0.2 (i.e., 1 - 0.8)
+        # This creates a 4:1 penalty ratio, forcing the model to care about walls.
+        alpha_t = torch.where(targets == 1, self.alpha, 1 - self.alpha)
+
+        # Apply the dynamic weight
+        focal_loss = alpha_t * (1 - pt) ** self.gamma * bce_loss
+
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
 # --------------------------
 # 1) Your modules (import these from your codebase)
 # --------------------------
@@ -137,6 +163,7 @@ class TrainConfig:
     skip: bool = False
     
     n_accum: int = 4               # gradient accumulation steps
+    #n_accum: int = 1               # gradient accumulation steps
     stride: int = 4               # ray stride for voxel supervision
 
 
@@ -186,11 +213,18 @@ class VoxelUpdaterSystem(pl.LightningModule):
         self.automatic_optimization = False   # <<< add this
         
         self.bev_window_m=(50.0, 50.0)
+        #self.bev_window_m=(5.0, 5.0)
         self.bev_origin_xy=(-25.0, -25.0)
-        #self.z_band_bev=(1.0, 3.0)
-        self.z_band_bev=(-1.0, 2.0)
+        #self.bev_origin_xy=(-10.0, -10.0)
+        self.z_band_bev=(1.0, 3.0)
+        self.z_band_bev=(-2.0, 3.0)
+        #self.z_band_bev=(-1.0, 2.0)
+
+        #self.z_band_bev=(-0.02, 0.1)
 
         self.fp_weight = 0.0
+
+        self.criterion = FocalLoss(alpha=0.8, gamma=2.0)
 
     def configure_optimizers(self):
     
@@ -475,8 +509,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
             bev_window_m=self.bev_window_m, # local 20x20 m
             bev_origin_xy=self.bev_origin_xy,
             z_clip_vox=(-np.inf, np.inf),
-            #z_band_bev=(self.z_band_bev[0], self.z_band_bev[1]),
-            z_band_bev=(self.z_band_bev[0] - 0.4, self.z_band_bev[1]),
+            z_band_bev=(self.z_band_bev[0], self.z_band_bev[1]),
+            #z_band_bev=(self.z_band_bev[0] - 0.4, self.z_band_bev[1]),
             frame_ids=frame_ids,
             radius= self.cfg.radius_m
         )
@@ -860,6 +894,9 @@ class VoxelUpdaterSystem(pl.LightningModule):
         mst = False
         
 
+
+        vox_gt_prev = None
+
         for t in range(T):
             print(t)
             imgs = batch["imgs_t"][t]
@@ -1042,11 +1079,11 @@ class VoxelUpdaterSystem(pl.LightningModule):
             total_pred = logit_pred_before.numel()
             total_gt = p_occ_tgt.numel()
             mask_pred = sum(valid_mask)
-            print("Pred len", total_pred)
-            print("GT len", total_gt)
-            print("Mask len", mask_pred)
-            print("Mask/Pred", (mask_pred/total_pred))
-            print("Mask/GT", (mask_pred/total_gt))
+            #print("Pred len", total_pred)
+            #print("GT len", total_gt)
+            #print("Mask len", mask_pred)
+            #print("Mask/Pred", (mask_pred/total_pred))
+            #print("Mask/GT", (mask_pred/total_gt))
 
             #_, valid_gt = self.align_probs_to_keys(self.vox.keys, torch.ones_like(logit_pred_before), self.vox_gt.keys, default=0.0)
 
@@ -1063,6 +1100,71 @@ class VoxelUpdaterSystem(pl.LightningModule):
             
             loss_intersect = torch.tensor(0.0, device=self.device)
             pos_weight = torch.tensor(1.0, device=self.device)
+
+
+
+
+
+            # ---------------------------------------------------------
+            # NEW: TEMPORAL DELTA LOGIC
+            # ---------------------------------------------------------
+
+
+            # We need a mask that says: "Did this specific voxel CHANGE since the last frame?"
+            """
+            change_mask = torch.zeros_like(tgt_intersect, dtype=torch.bool)
+
+            # Check if we have history stored
+            if vox_gt_prev is not None:
+                # Query the PREVIOUS GT structure using CURRENT keys.
+                # This aligns the past world to the current view.
+                _, tgt_prev_aligned = self.align_probs_to_keys_soft(
+                     self.vox, torch.ones_like(logit_pred_before), vox_gt_prev, default=0.0
+                )
+
+                # Extract the same subset of valid voxels
+                tgt_prev_intersect = tgt_prev_aligned[valid_mask]
+
+                # Calculate Change: XOR Logic (Wall->Empty OR Empty->Wall)
+                # We treat >0.5 as occupied.
+                current_bool = (tgt_intersect > 0.5)
+                prev_bool    = (tgt_prev_intersect > 0.5)
+                change_mask  = (current_bool != prev_bool)
+
+            # ---------------------------------------------------------
+
+            loss_intersect = torch.tensor(0.0, device=self.device)
+
+            if pred_intersect.numel() > 0:
+                # A. Calculate Spatial Balance (Walls vs Empty) - EXISTING LOGIC
+                pos_mask = (tgt_intersect > 0.5)
+                num_pos = pos_mask.sum()
+                num_neg = (~pos_mask).sum()
+
+                pos_weight = torch.tensor(1.0, device=self.device)
+                if num_pos > 0:
+                    pos_weight = (num_neg.float() / (num_pos.float() + 1e-8)).clamp(min=1.0, max=20.0)
+
+                # Start with base weights
+                weights = torch.ones_like(tgt_intersect, device=self.device)
+                weights[pos_mask] = pos_weight
+
+                # B. Inject Temporal Bounty - NEW LOGIC
+                # Multiply the weight of changed voxels by 10.0 (The Bounty)
+                # This stacks with pos_weight! A moving wall gets 20.0 * 10.0 = 200.0 weight.
+                temporal_bounty = 10.0
+                weights[change_mask] *= temporal_bounty
+
+                # C. Use Standard BCE (Manual Weighting gives you more control than FocalLoss here)
+                loss_intersect = F.binary_cross_entropy_with_logits(
+                    pred_intersect,
+                    tgt_intersect,
+                    weight=weights,  # <--- Passing the "Sniper" weights
+                    reduction='mean'
+                )
+
+            vox_gt_prev = self.vox_gt
+            """
 
             if pred_intersect.numel() > 0:
                 # Calculate weight for positives just like before
@@ -1095,6 +1197,10 @@ class VoxelUpdaterSystem(pl.LightningModule):
                     weight=weights,
                     reduction='mean'
                 )
+
+
+                #loss_intersect = self.criterion(pred_intersect, tgt_intersect)
+
 
             # ---------------------------------------------------------
             # PART B: Loss on False Positives (Pred - GT)
@@ -1230,23 +1336,24 @@ class VoxelUpdaterSystem(pl.LightningModule):
             current_pos_weight = pos_weight if isinstance(pos_weight, torch.Tensor) else torch.tensor(pos_weight)
 
             # --- PRINT TO TERMINAL (Every 100 steps or on specific batch) ---
-            print(f"\n[Step {batch_idx} Analysis]")
-            print(f"  GT Walls: {int(num_pos_gt)} voxels ({pos_ratio:.4%} of volume)")
-            print(f"  Pred Walls: {int(num_pred_active)} voxels")
-            print(f"  Confidence: Walls={avg_prob_on_walls:.4f}, Empty={avg_prob_on_empty:.4f}")
-            print(f"  Pos Weight Used: {current_pos_weight.item():.2f}")
-            print(f"  IoU Components: Intersect={int(intersection)} / Union={int(union)}")
-            print("-" * 30)
+            #print(f"\n[Step {batch_idx} Analysis]")
+            #print(f"  GT Walls: {int(num_pos_gt)} voxels ({pos_ratio:.4%} of volume)")
+            #print(f"  Pred Walls: {int(num_pred_active)} voxels")
+            #print(f"  Confidence: Walls={avg_prob_on_walls:.4f}, Empty={avg_prob_on_empty:.4f}")
+            #print(f"  Pos Weight Used: {current_pos_weight.item():.2f}")
+            #print(f"  IoU Components: Intersect={int(intersection)} / Union={int(union)}")
+            #print("-" * 30)
 
 
             torch.cuda.empty_cache()
             
-        
+    
         # ---- End of Sequence Loop ----
 
         # # 1. Clip Gradients
         grad_norm = self.compute_grad_norm()
         torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=float(self.cfg.n_accum))            
+
         
         # # 2. Optimizer Step
         # opt.step()            
@@ -1651,7 +1758,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
         return val_loss_total
     
 
-    def predict_step(self, batch: Dict, batch_idx: int, dataloader_idx: int = 0):
+    def predict_step(self, batch: Dict, batch_idx: int, dataloader_idx: int = 0, step=20):
         device = self.device
 
         self.vox.reset_state()
@@ -1692,13 +1799,13 @@ class VoxelUpdaterSystem(pl.LightningModule):
         gt_seq = []
         for t in range(T):
             if self.cfg.skip:
-                t = t * STEP
+                t = t * step
             gt_path = os.path.join(gt_root, f"{seq_id}_t{t:04d}_gt.npz")
 
             if os.path.exists(gt_path):
                 vox_gt_t = load_sparse_voxel_grid(gt_path, device)
             else:
-                # print(f"Warning: GT missing for {gt_path}")
+                print(f"Warning: GT missing for {gt_path}")
                 vox_gt_t = None
             gt_seq.append(vox_gt_t)
 
@@ -1726,7 +1833,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
             if self.vox_gt is None:
                 continue
 
-            p = t * STEP
+            p = t * step
             cache_path = os.path.join(precomputed_root, seq_id, f"t{p:04d}.pt")
             if not os.path.exists(cache_path):
                 continue
@@ -2394,7 +2501,8 @@ class HabitatSeqDataset(Dataset):
         min_images_per_timestep: int = 1,
         sequences: Optional[List[str]] = None,   # pass a subset for train/val if you want
         skip=False,
-        seq_list: str = "/cluster/scratch/kochmar/renders/seq_manifest.json"
+        seq_list: str = "/cluster/scratch/kochmar/renders/seq_manifest.json",
+        step=1
 
     ):
         self.root = dataset_root
@@ -2403,6 +2511,7 @@ class HabitatSeqDataset(Dataset):
         self.min_images_per_timestep = min_images_per_timestep
         self.skip = skip
         self.seq_list = seq_list
+        self.step = step
         
         if sequences is None:
             # seqs = _sequence_dirs_from_root(dataset_root)
@@ -2460,7 +2569,7 @@ class HabitatSeqDataset(Dataset):
 
         imgs_t: List[List[Dict]] = []
         for t, td in enumerate(t_dirs):
-            if t % STEP != 0 and self.skip:
+            if t % self.step != 0 and self.skip:
                 continue
             imgs = self._load_timestep(td)
             if imgs:
@@ -2496,7 +2605,8 @@ class HabitatDataModule(pl.LightningDataModule):
         train_val_split: float = 0.0,  # 0 = all train, else fraction for val (e.g., 0.1)
         seed: int = 42,
         skip=False,
-        seq_list: str = "/cluster/scratch/kochmar/renders/seq_manifest.json"
+        seq_list: str = "/cluster/scratch/kochmar/renders/seq_manifest.json",
+        step=1
     ):
         super().__init__()
         self.dataset_root = dataset_root
@@ -2511,6 +2621,7 @@ class HabitatDataModule(pl.LightningDataModule):
         self.val_set = None
         self.skip = skip
         self.seq_list = seq_list
+        self.step = step
     def setup(self, stage: Optional[str] = None):
         #print("getting seqs")
         # all_seqs = _sequence_dirs_from_root(self.dataset_root)
@@ -2557,7 +2668,8 @@ class HabitatDataModule(pl.LightningDataModule):
             verbose=self.verbose,
             sequences=train_seqs,
             skip=self.skip,
-            seq_list=self.seq_list
+            seq_list=self.seq_list,
+            step=self.step
         )
         
         self.val_set = HabitatSeqDataset(
@@ -2566,7 +2678,8 @@ class HabitatDataModule(pl.LightningDataModule):
             verbose=self.verbose,
             sequences=val_seqs,
             skip=self.skip,
-            seq_list=self.seq_list
+            seq_list=self.seq_list,
+            step=self.step
         ) if val_seqs else None
 
     def train_dataloader(self):
@@ -2605,9 +2718,9 @@ def main():
         # dataset_root="/Users/marvin/Documents/Thesis/repo/dataset_generation/habitat/",
         #dataset_root="/home/mpk40/Documents/data/",
         dataset_root="/cluster/scratch/kochmar/renders/",
-        gt_voxels_file="gt_voxels_per_timestep_01",
+        gt_voxels_file="gt_voxels_per_timestep_new",
         precomputed_cache_file="precomputed_cache",
-        pose_file="gt_poses",
+        pose_file="gt_poses_new",
         seq_file="seq_manifest.json",
         voxel_size=0.2,
         radius_m=1,
@@ -2615,15 +2728,19 @@ def main():
         temp=0.5,
         feature_dim=32,
         occ_decoder_hidden=64,
-        lr=3e-4,
+        #lr=3e-4,
+        lr=3e-3,
         max_epochs=200,
         batch_size=1,
         num_workers=0,
         precision="bf16",
         skip=True,
         weight_decay=0.05,
+        #weight_decay=0.00,
         lambda_occ= 1.0,
         lambda_temp = 0.05,      # temporal consistency weight
+        #lambda_temp = 0.00001,      # temporal consistency weight
+
         lambda_ent = 1e-3,      # routing entropy reg
         lambda_tv = 1e-4 ,      # (optional) spatial TV on occupancy
     )
@@ -2634,9 +2751,11 @@ def main():
         num_workers=cfg.num_workers,
         size=512,
         verbose=False,
-        train_val_split=0.2,  # or whatever you want
+        train_val_split=0.5,  # or whatever you want
         skip=True,
-        seq_list=os.path.join(cfg.dataset_root, cfg.seq_file)
+        seq_list=os.path.join(cfg.dataset_root, cfg.seq_file),
+        step=STEP
+        
     )
 
     sys = VoxelUpdaterSystem(cfg)
@@ -2647,9 +2766,9 @@ def main():
     #    cfg=cfg
     #)
     ckpt_cb = pl.callbacks.ModelCheckpoint(
-        dirpath="/cluster/scratch/kochmar/checkpoints/full",       # Explicitly set a folder so you can find them
+        dirpath="/cluster/scratch/kochmar/checkpoints/full5",       # Explicitly set a folder so you can find them
         monitor="val_loss_total",
-        save_top_k=5,
+        save_top_k=3,
         mode="min",
         filename="voxup-{epoch:02d}-{val_loss_total:.4f}" # Match the key logged in validation_step
     )
@@ -2671,7 +2790,8 @@ def main():
     # 2. Load the checkpoint file manually
     #ckpt_path = "/cluster/scratch/kochmar/checkpoints/voxup-epoch=03-val_loss_total=nan.ckpt"
     #ckpt_path = "/cluster/scratch/kochmar/checkpoints/full/voxup-epoch=05-val_loss_total=27.0719.ckpt"
-    ckpt_path = "/cluster/scratch/kochmar/checkpoints/full/voxup-epoch=05-val_loss_total=11.2481.ckpt"
+    ckpt_path = "/cluster/scratch/kochmar/checkpoints/full3/voxup-epoch=07-val_loss_total=8.8636.ckpt"
+    ckpt_path = "/cluster/scratch/kochmar/checkpoints/full4/voxup-epoch=39-val_loss_total=9.4226.ckpt"
     checkpoint = torch.load(ckpt_path, map_location="cpu") # Load to CPU first to save GPU mem
     state_dict = checkpoint["state_dict"]
 
@@ -2705,12 +2825,22 @@ def main():
     
 
  
+    """
+    print("Applying GRU Surgery...")
+    dim = sys.vox.feature_dim
+    with torch.no_grad():
+        # Force Update Gate bias to -2.0 (Open/Reactive)
+        # This overwrites whatever the checkpoint just loaded.
+        sys.vox.gru_cell.bias_ih[dim : 2*dim].fill_(-2.0)
+        sys.vox.gru_cell.bias_hh[dim : 2*dim].fill_(-2.0)
+
+    """
     trainer = pl.Trainer(
         max_epochs=cfg.max_epochs,
         precision=cfg.precision,
         #gradient_clip_val=1.0,
         log_every_n_steps=1,
-        check_val_every_n_epoch=2,
+        check_val_every_n_epoch=3,
         callbacks=[ckpt_cb, lr_cb],
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=1,
@@ -2719,9 +2849,12 @@ def main():
         logger=wandb_logger,
     )
     #print(">>> before trainer.fit()", flush=True)
-    #ckpt_path = "/cluster/scratch/kochmar/checkpoints/full/voxup-epoch=05-val_loss_total=11.2481.ckpt"
+    #ckpt_path = "/cluster/scratch/kochmar/checkpoints/full/voxup-epoch=07-val_loss_total=10.9045.ckpt"
+
+
 
     #trainer.fit(sys, dm, ckpt_path=ckpt_path)
+
     trainer.fit(sys, dm)
 if __name__ == "__main__":
     main()
