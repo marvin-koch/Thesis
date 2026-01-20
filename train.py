@@ -217,7 +217,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
         self.bev_origin_xy=(-25.0, -25.0)
         #self.bev_origin_xy=(-10.0, -10.0)
         self.z_band_bev=(1.0, 3.0)
-        self.z_band_bev=(-2.0, 3.0)
+        self.z_band_bev=(-2.2, 3.5)
         #self.z_band_bev=(-1.0, 2.0)
 
         #self.z_band_bev=(-0.02, 0.1)
@@ -895,7 +895,11 @@ class VoxelUpdaterSystem(pl.LightningModule):
         
 
 
-        vox_gt_prev = None
+        self.vox_gt_prev = None
+        self.tgt_prev = None
+
+
+
 
         for t in range(T):
             print(t)
@@ -1110,6 +1114,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
             # ---------------------------------------------------------
 
 
+
+
             # We need a mask that says: "Did this specific voxel CHANGE since the last frame?"
             """
             change_mask = torch.zeros_like(tgt_intersect, dtype=torch.bool)
@@ -1191,15 +1197,101 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 #         reduction="mean"
                 #     )
                     
-                loss_intersect = F.binary_cross_entropy_with_logits(
-                    pred_intersect, 
-                    tgt_intersect, 
-                    weight=weights,
-                    reduction='mean'
-                )
+
+
+
+                """
+                if self.vox_gt_prev is not None:
+
+                    p_occ_tgt_gt_aligned_prev, valid_mask_prev = self.align_probs_to_keys_soft(
+                        self.vox_gt_prev, self.tgt_prev, self.vox, default=0.0
+                    )
+
+                    tgt_intersect_prev = p_occ_tgt_gt_aligned_prev[valid_mask]
+                    # 2. Identify voxels where the GROUND TRUTH actually flipped
+                    # tgt_intersect is your GT for the current frame
+                    curr_bool = (tgt_intersect > 0.5)
+                    prev_bool = (tgt_intersect_prev > 0.5)
+
+                    # change_mask is True only where a voxel went Air -> Wall or Wall -> Air
+                    change_mask = (curr_bool != prev_bool)
+
+                    # 3. Apply the Bounty
+                    weights = torch.ones_like(tgt_intersect)
+
+                    # Keep your existing weighting for occupied voxels
+                    pos_mask = (tgt_intersect > 0.5)
+                    weights[pos_mask] = pos_weight
+
+                    # HEAVY penalty for missing a change
+                    weights[change_mask] *= 10.0
+
+                    # 4. Calculate the reactive loss
+                    loss_intersect = F.binary_cross_entropy_with_logits(
+                        pred_intersect, tgt_intersect, weight=weights, reduction='mean'
+                    )
+
+
+                """
+                if self.vox_gt_prev is not None:
+                    # 1. Align Past to Present
+                    p_occ_tgt_gt_aligned_prev, _ = self.align_probs_to_keys_soft(
+                        self.vox_gt_prev, self.tgt_prev, self.vox, default=0.0
+                    )
+                    tgt_intersect_prev = p_occ_tgt_gt_aligned_prev[valid_mask]
+
+                    # 2. Identify the specific types of change
+                    # curr_bool: True if Wall NOW
+                    # prev_bool: True if Wall BEFORE
+                    curr_bool = (tgt_intersect > 0.5)
+                    prev_bool = (tgt_intersect_prev > 0.5)
+
+                    # Case A: Object Jumped IN (Air -> Wall)
+                    appearing_mask = curr_bool & (~prev_bool)
+
+                    # Case B: Object Jumped OUT (Wall -> Air) -> THIS CAUSES GHOSTING
+                    disappearing_mask = (~curr_bool) & prev_bool
+
+                    # 3. Apply the Weights
+                    weights = torch.ones_like(tgt_intersect)
+
+                    # Base weight for occupied voxels (Static Walls + Appearing Objects)
+                    # If pos_weight is huge (e.g. 50), this ensures we capture walls.
+                    weights[curr_bool] = pos_weight
+
+                    # --- THE BOUNTY FIX ---
+
+                    # Boost "Appearing" slightly more to ensure we catch the jump
+                    weights[appearing_mask] *= 20.0
+                    # (Total weight = pos_weight * 5.0 = 250ish)
+
+                    # Boost "Disappearing" MASSIVELY to fix Precision/Ghosting
+                    # Since the base weight was 1.0, we need to multiply it by pos_weight * 5
+                    # to match the importance of the appearing objects.
+                    weights[disappearing_mask] = 20.0
+                    # (Total weight = 250ish)
+
+                    # 4. Calculate Loss
+                    loss_intersect = F.binary_cross_entropy_with_logits(
+                        pred_intersect, tgt_intersect, weight=weights, reduction='mean'
+                    )
+                else:
+                    loss_intersect = F.binary_cross_entropy_with_logits(
+                        pred_intersect, 
+                        tgt_intersect, 
+                        weight=weights,
+                        reduction='mean'
+
+                    )
 
 
                 #loss_intersect = self.criterion(pred_intersect, tgt_intersect)
+
+
+            self.vox_gt_prev = self.vox_gt
+            self.tgt_prev = p_occ_tgt.detach()
+
+
 
 
             # ---------------------------------------------------------
@@ -2739,7 +2831,7 @@ def main():
         #weight_decay=0.00,
         lambda_occ= 1.0,
         lambda_temp = 0.05,      # temporal consistency weight
-        #lambda_temp = 0.00001,      # temporal consistency weight
+        #lambda_temp = 0.0,      # temporal consistency weight
 
         lambda_ent = 1e-3,      # routing entropy reg
         lambda_tv = 1e-4 ,      # (optional) spatial TV on occupancy
@@ -2751,7 +2843,8 @@ def main():
         num_workers=cfg.num_workers,
         size=512,
         verbose=False,
-        train_val_split=0.5,  # or whatever you want
+        #train_val_split=0.5,  # or whatever you want
+        train_val_split=0.2,  # or whatever you want
         skip=True,
         seq_list=os.path.join(cfg.dataset_root, cfg.seq_file),
         step=STEP
@@ -2791,7 +2884,6 @@ def main():
     #ckpt_path = "/cluster/scratch/kochmar/checkpoints/voxup-epoch=03-val_loss_total=nan.ckpt"
     #ckpt_path = "/cluster/scratch/kochmar/checkpoints/full/voxup-epoch=05-val_loss_total=27.0719.ckpt"
     ckpt_path = "/cluster/scratch/kochmar/checkpoints/full3/voxup-epoch=07-val_loss_total=8.8636.ckpt"
-    ckpt_path = "/cluster/scratch/kochmar/checkpoints/full4/voxup-epoch=39-val_loss_total=9.4226.ckpt"
     checkpoint = torch.load(ckpt_path, map_location="cpu") # Load to CPU first to save GPU mem
     state_dict = checkpoint["state_dict"]
 

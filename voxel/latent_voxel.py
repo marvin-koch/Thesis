@@ -371,7 +371,7 @@ class LatentVoxelGrid(nn.Module):
         self.z_proj = nn.Identity()
         # update modules
         self.gru_cell = nn.GRUCell(input_size=feature_dim, hidden_size=feature_dim)
-        self.input_gain = nn.Parameter(torch.tensor(1.0))
+        self.input_gain = nn.Parameter(torch.tensor(5.0))
 
 
         bias_ih = self.gru_cell.bias_ih
@@ -380,16 +380,19 @@ class LatentVoxelGrid(nn.Module):
         # 2. Force the Update Gate (middle chunk) to be positive (+1.0)
         # This sets the default behavior to "Update" (Forget history), preventing freezing.
         # Set Update gate bias (indices dim to 2*dim) to +1.0
+        """
         with torch.no_grad():
             # 1. Initialize all biases to 0 first
             self.gru_cell.bias_ih.zero_()
             self.gru_cell.bias_hh.zero_()
-            bias_ih[feature_dim : 2*feature_dim].fill_(1.0)
-            bias_hh[feature_dim : 2*feature_dim].fill_(1.0)
+            bias_ih[feature_dim : 2*feature_dim].fill_(-2.0)
+            bias_hh[feature_dim : 2*feature_dim].fill_(-2.0)
         
+        """
+
         self.update_mlp = nn.Sequential(
             nn.Linear(2* feature_dim, 2*feature_dim),
-            nn.LayerNorm(2*feature_dim),
+            #nn.LayerNorm(2*feature_dim),
             nn.GELU(),  # Better than ReLU for gradients
 
             nn.Linear(2*feature_dim, 2*feature_dim),
@@ -399,9 +402,6 @@ class LatentVoxelGrid(nn.Module):
             nn.Linear(2*feature_dim, feature_dim) # Output is the "Delta"
         )
 
-        # Initialize output layer to zero (so training starts stable, preserving memory)
-        nn.init.zeros_(self.update_mlp[-1].weight)
-        nn.init.zeros_(self.update_mlp[-1].bias)
         
         self.sim_net  = FeatureVoxelSimilarity(feature_dim)
         
@@ -419,7 +419,7 @@ class LatentVoxelGrid(nn.Module):
         
         self.decoder = LatentToOccupancyDecoder(feature_dim, cond=None)
         
-        self.free_token = nn.Parameter(torch.randn(1, feature_dim) * 0.1)
+        self.free_token = nn.Parameter(torch.randn(1, feature_dim))
         #self.input_norm = nn.LayerNorm(feature_dim)
 
         # 1. Initialize WHOLE network (Good for fc1, fc2 hidden layers)
@@ -428,7 +428,8 @@ class LatentVoxelGrid(nn.Module):
 
         # 2. Overwrite ONLY the final layer (Fixes the output prior)
         # Bias -3.0 -> ~5% probability
-        nn.init.constant_(self.decoder.fc3.bias, -3.0) 
+        #nn.init.constant_(self.decoder.fc3.bias, -3.0) 
+        nn.init.constant_(self.decoder.fc3.bias, 0.0) 
         # Weight 0.0 -> Prevents random noise from overriding the bias
         nn.init.zeros_(self.decoder.fc3.weight)
 
@@ -601,7 +602,9 @@ class LatentVoxelGrid(nn.Module):
             self.lt_promoted_flag= grow_like(self.lt_promoted_flag, 0)
 
             # grow latents (zeros for new voxels)
-            z_new = torch.zeros((uk.shape[0], self.feature_dim), device=self.device, dtype=self.dtype)
+            current_dtype = self.z_latent.dtype if self.z_latent.numel() > 0 else self.dtype
+            #z_new = torch.zeros((uk.shape[0], self.feature_dim), device=self.device, dtype=self.dtypew)
+            z_new = torch.zeros((uk.shape[0], self.feature_dim), device=self.device, dtype=current_dtype)
             if self.z_latent.numel() > 0:
                 z_new[idx_old] = self.z_latent
             self.z_latent = z_new
@@ -697,7 +700,38 @@ class LatentVoxelGrid(nn.Module):
     def generate_phantom_points_none(self, origins, terminations, n_samples=3):
         return torch.empty((0, 3), device=self.device), torch.empty((0, self.feature_dim), device=self.device)
 
-    def generate_phantom_points(self, origins, terminations, n_samples=3):
+    def generate_phantom_points(self, origins, terminations, n_samples=16):
+        # n_samples=16 is Safe for VRAM, but "Sparse" spatially.
+
+        N = origins.shape[0]
+
+        # 1. Create base steps (0.0, 0.05, 0.10, ... 0.85)
+        # Shape: (1, n_samples)
+        steps = torch.linspace(0, 0.85, n_samples, device=self.device).unsqueeze(0)
+
+        # 2. ADD JITTER (The Magic Fix)
+        # Calculate the gap size between samples
+        step_size = 0.85 / (n_samples - 1)
+
+        # Add random noise: +/- half a step
+        # This ensures the sample could be ANYWHERE along the segment
+        noise = (torch.rand(N, n_samples, device=self.device) - 0.5) * step_size
+
+        # Apply noise to the steps
+        ratios = steps + noise
+        ratios = ratios.clamp(0.0, 0.85) # Keep within ray bounds
+
+        # 3. Generate Points
+        vec = (terminations - origins).unsqueeze(1)
+        phantom_pts = origins.unsqueeze(1) + vec * ratios.unsqueeze(-1)
+        phantom_pts = phantom_pts.reshape(-1, 3)
+
+        # 4. Features (LOUD "Air" Token)
+        phantom_feats = self.free_token.expand(phantom_pts.shape[0], -1)
+
+        return phantom_pts, phantom_feats
+
+    def generate_phantom_points_old(self, origins, terminations, n_samples=3):
             """
             origins: (N, 3) Camera centers corresponding to each point
             terminations: (N, 3) The wall points found by depth
@@ -708,8 +742,8 @@ class LatentVoxelGrid(nn.Module):
             # 1. Create random ratios between 0.0 (camera) and 0.90 (near wall)
             # We stop at 0.90 to avoid putting a phantom point inside the wall
 
-            #ratios = torch.rand(N, n_samples, device=self.device) * 0.90
-            ratios = torch.rand(N, n_samples, device=self.device) * 0.85
+            ratios = torch.rand(N, n_samples, device=self.device) * 0.90
+            #ratios = torch.rand(N, n_samples, device=self.device) * 0.85
            
             # 2. Interpolate: P_phantom = Origin + t * (Wall - Origin)
             # (N, 1, 3)
@@ -1006,6 +1040,23 @@ class LatentVoxelGrid(nn.Module):
         if not torch.isfinite(f_pts).all():
             f_pts = torch.nan_to_num(f_pts, nan=0.0, posinf=0.0, neginf=0.0)
 
+        """
+        # 1. Convert new points to voxel keys
+        ijk_new = self._world_to_ijk(pts_world)
+        keys_new = self._hash_ijk(ijk_new)
+
+        # 2. Filter unique keys to save memory
+        keys_new = torch.unique(keys_new)
+
+        # 3. Expand the grid
+        # This adds 0-initialized latent vectors for the new locations
+        # and updates self.keys so the subsequent query can find them.
+        self._ensure_and_index(keys_new)
+        """
+
+
+
+
         dev = self.device
         N   = int(pts_world.shape[0])
         M   = int(self.keys.shape[0])
@@ -1021,8 +1072,8 @@ class LatentVoxelGrid(nn.Module):
             r_vox = int(math.ceil(radius / max(vox, 1e-8))) + int(neighbor_pad)
             r_vox = min(r_vox, int(r_vox_cap))
             K_ball_bound = (2 * r_vox + 1) ** 3
-            K_ball_cap   = 32  # <--- Increased Cap to handle larger radius
-            K_ball_cap   = 16  # <--- Increased Cap to handle larger radius
+            K_ball_cap   = 64  # <--- Increased Cap to handle larger radius
+            #K_ball_cap   = 16  # <--- Increased Cap to handle larger radius
             K_ball = min(M, K_ball_bound, K_ball_cap)
         else:
             K_ball = 0
@@ -1077,7 +1128,11 @@ class LatentVoxelGrid(nn.Module):
 
         # 2. Initialize accumulator with -Infinity
         # We process in chunks to avoid OOM if Pairs is huge
+
+        #MAX POOLING
         u = torch.full((idx_upd.numel(), D), -1e9, device=dev, dtype=torch.float32)
+
+        #u = torch.zeros((idx_upd.numel(), D), device=dev, dtype=torch.float32)
 
         chunk_size = 50_000
         num_pairs = f_sel.shape[0]
@@ -1098,7 +1153,9 @@ class LatentVoxelGrid(nn.Module):
                 inv_expanded, 
                 f_chunk.float(), 
                 reduce="amax", 
+                #reduce="mean", 
                 include_self=True
+                #include_self=False
             )
 
         # Safety: Replace -inf with 0 (for any voxels that somehow got no updates, though unlikely)
@@ -1121,12 +1178,17 @@ class LatentVoxelGrid(nn.Module):
         #with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
         #    z_new = self.gru_cell(x_in, z_sel)
 
-        combined = torch.cat([z_sel, u_sel], dim=-1) # (U, 2D)
-        delta = self.update_mlp(combined) * self.input_gain
+        #combined = torch.cat([z_sel, u_sel], dim=-1) # (U, 2D)
+        #delta = self.update_mlp(combined) * self.input_gain
 
         
         #z_new = delta
-        z_new = self.gru_cell(delta, z_sel)
+
+        #z_new = self.gru_cell(delta, z_sel)
+        #z_new = torch.tanh(z_new) * 5.0
+        
+        z_new = self.gru_cell(x_in, z_sel)
+        #z_new = u_sel
 
 
 
