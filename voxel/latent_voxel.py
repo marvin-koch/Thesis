@@ -715,6 +715,18 @@ class LatentVoxelGrid(nn.Module):
 
         # Add random noise: +/- half a step
         # This ensures the sample could be ANYWHERE along the segment
+
+
+        """
+        #REMOVE AFTER
+        seed = 42
+        gen = torch.Generator(device=self.device)
+        gen.manual_seed(seed)
+        # Pass the generator to the random function
+        rand_val = torch.rand(N, n_samples, device=self.device, generator=gen)
+        noise = (rand_val - 0.5) * step_size
+        """
+
         noise = (torch.rand(N, n_samples, device=self.device) - 0.5) * step_size
 
         # Apply noise to the steps
@@ -760,269 +772,7 @@ class LatentVoxelGrid(nn.Module):
             phantom_feats = self.free_token.expand(phantom_pts.shape[0], -1)
             
             return phantom_pts, phantom_feats
-
-
-
-    def update_with_features2(self,
-                            pts_world: torch.Tensor,  # (N,3)
-                            f_pts: torch.Tensor,      # (N,D)
-                            radius: float = 0.25,
-                            *,
-                            chunkN: int = 100_000,     # tune
-                            chunkT: int = 512,        # CHUNK OFFSETS!
-                            neighbor_pad: int = 0,
-                            r_vox_cap: int = 10,       # safety cap on neighbor radius in voxels
-                            use_amp: bool = True):
-        if pts_world.numel() == 0 or self.keys.numel() == 0:
-            print("leaving")
-
-            return
-        
-      
-        if not torch.isfinite(f_pts).all():
-            f_pts = torch.nan_to_num(f_pts, nan=0.0, posinf=0.0, neginf=0.0)
-
-        dev = self.device
-        N   = int(pts_world.shape[0])
-        M   = int(self.keys.shape[0])
-        K   = min(int(self.routing_topk), M)
-        D   = self.feature_dim
-        vox = float(self.p.voxel_size)
-
-        # --- voxel centers once, on device ---
-        vox_xyz = (self.origin +
-                (self._unhash_keys(self.keys) + 0.5) * vox).to(dev).contiguous()
-
-        # --- query in chunks, radius-only neighbors ---
-        #torch.cuda.synchronize()
-
-        start = time.time()
-        CH = 512_000
-        if radius > 0:
-            r_vox = int(math.ceil(radius / max(vox, 1e-8))) + int(neighbor_pad)
-            r_vox = min(r_vox, int(r_vox_cap))
-            K_ball_bound = (2 * r_vox + 1) ** 3
-            K_ball_cap   = 32
-            K_ball = min(M, K_ball_bound, K_ball_cap)
-        else:
-            K_ball = 0
-
-        print("K_ball",K_ball)
-        all_i_parts, all_j_parts = [], []
-        
-        got_mass = torch.zeros(M, dtype=torch.bool, device=dev)
-
-        for i0 in range(0, N, CH):
-            i1 = min(i0 + CH, N)
-            pts_chunk = pts_world[i0:i1].to(dev, torch.float32).contiguous()
-            pts_b = pts_chunk.unsqueeze(0)
-            vox_b = vox_xyz.unsqueeze(0)
-
-            if K_ball > 0:
-                res = ball_query(pts_b, vox_b, K=K_ball, radius=float(radius), return_nn=False)
-                idx_ball = res.idx.squeeze(0)                  # (n, K_ball)
-                valid = idx_ball >= 0
-                
-                if valid.any():
-                    ii_local, kk = torch.where(valid)
-                    jj = idx_ball[ii_local, kk]
-                    all_i_parts.append(ii_local.to(torch.long) + i0)   # <-- add i0 (globalize)
-                    all_j_parts.append(jj.to(torch.long))
-                    jj_u = torch.unique_consecutive(torch.sort(jj).values)  # unique within chunk
-                    got_mass[jj_u] = True
-
-        # --- union + dedup ---
-        if not all_i_parts:
-            return
-        i_idx = torch.cat(all_i_parts, dim=0)
-        j_idx = torch.cat(all_j_parts, dim=0)
-        h = (i_idx.to(torch.int64) << 32) | j_idx.to(torch.int64)
-        h_u = torch.unique(h)
-
-        i_idx = (h_u >> 32).to(torch.long)
-        j_idx = (h_u & ((1 << 32) - 1)).to(torch.long)
-        idx_upd = got_mass.nonzero(as_tuple=False).squeeze(-1)  # touched voxels (U,)
-        
-
-
-        #torch.cuda.synchronize()
-
-        #print("Pairs took", time.time() - start, "seconds!")
-
-        # # --- quick sanity (optional) ---
-        # counts_per_point = torch.bincount(i_idx, minlength=N)
-        # #print("Mean neighbors:", float(counts_per_point.float().mean()),
-        #       "Max:", int(counts_per_point.max()), "Min:", int(counts_per_point.min()))
-
-        # ---------- SIM / WEIGHTS / ACCUM ----------
-        
-        
-     
-        start = time.time()
-
-        # 1) project features ONCE (don’t re-project per pair)
-        # f_proj_all = self.z_proj(f_pts.to(dev))    # (N, Z_lat)
-        f_proj_all = (f_pts.to(dev))    # (N, Z_lat)
-
-        # 2) gather per pair
-        p_sel = pts_world[i_idx].to(dev)
-        v_sel = vox_xyz[j_idx]
-        z_sel = self.z_latent[j_idx]
-        f_sel = f_proj_all[i_idx]                  # use precomputed projection
-        delta = p_sel - v_sel
-
-       
-        
-
-            # 3) sim
-        sim_flat = self.sim_net(f_sel, z_sel, delta)
-            # sim_flat = fast_sim_mlp_pairs(self.sim_net, i_idx, j_idx, f_proj_all, self.z_latent, delta)
-        #torch.cuda.synchronize()
-
-        #print("Sim flat took", time.time() - start, "seconds!")
-        start = time.time()
-
-       
-        
-        # 4) stable softmax per point
-        Nfull = int(N)
-        tau = max(float(self.routing_tau), 1e-6)
-
-        # Force Float32 for precision in exponentials
-        #sim_flat_f32 = sim_flat.float() 
-        sim_flat_f32 = sim_flat.float().clamp(min=-50.0, max=50.0)
-        
-        max_per_i = torch.full((Nfull,), -1e9, device=dev, dtype=torch.float32)
-        max_per_i = max_per_i.scatter_reduce(0, i_idx, sim_flat_f32, reduce="amax", include_self=True)
-        
-        sim_shift = sim_flat_f32 - max_per_i[i_idx]
-        #w_unnorm  = torch.exp(sim_shift / tau) # Safer in float32
-        w_unnorm  = torch.exp((sim_shift / tau).clamp(min=-50.0, max=50.0))
-
-        sum_per_i = torch.zeros(Nfull, device=dev, dtype=torch.float32).scatter_add(0, i_idx, w_unnorm)
-        weights   = w_unnorm / (sum_per_i[i_idx] + 1e-8)
-        weights = torch.nan_to_num(weights, nan=0.0)
-        
-        #torch.cuda.synchronize()
-
-
-
-        #print("Softmax took", time.time() - start, "seconds!")
-
-        
-        start = time.time()
-
-        # # Get unique indices and their inverse mapping
-        # idx_upd, inverse_indices = torch.unique(j_idx.long(), return_inverse=True)
-
-        # if idx_upd.numel() == 0:
-        #     return
-
-        # #print(f"unique operation took {time.time() - start:.4f} seconds")
-
-        # # Accumulate directly into sparse buffer (only U voxels, not M)
-        # u_sparse = torch.zeros(idx_upd.numel(), self.feature_dim, device=dev, dtype=torch.float32)
-        # contrib32 = weights.to(torch.float32).unsqueeze(-1) * f_sel.to(torch.float32)
-
-        # u_sparse.index_add_(0, inverse_indices, contrib32)
-
-        # # GRU on touched voxels
-        # u_sel = u_sparse.to(self.z_latent.dtype)
-        # z_sel = self.z_latent[idx_upd]
-        
-        
-        
-        # compact map j -> [0..U-1] without unique/bincount
-        comp = torch.full((M,), -1, device=dev, dtype=torch.long)
-        comp[idx_upd] = torch.arange(idx_upd.numel(), device=dev, dtype=torch.long)
-        inv = comp[j_idx]  # (R,) compact row ids
-
-
-
-
-        u = torch.zeros(idx_upd.numel(), D, device=dev, dtype=torch.float32)
-        chunk_size = 20_000 
-        num_pairs = weights.shape[0]
-
-        for chunk_start in range(0, num_pairs, chunk_size):
-            end = min(chunk_start + chunk_size, num_pairs)
-
-            # Slice the inputs
-            w_chunk = weights[chunk_start:end].unsqueeze(-1)
-            f_chunk = f_sel[chunk_start:end]
-            inv_chunk = inv[chunk_start:end]
-
-            contrib_chunk = w_chunk * f_chunk
-
-            # Accumulate into the main buffer
-            u.index_add_(0, inv_chunk, contrib_chunk.to(torch.float32))
-            
-            # Explicitly free memory (optional but safe)
-            del contrib_chunk, w_chunk, f_chunk
-            
-
-            
-        # GRU only on touched voxels
-        u_sel = u.to(self.z_latent.dtype)
-        z_sel = self.z_latent[idx_upd]
-        
-        #torch.cuda.synchronize()
-
-        #print("accum took", time.time() - start, "seconds!")
-        start = time.time()
-
-
-
-        #gamma = torch.sigmoid(self.gate_mlp(torch.cat([u_sel, z_sel], dim=-1)))
-        #x_in  = u_sel * gamma
-
-
-        #x_in = self.input_norm(u_sel)
-
-        #torch.cuda.synchronize()
-
-        #print("gate took", time.time() - start, "seconds!")
-        start = time.time()
-        # inp = x_in.unsqueeze(1)    # (U, 1, D)
-        # h0  = z_sel.unsqueeze(0)    # (1, U, D)
-        
-      
-
-        #with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
-        #z_new = self.gru_cell(x_in, z_sel)
-            
-            
-            # out, h = self.gru_cell(inp, h0)
-            # z_new = out[:, 0, :]     # (U, D)
-
-            # z_new = self.ema_upd(x_in, z_sel)
-
-        combined = torch.cat([z_sel, u_sel], dim=-1) # (U, 2D)
-        delta = self.update_mlp(combined)
-
-        #z_new = z_sel + delta
-        z_new = self.gru_cell(delta, z_sel)
-        #z_new = delta
-
-
-
-        z_new = z_new.to(self.z_latent.dtype)
-
-        if not torch.isfinite(z_new).all():
-            # print("Warning: NaN/Inf detected in GRU update. Sanitizing...")
-            z_new = torch.nan_to_num(z_new, nan=0.0, posinf=0.0, neginf=0.0)
-
-        self.z_latent.index_copy_(0, idx_upd, z_new)
-
-        del f_sel, z_sel, u_sel, sim_flat, f_pts, pts_world, z_new, sim_flat_f32
-        torch.cuda.empty_cache()
-            
-            # self.z_latent = self.gru_cell(x_in, self.z_latent)
-        #torch.cuda.synchronize()
-
-        #print("Gru took", time.time() - start, "seconds!")
-
-            
+ 
     def update_with_features(self,
                             pts_world: torch.Tensor,  # (N,3)
                             f_pts: torch.Tensor,      # (N,D)
@@ -1072,8 +822,8 @@ class LatentVoxelGrid(nn.Module):
             r_vox = int(math.ceil(radius / max(vox, 1e-8))) + int(neighbor_pad)
             r_vox = min(r_vox, int(r_vox_cap))
             K_ball_bound = (2 * r_vox + 1) ** 3
+            #K_ball_cap   = 32  # <--- Increased Cap to handle larger radius
             K_ball_cap   = 64  # <--- Increased Cap to handle larger radius
-            #K_ball_cap   = 16  # <--- Increased Cap to handle larger radius
             K_ball = min(M, K_ball_bound, K_ball_cap)
         else:
             K_ball = 0
@@ -1298,7 +1048,6 @@ class LatentVoxelGrid(nn.Module):
         probs = self.decoder(z_lat, centers if with_xyz_cond else None)
         probs = torch.sigmoid(probs)
         probs = probs.to(dtype=bev.dtype)   # match float32 destination
-        print(f"DEBUG: Probs Min: {probs.min().item():.4f}, Max: {probs.max().item():.4f}, Mean: {probs.mean().item():.4f}")
 
 
 
@@ -1368,7 +1117,6 @@ class LatentVoxelGrid(nn.Module):
         y0, y1 = y_range
         Hx = int((x1 - x0) / res_xy)
         Hy = int((y1 - y0) / res_xy)
-        print(f"DEBUG: BEV Grid Size: ({Hx}, {Hy}) | Origin: ({x0}, {y0}) | Res: {res_xy}")
 
         # Initialize with -1.0 (Unknown)
         bev = torch.full((Hy, Hx), -1.0, device=self.device, dtype=torch.float32)
@@ -1380,40 +1128,31 @@ class LatentVoxelGrid(nn.Module):
             print("DEBUG: No voxel centers found (grid empty).")
             return np.full((Hy, Hx), -1, dtype=np.int8), meta
 
-        print(f"DEBUG: Total Voxels: {centers.shape[0]}")
-
         # --- 3. Filter Z-Band ---
         z = centers[:, 2]
         z_mask = (z >= z_min) & (z <= z_max)
         if not z_mask.any():
-            print(f"DEBUG: All voxels filtered by Z-band ({z_min} to {z_max}). Max Z found: {z.max():.2f}")
             return np.full((Hy, Hx), -1, dtype=np.int8), meta
 
         centers = centers[z_mask]
         z_lat = self.z_latent[z_mask]
-        print(f"DEBUG: Voxels in Z-band: {centers.shape[0]}")
 
         # --- 4. Decode ---
         probs = self.decoder(z_lat, centers if with_xyz_cond else None)
         probs = torch.sigmoid(probs)
         probs = probs.to(dtype=bev.dtype)   # match float32 destination
-        print(f"DEBUG: Probabilities -> Min: {probs.min():.4f}, Max: {probs.max():.4f}")
 
         # --- 5. Project to 2D ---
         gx = ((centers[:, 0] - x0) / res_xy).floor().to(torch.long)
         gy = ((centers[:, 1] - y0) / res_xy).floor().to(torch.long)
 
-        print(f"DEBUG: Projected X range: [{gx.min()}, {gx.max()}] (Valid: 0-{Hx-1})")
-        print(f"DEBUG: Projected Y range: [{gy.min()}, {gy.max()}] (Valid: 0-{Hy-1})")
 
         keep = (gx >= 0) & (gx < Hx) & (gy >= 0) & (gy < Hy)
         gx, gy, probs = gx[keep], gy[keep], probs[keep]
 
         if probs.numel() == 0:
-            print("DEBUG: ALL points filtered out by X/Y bounds! Check 'bev_window_m' and 'bev_origin_xy'.")
             return np.full((Hy, Hx), -1, dtype=np.int8), meta
 
-        print(f"DEBUG: Points keeping for Rasterization: {probs.numel()}")
 
         # --- 6. Rasterize ---
         idx = gy * Hx + gx
@@ -1424,7 +1163,6 @@ class LatentVoxelGrid(nn.Module):
         bev_np = bev.cpu().numpy()
 
         # Check raw values in the grid before thresholding
-        print(f"DEBUG: Max value in BEV grid before threshold: {bev_np.max():.4f}")
 
         out_map = np.full_like(bev_np, -1, dtype=np.int8)
 
@@ -1435,7 +1173,6 @@ class LatentVoxelGrid(nn.Module):
         out_map[free_mask] = 0
         out_map[occupied_mask] = 100
 
-        print(f"DEBUG: Final Map Counts -> Free: {np.sum(free_mask)}, Occ: {np.sum(occupied_mask)}")
 
         return out_map, meta
     """
@@ -1519,6 +1256,191 @@ class LatentVoxelGrid(nn.Module):
             self.z_latent = z
 
     def initialize_latents_from_full_cloud(
+                self,
+                pts_world: torch.Tensor,   # (N,3) full scene points (aligned)
+                f_pts: torch.Tensor,       # (N,D) point features
+                cam_centers: torch.Tensor, # (N,3) Camera center for each point
+                *,
+                init_lt: bool = True,      # initialize LT/ST from decoded probs
+                lt_level: float | None = None,
+                carve_free: bool = True,   
+                z_clip: Tuple[float,float] | None = (-float('inf'), float('inf')),
+                stride: int = 4,         
+                samples_per_voxel: float = 2.0, # Match GT density (usually 2.0)
+                max_rays: int = 10000,          # Match GT cap (usually 10k or 20k)
+                max_range: float = 12.0         # Match GT clip (usually 12.0)
+            ):
+                """
+                Seed z_latent using the full point cloud.
+                Logic aligns with update_with_features: Max Pool -> GRU Update.
+                """
+                dev, dt = self.device, self.dtype
+
+                if pts_world.numel() == 0:
+                    return
+
+                pts_world = pts_world.to(dev, dt)
+                f_pts = f_pts.to(dev, dt)
+
+                # 1. Input Sanitization
+                if not torch.isfinite(f_pts).all():
+                    f_pts = torch.nan_to_num(f_pts, nan=0.0, posinf=0.0, neginf=0.0)
+
+                finite = torch.isfinite(pts_world).all(dim=1) & torch.isfinite(cam_centers).all(dim=1)
+                pts_world, cam_centers, f_pts = pts_world[finite], cam_centers[finite], f_pts[finite]
+                if pts_world.numel() == 0: return
+
+                if z_clip is not None:
+                    z0, z1 = z_clip
+                    keep = (pts_world[:,2] >= z0) & (pts_world[:,2] <= z1)
+                    pts_world, cam_centers, f_pts = pts_world[keep], cam_centers[keep], f_pts[keep]
+
+                if max_range is not None and cam_centers is not None:
+                    cam_centers = cam_centers.to(dev, dt)
+                    d_all = torch.norm(pts_world - cam_centers, dim=1)
+                    keep = d_all <= max_range
+                    pts_world = pts_world[keep]
+                    f_pts = f_pts[keep]
+                    cam_centers = cam_centers[keep]
+                
+                # --- 2. Identify Surface Voxels (Walls) ---
+                ijk = self._world_to_ijk(pts_world)
+                keys_surf = self._hash_ijk(ijk) # (N,)
+
+                # --- 3. Identify Free Space Voxels (Air) ---
+                keys_free = torch.zeros(0, dtype=torch.int64, device=dev)
+                
+                if carve_free and cam_centers is not None:
+                    cam_centers = cam_centers.to(dev, dt)
+                    
+                    # Subsample for Ray Marching
+                    P_sub = pts_world[::stride]
+                    C_sub = cam_centers[::stride]
+                    
+                    # Cap rays to match GT generation limits
+                    if max_rays is not None and P_sub.shape[0] > max_rays:
+
+                        
+                        """
+                        #REMOVE AFTER
+                        seed = 42
+                        gen = torch.Generator(device=self.device)
+
+                        gen.manual_seed(seed)
+                        # Generate permutation using the specific seed
+                        perm = torch.randperm(P_sub.shape[0], device=self.device, generator=gen)[:max_rays]
+                        """
+
+
+                        perm = torch.randperm(P_sub.shape[0], device=dev)[:max_rays]
+                        P_sub = P_sub[perm]
+                        C_sub = C_sub[perm]
+
+                    if P_sub.numel() > 0:
+                        V = P_sub - C_sub
+                        seg_len = torch.linalg.norm(V, dim=1)
+                        
+                        # Steps based on density
+                        steps = torch.clamp((seg_len / self.p.voxel_size * samples_per_voxel).ceil().to(torch.int32), min=1)
+                        max_steps = int(steps.max().item())
+
+                        base = torch.arange(max_steps, device=dev, dtype=dt) + 0.5
+                        t = base[None, :] / steps.to(dt)[:, None]
+                        
+                        # Strictly before the wall
+                        t = torch.minimum(t, torch.nextafter(torch.tensor(1.0, device=dev, dtype=dt), torch.tensor(0.0, device=dev, dtype=dt)))
+                        mask = (t < 1.0)
+                        
+                        samples = C_sub.unsqueeze(1) + t.unsqueeze(-1) * V.unsqueeze(1)
+                        samples = samples[mask]
+                        
+                        if samples.numel() > 0:
+                            ijk_free = self._world_to_ijk(samples)
+                            keys_free_all = self._hash_ijk(ijk_free)
+                            
+                            # Set Difference (Air - Wall)
+                            unique_walls = torch.unique(keys_surf)
+                            keep = ~torch.isin(keys_free_all, unique_walls)
+                            keys_free = torch.unique(keys_free_all[keep])
+
+                # --- 4. Allocate Everything (Walls + Air) ---
+                all_keys = torch.cat([keys_free, keys_surf]) 
+                self._ensure_and_index(all_keys)
+                
+                # A. Initialize Free Space with Token
+                idx_free = torch.searchsorted(self.keys, keys_free)
+                if idx_free.numel() > 0:
+                    token_expanded = self.free_token.expand(idx_free.shape[0], -1)
+                    self.z_latent.index_copy_(0, idx_free, token_expanded)
+
+                # --- 5. Feature Pooling (Surface Voxels) - MAX POOLING ---
+                # Map N points to M unique voxel indices
+                idx_surf_pts = torch.searchsorted(self.keys, keys_surf)
+                
+                # Identify which voxels are actually walls
+                unique_surf_idx = torch.unique(idx_surf_pts)
+                
+                # Initialize accumulator with -Infinity for Max Pooling
+                u_all = torch.full((self.keys.shape[0], self.feature_dim), -1e9, device=dev, dtype=dt)
+
+                # FIX: Removed the chunking loop to avoid In-place Autograd error.
+                # Perform scatter_reduce in one shot.
+                # Expand indices: (N, D)
+                idx_expanded = idx_surf_pts.unsqueeze(-1).expand(-1, self.feature_dim)
+
+                # Max Pool
+                u_all.scatter_reduce_(0, idx_expanded, f_pts, reduce="amax", include_self=True)
+
+                # --- 6. GRU Update (Surface Voxels) ---
+                # Extract inputs for surface voxels
+                u_surf = u_all[unique_surf_idx]
+
+
+                # Cleanup -inf from initialization (should generally be covered, but for safety)
+                u_surf = torch.where(u_surf <= -1e8, torch.tensor(0.0, device=dev, dtype=dt), u_surf)
+
+                # Get current state (will be 0.0 for new voxels, or existing if re-initializing)
+                z_prev = self.z_latent[unique_surf_idx]
+
+                # Apply GRU: z_new = GRU(input=u, hidden=z_prev)
+                z_new = self.gru_cell(u_surf, z_prev)
+                
+                # Sanitize GRU output
+                if not torch.isfinite(z_new).all():
+                    z_new = torch.nan_to_num(z_new, nan=0.0, posinf=0.0, neginf=0.0)
+
+                # Write Back
+                self.z_latent.index_copy_(0, unique_surf_idx, z_new.to(self.z_latent.dtype))
+
+                # --- 7. Initialize Occupancy Logits ---
+                if init_lt:
+                    if lt_level is not None:
+                        p_occ = torch.full((self.keys.shape[0],), float(lt_level), device=dev, dtype=dt)
+                        # Force surface voxels to be occupied if relying on simple counts
+                        # (Here we just trust the lt_level passed in, or the decoder below)
+                        self.vals_lt[:] = p_occ
+                        self.vals_st[:] = p_occ
+                    elif self.decoder is not None:
+                        # Decode everything (including air)
+                        centers = self.voxel_centers()
+                        p_occ = self.decoder(self.z_latent, centers if getattr(self.decoder, "cond", None) == "xyz" else None)
+                        logit = p_occ
+                        self.vals_lt[:] = logit
+                        self.vals_st[:] = logit
+
+                    self.vals_lt.clamp_(min=self.p.l_min, max=self.p.l_max)
+                    self.vals_st.clamp_(min=self.p.l_min, max=self.p.l_max)
+                    self.vals = self._display_vals()
+
+                # 8. Update timestamps for surface voxels
+                if pts_world.shape[0] > 0:
+                    now = torch.tensor(self.epoch, dtype=self.seen_occ_epoch.dtype, device=self.device)
+                    if self.seen_occ_epoch.shape[0] != self.keys.shape[0]:
+                        self._ensure_and_index(torch.zeros(0, dtype=torch.int64, device=self.device))
+                    self.seen_occ_epoch[unique_surf_idx] = now
+
+    """
+    def initialize_latents_from_full_cloud(
             self,
             pts_world: torch.Tensor,   # (N,3) full scene points (aligned)
             f_pts: torch.Tensor,       # (N,D) point features
@@ -1535,10 +1457,7 @@ class LatentVoxelGrid(nn.Module):
             max_rays: int = 10000,          # Match GT cap (usually 10k or 20k)
             max_range: float = 12.0         # Match GT clip (usually 12.0)
         ):
-            """
-            Seed z_latent for all touched voxels using the *full* point cloud.
-            Uses exact logic from voxel.py integrate_points_with_cameras to ensure parity.
-            """
+
             dev, dt = self.device, self.dtype
 
             if pts_world.numel() == 0:
@@ -1583,14 +1502,7 @@ class LatentVoxelGrid(nn.Module):
                 C_sub = cam_centers[::stride]
                 
                 # B. Max Range Filter (Critical for matching GT)
-                """
-                d_raw = torch.norm(P_sub - C_sub, dim=1)
-                mask_range = d_raw <= max_range
-                P_sub = P_sub[mask_range]
-                C_sub = C_sub[mask_range]
-                """
-                
-                # C. Random Cap (Critical for matching GT density)
+                                # C. Random Cap (Critical for matching GT density)
                 if max_rays is not None and P_sub.shape[0] > max_rays:
                     perm = torch.randperm(P_sub.shape[0], device=dev)[:max_rays]
                     P_sub = P_sub[perm]
@@ -1681,16 +1593,7 @@ class LatentVoxelGrid(nn.Module):
 
             # (Optional) Max pooling logic
             if pool == "mean+max":
-                """
-                z_max = torch.full((M, Dp), -1e9, device=dev, dtype=dt)
-                for d in range(Dp):
-                    flat = torch.full((M,), -1e9, device=dev, dtype=dt)
-                    torch.scatter_reduce(flat, 0, idx, f_pts[:, d], reduce="amax", include_self=True)
-                    z_max[:, d] = flat
-                z_pool = torch.cat([z_mean, z_max], dim=-1)
-                """
-
-                z_pool = torch.full((M, Dp), -1e9, device=dev, dtype=dt)
+                                z_pool = torch.full((M, Dp), -1e9, device=dev, dtype=dt)
 
                 # Chunk size for safety (e.g., 500k points at a time)
                 chunk_size = 500_000
@@ -1778,3 +1681,4 @@ class LatentVoxelGrid(nn.Module):
                     if self.seen_occ_epoch.shape[0] != self.keys.shape[0]:
                         self._ensure_and_index(torch.zeros(0, dtype=torch.int64, device=self.device))
                     self.seen_occ_epoch[touched_idx] = now
+    """

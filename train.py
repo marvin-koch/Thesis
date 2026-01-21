@@ -2818,7 +2818,9 @@ def main():
         radius_m=1,
         topk=8,
         temp=0.5,
+        #feature_dim=16,
         feature_dim=32,
+
         occ_decoder_hidden=64,
         #lr=3e-4,
         lr=3e-3,
@@ -2830,8 +2832,8 @@ def main():
         weight_decay=0.05,
         #weight_decay=0.00,
         lambda_occ= 1.0,
-        lambda_temp = 0.05,      # temporal consistency weight
-        #lambda_temp = 0.0,      # temporal consistency weight
+        #lambda_temp = 0.05,      # temporal consistency weight
+        lambda_temp = 0.0,      # temporal consistency weight
 
         lambda_ent = 1e-3,      # routing entropy reg
         lambda_tv = 1e-4 ,      # (optional) spatial TV on occupancy
@@ -2859,7 +2861,7 @@ def main():
     #    cfg=cfg
     #)
     ckpt_cb = pl.callbacks.ModelCheckpoint(
-        dirpath="/cluster/scratch/kochmar/checkpoints/full5",       # Explicitly set a folder so you can find them
+        dirpath="/cluster/scratch/kochmar/checkpoints/full7",       # Explicitly set a folder so you can find them
         monitor="val_loss_total",
         save_top_k=3,
         mode="min",
@@ -2881,8 +2883,7 @@ def main():
 
 
     # 2. Load the checkpoint file manually
-    #ckpt_path = "/cluster/scratch/kochmar/checkpoints/voxup-epoch=03-val_loss_total=nan.ckpt"
-    #ckpt_path = "/cluster/scratch/kochmar/checkpoints/full/voxup-epoch=05-val_loss_total=27.0719.ckpt"
+    """
     ckpt_path = "/cluster/scratch/kochmar/checkpoints/full3/voxup-epoch=07-val_loss_total=8.8636.ckpt"
     checkpoint = torch.load(ckpt_path, map_location="cpu") # Load to CPU first to save GPU mem
     state_dict = checkpoint["state_dict"]
@@ -2913,7 +2914,8 @@ def main():
     for key in keys_to_remove:
         if key in state_dict:
             del state_dict[key]
-    #keys = sys.load_state_dict(checkpoint["state_dict"], strict=False)
+    keys = sys.load_state_dict(checkpoint["state_dict"], strict=False)
+    """
     
 
  

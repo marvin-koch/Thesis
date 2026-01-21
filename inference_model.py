@@ -13,8 +13,10 @@ def main():
     ckpt_path = "/cluster/scratch/kochmar/checkpoints/full/voxup-epoch=07-val_loss_total=10.9045.ckpt"
     ckpt_path = "/cluster/scratch/kochmar/checkpoints/full2/voxup-epoch=09-val_loss_total=8.8623.ckpt"
     ckpt_path = "/cluster/scratch/kochmar/checkpoints/full3/voxup-epoch=07-val_loss_total=8.8636.ckpt"
-    ckpt_path = "/cluster/scratch/kochmar/checkpoints/full5/voxup-epoch=02-val_loss_total=10.3785.ckpt"
-    out_dir = "/cluster/scratch/kochmar/predict_outputs_one/"
+    ckpt_path = "/cluster/scratch/kochmar/checkpoints/full5/voxup-epoch=05-val_loss_total=9.1113.ckpt"
+    ckpt_path = "/cluster/scratch/kochmar/checkpoints/full7/voxup-epoch=05-val_loss_total=8.7155.ckpt"
+
+    out_dir = "/cluster/scratch/kochmar/predict_outputs_all/"
     os.makedirs(out_dir, exist_ok=True)
 
     STEP = 20
@@ -52,7 +54,7 @@ def main():
         num_workers=cfg.num_workers,
         size=512,
         verbose=False,
-        train_val_split=0.1,  # doesn't matter if you pass your own loader below
+        train_val_split=0.07,  # doesn't matter if you pass your own loader below
         skip=True,
         seq_list=os.path.join(cfg.dataset_root, cfg.seq_file),
         step=STEP
