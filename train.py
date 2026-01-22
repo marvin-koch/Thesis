@@ -88,34 +88,6 @@ def load_sparse_voxel_grid(path, device):
 
     return vox_gt
 
-class FocalLoss(nn.Module):
-    def __init__(self, alpha=0.8, gamma=2.0, reduction='mean'):
-        super(FocalLoss, self).__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-        self.reduction = reduction
-
-    def forward(self, inputs, targets):
-        # BCEWithLogitsLoss combines Sigmoid and BCE.
-        bce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
-        pt = torch.exp(-bce_loss)  # pt is the probability of the true class
-
-        # --- THE CRITICAL FIX ---
-        # alpha_t is a vector the same size as targets.
-        # If target is 1 (Wall): weight = 0.8
-        # If target is 0 (Empty): weight = 0.2 (i.e., 1 - 0.8)
-        # This creates a 4:1 penalty ratio, forcing the model to care about walls.
-        alpha_t = torch.where(targets == 1, self.alpha, 1 - self.alpha)
-
-        # Apply the dynamic weight
-        focal_loss = alpha_t * (1 - pt) ** self.gamma * bce_loss
-
-        if self.reduction == 'mean':
-            return focal_loss.mean()
-        elif self.reduction == 'sum':
-            return focal_loss.sum()
-        else:
-            return focal_loss
 # --------------------------
 # 1) Your modules (import these from your codebase)
 # --------------------------
@@ -207,7 +179,14 @@ class VoxelUpdaterSystem(pl.LightningModule):
         # convenience buffer for device transfers
         self.register_buffer("_origin", torch.zeros(3), persistent=False)
         
-        self.projector = FeatureProjector(in_dim=768, out_dim=self.feature_dim)
+        #self.projector = FeatureProjector(in_dim=768, out_dim=self.feature_dim)
+
+        self.projector = FeatureProjector(
+            in_dim=768,
+            out_dim=self.feature_dim,
+            hidden_dim=64,
+            activation="gelu"   
+        )
 
 
         self.automatic_optimization = False   # <<< add this
@@ -217,14 +196,13 @@ class VoxelUpdaterSystem(pl.LightningModule):
         self.bev_origin_xy=(-25.0, -25.0)
         #self.bev_origin_xy=(-10.0, -10.0)
         self.z_band_bev=(1.0, 3.0)
-        self.z_band_bev=(-2.2, 3.5)
+        self.z_band_bev=(-2.0, 3.5)
         #self.z_band_bev=(-1.0, 2.0)
 
         #self.z_band_bev=(-0.02, 0.1)
 
         self.fp_weight = 0.0
 
-        self.criterion = FocalLoss(alpha=0.8, gamma=2.0)
 
     def configure_optimizers(self):
     
@@ -1285,7 +1263,6 @@ class VoxelUpdaterSystem(pl.LightningModule):
                     )
 
 
-                #loss_intersect = self.criterion(pred_intersect, tgt_intersect)
 
 
             self.vox_gt_prev = self.vox_gt
@@ -1850,7 +1827,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
         return val_loss_total
     
 
-    def predict_step(self, batch: Dict, batch_idx: int, dataloader_idx: int = 0, step=20):
+    def predict_step(self, batch: Dict, batch_idx: int, dataloader_idx: int = 0, step=1):
         device = self.device
 
         self.vox.reset_state()
@@ -2663,6 +2640,10 @@ class HabitatSeqDataset(Dataset):
         for t, td in enumerate(t_dirs):
             if t % self.step != 0 and self.skip:
                 continue
+            """
+            if t > 30:
+                break
+            """
             imgs = self._load_timestep(td)
             if imgs:
                 imgs_t.append(imgs)
@@ -2832,8 +2813,8 @@ def main():
         weight_decay=0.05,
         #weight_decay=0.00,
         lambda_occ= 1.0,
-        #lambda_temp = 0.05,      # temporal consistency weight
-        lambda_temp = 0.0,      # temporal consistency weight
+        lambda_temp = 0.05,      # temporal consistency weight
+        #lambda_temp = 0.0,      # temporal consistency weight
 
         lambda_ent = 1e-3,      # routing entropy reg
         lambda_tv = 1e-4 ,      # (optional) spatial TV on occupancy
@@ -2883,8 +2864,7 @@ def main():
 
 
     # 2. Load the checkpoint file manually
-    """
-    ckpt_path = "/cluster/scratch/kochmar/checkpoints/full3/voxup-epoch=07-val_loss_total=8.8636.ckpt"
+    ckpt_path = "/cluster/scratch/kochmar/checkpoints/full7/voxup-epoch=05-val_loss_total=8.7155.ckpt"
     checkpoint = torch.load(ckpt_path, map_location="cpu") # Load to CPU first to save GPU mem
     state_dict = checkpoint["state_dict"]
 
@@ -2914,21 +2894,8 @@ def main():
     for key in keys_to_remove:
         if key in state_dict:
             del state_dict[key]
-    keys = sys.load_state_dict(checkpoint["state_dict"], strict=False)
-    """
-    
+    #keys = sys.load_state_dict(checkpoint["state_dict"], strict=False)
 
- 
-    """
-    print("Applying GRU Surgery...")
-    dim = sys.vox.feature_dim
-    with torch.no_grad():
-        # Force Update Gate bias to -2.0 (Open/Reactive)
-        # This overwrites whatever the checkpoint just loaded.
-        sys.vox.gru_cell.bias_ih[dim : 2*dim].fill_(-2.0)
-        sys.vox.gru_cell.bias_hh[dim : 2*dim].fill_(-2.0)
-
-    """
     trainer = pl.Trainer(
         max_epochs=cfg.max_epochs,
         precision=cfg.precision,

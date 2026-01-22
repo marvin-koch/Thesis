@@ -5,6 +5,8 @@ from typing import Tuple, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import math
 import numpy as np
 import time
 
@@ -60,133 +62,48 @@ class VoxelParams:
 
 
 
-class FeatureVoxelSimilarity(nn.Module):
+class FeatureProjector(nn.Module):
     """
-    Robust Neural Routing Module.
+    Projects high-dimensional point features (e.g., 768-D from a vision backbone)
+    into a smaller latent space (e.g., 64-D) suitable for voxel updates.
 
-    Instead of a rigid linear penalty on distance, this module uses
-    Fourier Positional Encodings on the geometric delta (point - voxel_center).
-
-    This allows the network to LEARN the valid spatial radius based on feature context.
-    It can learn to tolerate misalignment if feature similarity is high.
+    Optionally includes normalization or a small MLP head.
     """
-    def __init__(self, feat_dim: int, hidden_dim: int = 16, pe_bands: int = 4):
+    def __init__(self, in_dim: int = 768, out_dim: int = 64, hidden_dim: int | None = None,
+                 use_layernorm: bool = True, activation: str = "relu"):
         super().__init__()
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.use_layernorm = use_layernorm
 
-        self.pe_bands = pe_bands
-        # 3 coords * 2 (sin/cos) * bands
-        pe_dim = 3 * 2 * pe_bands
-
-        # Project features to a shared space
-        self.f_proj = nn.Linear(feat_dim, hidden_dim)
-        self.z_proj = nn.Linear(feat_dim, hidden_dim)
-
-        # MLP scorer: Inputs [Projected_F, Projected_Z, Encoded_Delta]
-        in_dim = hidden_dim + hidden_dim + pe_dim
-
-        self.mlp = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, 1) # Output raw score (logit)
-        )
-
-    def _fourier_encode(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (N, 3)
-        # Returns: (N, pe_dim)
-        batch_size = x.shape[0]
-        # Frequencies: 2^0 * pi ... 2^(B-1) * pi
-        freqs = torch.pow(2.0, torch.arange(self.pe_bands, device=x.device, dtype=x.dtype)) * torch.pi
-
-        # (N, 3, 1) * (1, 1, B) -> (N, 3, B)
-        args = x.unsqueeze(-1) * freqs.view(1, 1, -1)
-
-        # Flatten last two dims -> (N, 3*B)
-        sin_enc = torch.sin(args).view(batch_size, -1)
-        cos_enc = torch.cos(args).view(batch_size, -1)
-
-        return torch.cat([sin_enc, cos_enc], dim=-1)
-
-    def forward(self,
-                f_pts_flat: torch.Tensor,   # (R, D)
-                z_vox_flat: torch.Tensor,   # (R, D)
-                delta_xyz_flat: torch.Tensor # (R, 3)
-               ) -> torch.Tensor:
-
-        # 1. Encode Geometry
-        d_emb = self._fourier_encode(delta_xyz_flat) # (R, PE_dim)
-
-        # 2. Project Features
-        f_emb = self.f_proj(f_pts_flat)
-        z_emb = self.z_proj(z_vox_flat)
-
-        # 3. Concatenate and Score
-        # (R, H + H + PE)
-        combined = torch.cat([f_emb, z_emb, d_emb], dim=-1)
-
-        # Output score
-        score = self.mlp(combined).squeeze(-1)
-
-        return score
-
-class FeatureVoxelSimilarity2(nn.Module):
-
-    def __init__(self, feat_dim: int, proj_dim: int = 32, use_cosine: bool = True):
-        super().__init__()
-        # use bias=False so projections are pure linear embeddings
-        self.f_proj = nn.Linear(feat_dim, proj_dim, bias=False)
-        self.z_proj = nn.Linear(feat_dim, proj_dim, bias=False)
-        self.delta_lin = nn.Linear(3, 1, bias=True)
-        self.use_cosine = use_cosine
-        # learned temperature to calibrate scale
-        #self.log_temp = nn.Parameter(torch.tensor(0.0))
-
-    def forward(self,
-                f_pts_flat: torch.Tensor,   # (R, D)
-                z_vox_flat: torch.Tensor,   # (R, D)
-                delta_xyz_flat: torch.Tensor # (R, 3)
-               ) -> torch.Tensor:
-        # ensure contiguous for matmul throughput
-        f = f_pts_flat.contiguous()
-        z = z_vox_flat.contiguous()
-        d = delta_xyz_flat.contiguous()
-
-        # project each side (R,D) -> (R,P)
-        Fp = self.f_proj(f)
-        Zp = self.z_proj(z)
-
-        Fp = Fp.clamp(min=-1e3, max=1e3)
-        Zp = Zp.clamp(min=-1e3, max=1e3)
-
-        if self.use_cosine:
-            Fp = Fp / (Fp.norm(dim=-1, keepdim=True) + 1e-6)
-            Zp = Zp / (Zp.norm(dim=-1, keepdim=True) + 1e-6)
-
-        # dot product core (R,)
-        core = (Fp * Zp).sum(dim=-1)
-
-        # tiny delta term (R,)
-        dterm = self.delta_lin(d).squeeze(-1)
-
-        
-        # scale
-        #safe_log_temp = self.log_temp.clamp(max=4.6)
-        #temp = safe_log_temp.exp()
-
-        #return temp * (core + dterm)
-
-        return core + dterm
-    
-    
+        if hidden_dim is None:
+            # simple linear projection
+            self.net = nn.Linear(in_dim, out_dim)
+        else:
+            # small MLP head for richer mapping
+            act = nn.ReLU() if activation == "relu" else nn.GELU()
+            self.net = nn.Sequential(
+                nn.Linear(in_dim, hidden_dim),
+                act,
+                nn.Linear(hidden_dim, out_dim)
+            )
 
 
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import math
+        if use_layernorm:
+            self.norm = nn.LayerNorm(out_dim)
+        else:
+            self.norm = nn.Identity()
 
-# ----------------- (A) latent -> occupancy decoder -----------------
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (N, in_dim)
+        returns: (N, out_dim)
+        """
+        x = self.net(x)
+        x = self.norm(x)
+        return x
+
 class LatentToOccupancyDecoder(nn.Module):
     """
     Decode a voxel latent z_j (optionally conditioned on the voxel center)
@@ -260,63 +177,6 @@ class LatentToOccupancyDecoder(nn.Module):
         return logit
 
 
-
-class FeatureProjector(nn.Module):
-    """
-    Projects high-dimensional point features (e.g., 768-D from a vision backbone)
-    into a smaller latent space (e.g., 64-D) suitable for voxel updates.
-
-    Optionally includes normalization or a small MLP head.
-    """
-    def __init__(self, in_dim: int = 768, out_dim: int = 64, hidden_dim: int | None = None,
-                 use_layernorm: bool = True, activation: str = "relu"):
-        super().__init__()
-        self.in_dim = in_dim
-        self.out_dim = out_dim
-        self.use_layernorm = use_layernorm
-
-        if hidden_dim is None:
-            # simple linear projection
-            self.net = nn.Linear(in_dim, out_dim)
-        else:
-            # small MLP head for richer mapping
-            act = nn.ReLU() if activation == "relu" else nn.GELU()
-            self.net = nn.Sequential(
-                nn.Linear(in_dim, hidden_dim),
-                act,
-                nn.Linear(hidden_dim, out_dim)
-            )
-
-            
-
-        if use_layernorm:
-            self.norm = nn.LayerNorm(out_dim)
-        else:
-            self.norm = nn.Identity()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: (N, in_dim)
-        returns: (N, out_dim)
-        """
-        x = self.net(x)
-        x = self.norm(x)
-        return x
-
-
-class GatedEMAUpdate(nn.Module):
-    def __init__(self, dim: int, hidden: int = 64):
-        super().__init__()
-        self.gate = nn.Sequential(
-            nn.Linear(2*dim, hidden, bias=True),
-            nn.SiLU(),
-            nn.Linear(hidden, 1, bias=True),   # scalar α per voxel
-        )
-    def forward(self, u, z):
-        alpha = torch.sigmoid(self.gate(torch.cat([u, z], dim=-1)))  # (U,1)
-        return z + alpha * (u - z)
-
-
 # ----------------- Grid -----------------
 class LatentVoxelGrid(nn.Module):
     """
@@ -363,24 +223,31 @@ class LatentVoxelGrid(nn.Module):
 
         # ---- learned latent memory ----
         self.feature_dim = feature_dim
-        gate_hidden_dim = int(feature_dim/2)
 
         # self.input_dim = 768
         self.z_latent = torch.zeros((0, feature_dim), dtype=self.dtype, device=self.device)
         # self.z_proj = nn.Linear(self.input_dim, self.feature_dim)
         self.z_proj = nn.Identity()
         # update modules
+
+        self.fusion_mlp = nn.Sequential(
+            nn.Linear(feature_dim + 1, feature_dim),
+            nn.LayerNorm(feature_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(feature_dim, feature_dim)
+        )
+
         self.gru_cell = nn.GRUCell(input_size=feature_dim, hidden_size=feature_dim)
-        self.input_gain = nn.Parameter(torch.tensor(5.0))
 
 
+
+        """
         bias_ih = self.gru_cell.bias_ih
         bias_hh = self.gru_cell.bias_hh
 
         # 2. Force the Update Gate (middle chunk) to be positive (+1.0)
         # This sets the default behavior to "Update" (Forget history), preventing freezing.
         # Set Update gate bias (indices dim to 2*dim) to +1.0
-        """
         with torch.no_grad():
             # 1. Initialize all biases to 0 first
             self.gru_cell.bias_ih.zero_()
@@ -390,28 +257,7 @@ class LatentVoxelGrid(nn.Module):
         
         """
 
-        self.update_mlp = nn.Sequential(
-            nn.Linear(2* feature_dim, 2*feature_dim),
-            #nn.LayerNorm(2*feature_dim),
-            nn.GELU(),  # Better than ReLU for gradients
-
-            nn.Linear(2*feature_dim, 2*feature_dim),
-            nn.LayerNorm(2*feature_dim),
-            nn.GELU(),
-
-            nn.Linear(2*feature_dim, feature_dim) # Output is the "Delta"
-        )
-
-        
-        self.sim_net  = FeatureVoxelSimilarity(feature_dim)
-        
-        
-        self.gate_mlp = nn.Sequential(
-            nn.Linear(2*feature_dim, gate_hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(gate_hidden_dim, 1)
-        ).to(self.device)
-
+               
         # routing controls
         self.routing_tau: float = 0.5   # temperature for softmax
         self.routing_topk: int = 16     # voxels per point (after radius prefilter)
@@ -454,7 +300,8 @@ class LatentVoxelGrid(nn.Module):
         
         
         
-        current_device = self.gate_mlp[0].weight.device
+        #current_device = self.gru_cell[0].weight.device
+        current_device = self.gru_cell.weight_hh.device
         
         self.device = current_device
         
@@ -704,14 +551,15 @@ class LatentVoxelGrid(nn.Module):
         # n_samples=16 is Safe for VRAM, but "Sparse" spatially.
 
         N = origins.shape[0]
+        max_range = 0.85
 
         # 1. Create base steps (0.0, 0.05, 0.10, ... 0.85)
         # Shape: (1, n_samples)
-        steps = torch.linspace(0, 0.85, n_samples, device=self.device).unsqueeze(0)
+        steps = torch.linspace(0, max_range, n_samples, device=self.device).unsqueeze(0)
 
         # 2. ADD JITTER (The Magic Fix)
         # Calculate the gap size between samples
-        step_size = 0.85 / (n_samples - 1)
+        step_size = max_range / (n_samples - 1)
 
         # Add random noise: +/- half a step
         # This ensures the sample could be ANYWHERE along the segment
@@ -731,7 +579,7 @@ class LatentVoxelGrid(nn.Module):
 
         # Apply noise to the steps
         ratios = steps + noise
-        ratios = ratios.clamp(0.0, 0.85) # Keep within ray bounds
+        ratios = ratios.clamp(0.0, max_range) # Keep within ray bounds
 
         # 3. Generate Points
         vec = (terminations - origins).unsqueeze(1)
@@ -828,11 +676,63 @@ class LatentVoxelGrid(nn.Module):
         else:
             K_ball = 0
 
-        print("K_ball",K_ball)
         all_i_parts, all_j_parts = [], []
         got_mass = torch.zeros(M, dtype=torch.bool, device=dev)
         CH = 512_000
 
+
+
+        #WEIGHTED
+        sigma = self.p.voxel_size * 3.0
+
+        for i0 in range(0, N, CH):
+            i1 = min(i0 + CH, N)
+            pts_chunk = pts_world[i0:i1].to(dev, torch.float32).contiguous()
+            pts_b = pts_chunk.unsqueeze(0)
+            vox_b = vox_xyz.unsqueeze(0)
+
+            if K_ball > 0:
+                # res.dists contains Squared L2 distances
+                res = ball_query(pts_b, vox_b, K=K_ball, radius=float(radius), return_nn=False)
+                idx_ball = res.idx.squeeze(0)
+                dists_sq = res.dists.squeeze(0) # (Chunk, K)
+
+                valid = idx_ball >= 0
+
+                if valid.any():
+                    ii_local, kk = torch.where(valid)
+                    jj = idx_ball[ii_local, kk]
+
+                    all_i_parts.append(ii_local.to(torch.long) + i0)
+                    all_j_parts.append(jj.to(torch.long))
+
+                    # --- NEW: Compute Weights ---
+                    # Retrieve valid squared distances
+                    d2 = dists_sq[ii_local, kk]
+
+                    # Gaussian Weighting: w = exp( -dist^2 / (2*sigma^2) )
+                    weights = torch.exp(-d2 / (2 * (sigma ** 2)))
+
+                    # Store weights for this batch (we will concat them later)
+                    # We can hack this by appending to a temporary list or
+                    # re-calculating during aggregation.
+                    # Efficient approach: Append to a new list 'all_w_parts'
+                    if not hasattr(self, '_temp_w_parts'): self._temp_w_parts = []
+                    self._temp_w_parts.append(weights)
+
+                    jj_u = torch.unique(jj)
+                    got_mass[jj_u] = True
+
+        if not all_i_parts:
+            if hasattr(self, '_temp_w_parts'): del self._temp_w_parts
+            return
+
+        i_idx = torch.cat(all_i_parts, dim=0)
+        j_idx = torch.cat(all_j_parts, dim=0)
+        w_weights = torch.cat(self._temp_w_parts, dim=0).unsqueeze(-1) # (Pairs, 1)
+        del self._temp_w_parts # Cleanup
+
+        """
         for i0 in range(0, N, CH):
             i1 = min(i0 + CH, N)
             pts_chunk = pts_world[i0:i1].to(dev, torch.float32).contiguous()
@@ -858,6 +758,7 @@ class LatentVoxelGrid(nn.Module):
 
         i_idx = torch.cat(all_i_parts, dim=0)
         j_idx = torch.cat(all_j_parts, dim=0)
+        """
 
         # Identify which unique voxels are being updated
         idx_upd = got_mass.nonzero(as_tuple=False).squeeze(-1)
@@ -876,12 +777,14 @@ class LatentVoxelGrid(nn.Module):
         f_proj_all = f_pts.to(dev)  # Assuming already projected
         f_sel = f_proj_all[i_idx]   # (Pairs, D)
 
+        #NEW MULTIPLE WEIGHTS
+        f_sel = f_sel * w_weights
+
         # 2. Initialize accumulator with -Infinity
         # We process in chunks to avoid OOM if Pairs is huge
 
         #MAX POOLING
         u = torch.full((idx_upd.numel(), D), -1e9, device=dev, dtype=torch.float32)
-
         #u = torch.zeros((idx_upd.numel(), D), device=dev, dtype=torch.float32)
 
         chunk_size = 50_000
@@ -912,35 +815,44 @@ class LatentVoxelGrid(nn.Module):
         u = torch.nan_to_num(u, nan=0.0, posinf=0.0, neginf=0.0)
         u[u <= -1e8] = 0.0 # Clean up untouched initialization
 
+
+        # 1. Calculate Counts (Density)
+        # 'inv' maps every point-voxel pair to a unique voxel index.
+        # We just count occurrences of each index.
+        ones = torch.ones_like(inv, dtype=torch.float32)
+        counts = torch.zeros((idx_upd.numel(),), device=dev)
+        counts.scatter_add_(0, inv, ones)
+
+        # 2. Log-Encode the Count
+        # We use log1p because counts can vary wildly (1 vs 1000).
+        # Log brings them into a neural-friendly range (0.69 vs 6.9).
+        density_feature = torch.log1p(counts).unsqueeze(-1) # Shape: (M, 1)
+
+        # 3. Concatenate and Update
+        # u_sel is your max-pooled feature (M, D)
+        u_sel = u.to(self.z_latent.dtype)
+        z_sel = self.z_latent[idx_upd]
+
+        # Concatenate: [Features | Count]
+        gru_input = torch.cat([u_sel, density_feature], dim=-1)
+
+        refined_input = self.fusion_mlp(gru_input) # (M, D)
+        # Pass expanded input to GRU
+        z_new = self.gru_cell(refined_input, z_sel)
+
+        """
         # -----------------------------------------------------------------------
         # GRU Update
         # -----------------------------------------------------------------------
         u_sel = u.to(self.z_latent.dtype)
         z_sel = self.z_latent[idx_upd]
 
-        # Standard GRU Gate
-        #gamma = torch.sigmoid(self.gate_mlp(torch.cat([u_sel, z_sel], dim=-1)))
-        #x_in  = u_sel * gamma
-
         x_in = u_sel
 
-
-        #with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
-        #    z_new = self.gru_cell(x_in, z_sel)
-
-        #combined = torch.cat([z_sel, u_sel], dim=-1) # (U, 2D)
-        #delta = self.update_mlp(combined) * self.input_gain
-
-        
-        #z_new = delta
-
-        #z_new = self.gru_cell(delta, z_sel)
-        #z_new = torch.tanh(z_new) * 5.0
-        
         z_new = self.gru_cell(x_in, z_sel)
-        #z_new = u_sel
 
 
+        """
 
         if not torch.isfinite(z_new).all():
              z_new = torch.nan_to_num(z_new, nan=0.0, posinf=0.0, neginf=0.0)
@@ -1002,102 +914,6 @@ class LatentVoxelGrid(nn.Module):
             return self.decoder(self.z_latent, centers) * t
         else:
             return self.decoder(self.z_latent, None) * t
-
-    @torch.no_grad()
-    def to_bev2(
-        self,
-        x_range: tuple[float, float],
-        y_range: tuple[float, float],
-        res_xy: float,
-        z_min: float,
-        z_max: float,
-        agg: str = "max",
-        with_xyz_cond: bool = False,
-        occ_thresh: float = 0.5,  # Threshold for Occupied vs Free
-    ) -> tuple[np.ndarray, dict]:
-        """
-        Produce a BEV occupancy grid compatible with standard utils.
-        Returns:
-          bev: (Hy, Hx) numpy int8 array with values {-1, 0, 100}
-          meta: dict with origin/resolution for plotting
-        """
-        # 1. Setup Grid Dimensions
-        x0, x1 = x_range
-        y0, y1 = y_range
-        Hx = int((x1 - x0) / res_xy)
-        Hy = int((y1 - y0) / res_xy)
-
-        # Initialize with -1.0 to represent 'Unknown' (standard convention)
-        bev = torch.full((Hy, Hx), -1.0, device=self.device)
-        meta = {"x0": x0, "y0": y0, "res": res_xy, "width": Hx, "height": Hy}
-
-        # 2. Get Centers & Decode Probabilities
-        centers = self.voxel_centers()
-        if centers.numel() == 0:
-            return np.full((Hy, Hx), -1, dtype=np.int8), meta
-
-        z = centers[:, 2]
-        z_mask = (z >= z_min) & (z <= z_max)
-        if not z_mask.any():
-            return np.full((Hy, Hx), -1, dtype=np.int8), meta
-
-        centers = centers[z_mask]
-        z_lat = self.z_latent[z_mask]
-
-        # Decode: z_latent -> probability [0.0, 1.0]
-        probs = self.decoder(z_lat, centers if with_xyz_cond else None)
-        probs = torch.sigmoid(probs)
-        probs = probs.to(dtype=bev.dtype)   # match float32 destination
-
-
-
-        # 3. Project to Grid
-        gx = ((centers[:, 0] - x0) / res_xy).floor().to(torch.long)
-        gy = ((centers[:, 1] - y0) / res_xy).floor().to(torch.long)
-
-        keep = (gx >= 0) & (gx < Hx) & (gy >= 0) & (gy < Hy)
-        print(len(keep))
-        gx, gy, probs = gx[keep], gy[keep], probs[keep]
-
-        if probs.numel() == 0:
-            return np.full((Hy, Hx), -1, dtype=np.int8), meta
-
-        # 4. Rasterize
-        idx = gy * Hx + gx
-        flat = bev.view(-1)
-
-        if agg == "max":
-            # scatter_reduce 'amax' updates -1.0 with higher probabilities (0.0 to 1.0)
-            flat.scatter_reduce_(0, idx, probs, reduce="amax", include_self=True)
-        elif agg == "mean":
-            # For mean, we need a separate zero-initialized buffer
-            flat_sum = torch.zeros_like(flat)
-            flat_cnt = torch.zeros_like(flat)
-            flat_sum.scatter_add_(0, idx, probs)
-            flat_cnt.scatter_add_(0, idx, torch.ones_like(probs))
-
-            # Write means into bev, leaving untouched as -1.0
-            mask = flat_cnt > 0
-            flat[mask] = flat_sum[mask] / flat_cnt[mask]
-        else:
-            raise ValueError("agg must be 'max' or 'mean'")
-
-        # 5. Convert to Standard Integer Format (-1, 0, 100)
-        bev_np = bev.cpu().numpy()
-        out_map = np.full_like(bev_np, -1, dtype=np.int8)
-
-        # Identify cells that were updated (value > -0.5)
-        # Note: Valid probabilities are >= 0.0. Unknowns are -1.0.
-        known_mask = bev_np > -0.5
-
-        # Apply Thresholds
-        occupied_mask = (bev_np > occ_thresh) & known_mask
-        free_mask = (bev_np <= occ_thresh) & known_mask
-
-        out_map[free_mask] = 0       # Free
-        out_map[occupied_mask] = 100 # Occupied
-
-        return out_map, meta
 
     @torch.no_grad()
     def to_bev(
@@ -1175,75 +991,6 @@ class LatentVoxelGrid(nn.Module):
 
 
         return out_map, meta
-    """
-    # --- rasterize to 2D BEV occupancy ---
-    @torch.no_grad()
-    def to_bev(
-        self,
-        x_range: tuple[float, float],
-        y_range: tuple[float, float],
-        res_xy: float,
-        z_min: float,
-        z_max: float,
-        agg: str = "max",
-        with_xyz_cond: bool = False,
-    ) -> tuple[torch.Tensor, dict]:
-
-
-        centers = self.voxel_centers()
-        if centers.numel() == 0:
-            Hx = int((x_range[1]-x_range[0]) / res_xy)
-            Hy = int((y_range[1]-y_range[0]) / res_xy)
-            return torch.zeros(Hy, Hx), {"x0": x_range[0], "y0": y_range[0], "res": res_xy}
-
-        # slice by height
-        z = centers[:, 2]
-        z_mask = (z >= z_min) & (z <= z_max)
-        if not z_mask.any():
-            Hx = int((x_range[1]-x_range[0]) / res_xy)
-            Hy = int((y_range[1]-y_range[0]) / res_xy)
-            return torch.zeros(Hy, Hx, device=self.device), {"x0": x_range[0], "y0": y_range[0], "res": res_xy}
-
-        centers = centers[z_mask]
-        z_lat = self.z_latent[z_mask]
-        probs = self.decoder(z_lat, centers if with_xyz_cond else None)  # (Mz,)
-        probs = torch.sigmoid(probs)
-
-        # index into BEV grid
-        x0, x1 = x_range
-        y0, y1 = y_range
-        Hx = int((x1 - x0) / res_xy)
-        Hy = int((y1 - y0) / res_xy)
-
-        gx = ((centers[:, 0] - x0) / res_xy).floor().to(torch.long)
-        gy = ((centers[:, 1] - y0) / res_xy).floor().to(torch.long)
-        keep = (gx >= 0) & (gx < Hx) & (gy >= 0) & (gy < Hy)
-        gx, gy, probs = gx[keep], gy[keep], probs[keep]
-
-        bev = torch.zeros(Hy, Hx, device=self.device, dtype=probs.dtype)
-        if probs.numel() == 0:
-            return bev, {"x0": x0, "y0": y0, "res": res_xy}
-
-        if agg == "max":
-            # scatter max (PyTorch 2.0: scatter_reduce)
-            idx = gy * Hx + gx
-            flat = bev.view(-1)
-            flat.scatter_reduce_(0, idx, probs, reduce="amax", include_self=True)
-        elif agg == "mean":
-            idx = gy * Hx + gx
-            flat_sum = bev.view(-1)
-            flat_cnt = torch.zeros_like(flat_sum)
-            flat_sum.scatter_add_(0, idx, probs)
-            flat_cnt.scatter_add_(0, idx, torch.ones_like(probs))
-            flat = torch.where(flat_cnt > 0, flat_sum / flat_cnt.clamp_min(1), flat_sum*0)
-            bev = flat.view(Hy, Hx)
-        else:
-            raise ValueError("agg must be 'max' or 'mean'")
-
-        return bev, {"x0": x0, "y0": y0, "res": res_xy}
-    """
-
-
 
     def _ensure_feature_storage_(self):
         """internal: make sure z_latent exists & is aligned with keys."""
@@ -1382,6 +1129,8 @@ class LatentVoxelGrid(nn.Module):
                 
                 # Initialize accumulator with -Infinity for Max Pooling
                 u_all = torch.full((self.keys.shape[0], self.feature_dim), -1e9, device=dev, dtype=dt)
+                #u_all = torch.zeros((self.keys.shape[0], self.feature_dim), device=dev, dtype=dt)
+
 
                 # FIX: Removed the chunking loop to avoid In-place Autograd error.
                 # Perform scatter_reduce in one shot.
@@ -1390,6 +1139,7 @@ class LatentVoxelGrid(nn.Module):
 
                 # Max Pool
                 u_all.scatter_reduce_(0, idx_expanded, f_pts, reduce="amax", include_self=True)
+                #u_all.scatter_reduce_(0, idx_expanded, f_pts, reduce="mean", include_self=False)
 
                 # --- 6. GRU Update (Surface Voxels) ---
                 # Extract inputs for surface voxels
@@ -1439,246 +1189,3 @@ class LatentVoxelGrid(nn.Module):
                         self._ensure_and_index(torch.zeros(0, dtype=torch.int64, device=self.device))
                     self.seen_occ_epoch[unique_surf_idx] = now
 
-    """
-    def initialize_latents_from_full_cloud(
-            self,
-            pts_world: torch.Tensor,   # (N,3) full scene points (aligned)
-            f_pts: torch.Tensor,       # (N,D) point features
-            cam_centers: torch.Tensor, # (N,3) Camera center for each point
-            *,
-            pool: str = "mean",        # "mean" or "mean+max"
-            init_lt: bool = True,      # initialize LT/ST from decoded probs
-            lt_level: float | None = None,
-            z_whiten: bool = False,
-            carve_free: bool = True,   
-            z_clip: Tuple[float,float] | None = (-float('inf'), float('inf')),
-            stride: int = 4,         
-            samples_per_voxel: float = 2.0, # Match GT density (usually 2.0)
-            max_rays: int = 10000,          # Match GT cap (usually 10k or 20k)
-            max_range: float = 12.0         # Match GT clip (usually 12.0)
-        ):
-
-            dev, dt = self.device, self.dtype
-
-            if pts_world.numel() == 0:
-                return
-
-            pts_world = pts_world.to(dev, dt)
-            f_pts = f_pts.to(dev, dt)
-
-            finite = torch.isfinite(pts_world).all(dim=1) & torch.isfinite(cam_centers).all(dim=1)
-            pts_world, cam_centers, f_pts = pts_world[finite], cam_centers[finite], f_pts[finite]
-            if pts_world.numel() == 0: return
-
-            if z_clip is not None:
-                z0, z1 = z_clip
-                keep = (pts_world[:,2] >= z0) & (pts_world[:,2] <= z1)
-                pts_world, cam_centers, f_pts = pts_world[keep], cam_centers[keep], f_pts[keep]
-
-
-
-            if max_range is not None and cam_centers is not None:
-                cam_centers = cam_centers.to(dev, dt)
-                d_all = torch.norm(pts_world - cam_centers, dim=1)
-                keep = d_all <= max_range
-
-                pts_world = pts_world[keep]
-                f_pts = f_pts[keep]
-                cam_centers = cam_centers[keep]
-            
-            # --- 1. Identify Surface Voxels (Walls) ---
-            # Keep duplicates here (N,) because we need them for feature pooling later
-            ijk = self._world_to_ijk(pts_world)
-            keys_surf = self._hash_ijk(ijk)
-
-            # --- 2. Identify Free Space Voxels (Air) ---
-            keys_free = torch.zeros(0, dtype=torch.int64, device=dev)
-            
-            if carve_free and cam_centers is not None:
-                cam_centers = cam_centers.to(dev, dt)
-                
-                # A. Stride
-                P_sub = pts_world[::stride]
-                C_sub = cam_centers[::stride]
-                
-                # B. Max Range Filter (Critical for matching GT)
-                                # C. Random Cap (Critical for matching GT density)
-                if max_rays is not None and P_sub.shape[0] > max_rays:
-                    perm = torch.randperm(P_sub.shape[0], device=dev)[:max_rays]
-                    P_sub = P_sub[perm]
-                    C_sub = C_sub[perm]
-
-                if P_sub.numel() > 0:
-                    # --- Exact Ray Marching Logic from voxel.py ---
-                    V = P_sub - C_sub
-                    seg_len = torch.linalg.norm(V, dim=1)
-                    
-                    # Calculate number of steps per ray based on voxel density
-                    steps = torch.clamp((seg_len / self.p.voxel_size * samples_per_voxel).ceil().to(torch.int32), min=1)
-                    max_steps = int(steps.max().item())
-
-                    # Vectorized sample generation
-                    base = torch.arange(max_steps, device=dev, dtype=dt) + 0.5
-                    t = base[None, :] / steps.to(dt)[:, None]
-                    
-                    # Force t < 1.0 (strictly before the wall point)
-                    # matching: torch.minimum(t, torch.nextafter(1.0, 0.0))
-                    #t = torch.minimum(t, torch.tensor(1.0 - 1e-6, device=dev, dtype=dt))
-                    t = torch.minimum(t,torch.nextafter(torch.tensor(1.0, device=dev, dtype=dt),torch.tensor(0.0, device=dev, dtype=dt)))
-                    
-                    mask = (t < 1.0)
-                    
-                    # Generate sample points
-                    # (N, 1, 3) + (N, S, 1) * (N, 1, 3)
-                    samples = C_sub.unsqueeze(1) + t.unsqueeze(-1) * V.unsqueeze(1)
-                    samples = samples[mask]
-                    
-                    if samples.numel() > 0:
-                        ijk_free = self._world_to_ijk(samples)
-                        keys_free_all = self._hash_ijk(ijk_free)
-                        
-                        # D. Exact Set Difference (Air - Wall)
-                        # We remove any free key that is also a wall key.
-                        # This replaces the heuristic "dist_stop" logic.
-                        unique_walls = torch.unique(keys_surf)
-                        
-                        # Only keep keys NOT in walls
-                        # (Chunked check is safer for memory, but direct is fine for <1M points)
-                        keep = ~torch.isin(keys_free_all, unique_walls)
-                        keys_free = torch.unique(keys_free_all[keep])
-
-            # --- 3. Allocate Everything (Walls + Air) ---
-            # Concatenate: unique sorts them, so order in cat() doesn't strictly matter for index
-            all_keys = torch.cat([keys_free, keys_surf]) 
-            
-            # This allocates memory for all keys. 
-            # New voxels (including air) get z_latent initialized to 0.0.
-            self._ensure_and_index(all_keys)
-            
-            # Initialize Free Space with the Learned Token
-            
-            idx_free = torch.searchsorted(self.keys, keys_free)
-            
-            # 2. Write the free_token into z_latent
-            # We do this BEFORE surface pooling so surface features overwrite 
-            # any accidental collisions (though set difference prevents this).
-            if idx_free.numel() > 0:
-                # Expand token to (N_free, D)
-                # Assumes self.free_token is (1, D)
-                token_expanded = self.free_token.expand(idx_free.shape[0], -1)
-                
-                # Write to latent storage
-                self.z_latent.index_copy_(0, idx_free, token_expanded)
-
-            # --- 4. Feature Pooling (ONLY into Surface Voxels) ---
-            # We need to map the original N points (keys_surf) to the new sparse grid indices
-            idx = torch.searchsorted(self.keys, keys_surf)
-            
-            self._ensure_feature_storage_()
-
-            M = self.keys.shape[0]
-            Dp = f_pts.shape[-1]
-            Dl = self.feature_dim
-
-            # voxel pooling of point features
-            feat_sum = torch.zeros((M, Dp), device=dev, dtype=dt)
-            feat_cnt = torch.zeros((M, 1),  device=dev, dtype=dt)
-
-            # sum / count ONLY at surface indices
-            feat_sum.index_add_(0, idx, f_pts)  
-            feat_cnt.index_add_(0, idx, torch.ones((idx.shape[0], 1), device=dev, dtype=dt))
-
-            # mean
-            z_mean = torch.where(feat_cnt > 0, feat_sum / feat_cnt.clamp_min(1e-6), torch.zeros_like(feat_sum))
-
-            # (Optional) Max pooling logic
-            if pool == "mean+max":
-                                z_pool = torch.full((M, Dp), -1e9, device=dev, dtype=dt)
-
-                # Chunk size for safety (e.g., 500k points at a time)
-                chunk_size = 500_000
-                N = f_pts.shape[0]
-
-                for start_i in range(0, N, chunk_size):
-                    end_i = min(start_i + chunk_size, N)
-
-                    # Slice the inputs
-                    f_chunk = f_pts[start_i:end_i]
-                    idx_chunk = idx[start_i:end_i]
-
-                    # Expand indices for this chunk: (Chunk_N, Dp)
-                    idx_expanded = idx_chunk.unsqueeze(-1).expand(-1, Dp)
-
-                    # Accumulate max into the global z_max buffer
-                    # We use in-place scatter_reduce_ here because we are iterating chunks
-                    # and writing to the same destination 'z_max'.
-                    z_pool = torch.scatter_reduce(
-                        z_pool,
-                        0,
-                        idx_expanded,
-                        f_chunk,
-                        reduce="amax",
-                        include_self=True
-                    )
-
-                # Safety: Replace initialization values (-inf) with 0.0 for untouched voxels
-                z_pool = torch.where(
-                    z_pool <= -1e8,
-                    torch.tensor(0.0, device=dev, dtype=dt),
-                    z_pool
-                )
-
-            else:
-                z_pool = z_mean  # (M, Dp)
-
-
-            combined = torch.cat([z_pool, z_pool], dim=-1) # (U, 2D)
-            z_pool = self.update_mlp(combined)
-            # per-voxel whitening
-            if z_whiten:
-                mu = z_pool.mean(dim=-1, keepdim=True)
-                sd = z_pool.std(dim=-1, keepdim=True).clamp_min(1e-4)
-                z_pool = (z_pool - mu) / sd
-
-
-            # write into z_latent
-            if isinstance(self.z_proj, nn.Identity):
-                if z_pool.shape[1] != Dl:
-                    raise ValueError(f"latent_dim {Dl} != pooled feature dim {z_pool.shape[1]}")
-                self.z_latent = z_pool
-            else:
-                self.z_latent = self.z_proj(z_pool)
-
-
-            # --- 5. Initialize Occupancy Logits ---
-            if init_lt:
-                if lt_level is not None:
-                    p_occ = torch.full((M,), float(lt_level), device=dev, dtype=dt)
-                    touched = (feat_cnt.squeeze(-1) > 0)
-                    #logit = torch.logit(p_occ.clamp(1e-5, 1-1e-5))
-                    logit = p_occ
-                    self.vals_lt[touched] = logit[touched]
-                    self.vals_st[touched] = logit[touched]
-                elif self.decoder is not None:
-                    # Decode everything (including air). 
-                    centers = self.voxel_centers()
-                    p_occ = self.decoder(self.z_latent, centers if getattr(self.decoder, "cond", None) == "xyz" else None)
-                    #logit = torch.logit(p_occ.clamp(1e-5, 1-1e-5))
-                    logit = p_occ
-                    # Write to ALL allocated voxels (Walls + Air)
-                    self.vals_lt[:] = logit
-                    self.vals_st[:] = logit
-
-                self.vals_lt.clamp_(min=self.p.l_min, max=self.p.l_max)
-                self.vals_st.clamp_(min=self.p.l_min, max=self.p.l_max)
-                self.vals = self._display_vals()
-
-            # 6) housekeeping
-            if pts_world.shape[0] > 0:
-                touched_idx = torch.nonzero(feat_cnt.squeeze(-1) > 0, as_tuple=False).squeeze(-1)
-                if touched_idx.numel() > 0:
-                    now = torch.tensor(self.epoch, dtype=self.seen_occ_epoch.dtype, device=self.device)
-                    if self.seen_occ_epoch.shape[0] != self.keys.shape[0]:
-                        self._ensure_and_index(torch.zeros(0, dtype=torch.int64, device=self.device))
-                    self.seen_occ_epoch[touched_idx] = now
-    """
