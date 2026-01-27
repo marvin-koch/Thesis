@@ -942,6 +942,172 @@ def bev_from_voxels(
     vox,
     spec: BevSpec,
     include_free: bool = False,
+    prev_probs: Optional[Union[torch.Tensor, np.ndarray]] = None,
+    vis_mode: str = "occupancy",
+) -> Tuple[np.ndarray, dict, Union[torch.Tensor, np.ndarray]]:
+    """
+    Project occupied voxels to 2D BEV. Supports RGB Motion visualization.
+    """
+    # 1. Setup Grid Dimensions
+    W = int(round(spec.width_m / spec.resolution))
+    H = int(round(spec.height_m / spec.resolution))
+    zmin, zmax = spec.z_band
+    occ_thresh = 0.5
+
+    # Detect grid type
+    is_torch_grid = hasattr(vox, "keys") and hasattr(vox, "vals")
+
+    # Initialize (-1.0 = Unknown)
+    if is_torch_grid:
+        bev_probs = torch.full((H, W), -1.0, device=vox.device, dtype=torch.float32)
+    else:
+        bev_probs = np.full((H, W), -1.0, dtype=np.float32)
+
+    # ---------------------------------------------------------
+    # A. Torch Grid (Fast Path)
+    # ---------------------------------------------------------
+    if is_torch_grid:
+        keys: torch.Tensor = vox.keys
+        vals: torch.Tensor = vox.vals
+
+        if keys.numel() > 0:
+            # Decode keys to world coords
+            off = (1 << 20)
+            i = ((keys >> 42) & ((1 << 21) - 1)) - off
+            j = ((keys >> 21) & ((1 << 21) - 1)) - off
+            k = ( keys        & ((1 << 21) - 1)) - off
+            ijk = torch.stack([i, j, k], dim=-1).to(torch.float32)
+
+            origin = vox.origin.to(torch.float32)
+            vs = float(vox.p.voxel_size)
+            centers = origin + (ijk + 0.5) * vs
+            cx, cy, cz = centers[:, 0], centers[:, 1], centers[:, 2]
+
+            # Convert Log-Odds -> Probability [0, 1]
+            probs = torch.sigmoid(vals)
+
+            # Filter Z-band
+            z_mask = (cz >= zmin) & (cz <= zmax)
+
+            if z_mask.any():
+                u = torch.floor((cx[z_mask] - spec.origin_xy[0]) / spec.resolution).to(torch.int64)
+                v = torch.floor((cy[z_mask] - spec.origin_xy[1]) / spec.resolution).to(torch.int64)
+
+                inb = (u >= 0) & (u < W) & (v >= 0) & (v < H)
+                if inb.any():
+                    # Scatter max probability into grid
+                    # (Uses scatter_reduce 'amax' to overwrite -1.0 with valid probs)
+                    idx = v[inb] * W + u[inb]
+                    flat = bev_probs.view(-1)
+                    flat.scatter_reduce_(0, idx, probs[z_mask][inb], reduce="amax", include_self=True)
+
+    # ---------------------------------------------------------
+    # B. Dict/Numpy Grid (Compat Path)
+    # ---------------------------------------------------------
+    else:
+        source_dict = getattr(vox, "logodds", {})
+        # Fallback to iterating occupied voxels
+        occ_ijk = vox.occupied_voxels(zmin=zmin, zmax=zmax)
+        for ijk in occ_ijk:
+            val = source_dict.get(tuple(ijk), 5.0)
+            prob = 1.0 / (1.0 + np.exp(-val))
+
+            cx, cy, _ = vox.ijk_to_center(ijk)
+            u = int(math.floor((cx - spec.origin_xy[0]) / spec.resolution))
+            v = int(math.floor((cy - spec.origin_xy[1]) / spec.resolution))
+
+            if 0 <= u < W and 0 <= v < H:
+                bev_probs[v, u] = max(bev_probs[v, u], prob)
+
+    # ---------------------------------------------------------
+    # C. Prepare Returns
+    # ---------------------------------------------------------
+
+    # 1. Clean Probs for Next Step (Unknown -> 0.0)
+    # This prevents math errors in the next frame's subtraction
+    if is_torch_grid:
+        raw_probs_for_next_step = bev_probs.clone()
+        raw_probs_for_next_step[raw_probs_for_next_step < 0] = 0.0
+        bev_np = bev_probs.cpu().numpy()
+    else:
+        raw_probs_for_next_step = bev_probs.copy()
+        raw_probs_for_next_step[raw_probs_for_next_step < 0] = 0.0
+        bev_np = bev_probs
+
+    # 2. Render Map
+    if vis_mode == "motion":
+        # --- RGB Motion Visualization ---
+        out_img = np.zeros((H, W, 3), dtype=np.uint8)
+
+        # Current status
+        curr_occ = bev_np > occ_thresh
+
+        # Prepare Previous Frame
+        prev_np = None
+        if prev_probs is not None:
+            if isinstance(prev_probs, torch.Tensor):
+                prev_np = prev_probs.cpu().numpy()
+            else:
+                prev_np = prev_probs
+
+            if prev_np.shape != bev_np.shape:
+                prev_np = None # Shape mismatch reset
+
+        if prev_np is not None:
+            # --- Difference Calculation ---
+            # Treat Unknown (-1) in current frame as Free (0.0) for differencing.
+            # This ensures that if a voxel vanishes from the sparse grid,
+            # we correctly calculate (0.0 - 0.9 = -0.9) -> Disappearing.
+            curr_clean = bev_np.copy()
+            curr_clean[curr_clean < 0] = 100
+
+            delta = curr_clean - prev_np
+
+            # A. Static (Occupied NOW + Small Change) -> Grey
+            static_mask = (curr_occ) & (np.abs(delta) < 0.3)
+            out_img[static_mask] = [200, 200, 200]
+
+            # B. Appearing (Occupied NOW + Positive Delta) -> Red
+            appearing_mask = (curr_occ) & (delta > 0.25)
+            out_img[appearing_mask] = [255, 0, 50]
+
+            # C. Disappearing (Occupied BEFORE + Negative Delta) -> Blue
+            # We trust prev_np for existence check, since curr might be 0/Unknown
+            disappearing_mask = (prev_np > occ_thresh) & (delta < -0.25)
+            out_img[disappearing_mask] = [0, 150, 255]
+
+        else:
+            # No History -> Standard White
+            out_img[curr_occ] = [200, 200, 200]
+
+        bev = out_img
+
+    else:
+        # --- Standard Int8 Occupancy ---
+        bev = np.full_like(bev_np, -1, dtype=np.int8)
+
+        # Masks
+        known_mask = bev_np > -0.5
+        occupied_mask = (bev_np > occ_thresh) & known_mask
+        free_mask = (bev_np <= occ_thresh) & known_mask
+
+        bev[free_mask] = 0
+        bev[occupied_mask] = 100
+
+    meta = {
+        "resolution": spec.resolution,
+        "origin_xy": spec.origin_xy,
+        "width": W,
+        "height": H,
+        "z_band": spec.z_band,
+    }
+
+    return bev, meta, raw_probs_for_next_step
+
+def bev_from_voxels2(
+    vox,
+    spec: BevSpec,
+    include_free: bool = False,
 ) -> Tuple[np.ndarray, dict]:
     """
     Project occupied (and optionally free) voxels to a 2D BEV occupancy.
@@ -1237,7 +1403,7 @@ def build_maps_from_points_and_centers_torch(
         origin_xy=bev_origin_xy,
         z_band=z_band_bev,
     )
-    bev, meta = bev_from_voxels(tvox, bev_spec, include_free=True)
+    bev, meta, _ = bev_from_voxels(tvox, bev_spec, include_free=True)
     return tvox, bev, meta
 
 
@@ -1297,8 +1463,8 @@ def build_maps_from_latent_features(
         pts_phantom, feats_phantom = tvox.generate_phantom_points(
             cameras, 
             pts, 
-            n_samples=3
-            #n_samples=5
+            #n_samples=3
+            n_samples=5
         )
     
         pts_total = torch.cat([pts, pts_phantom], dim=0)
@@ -1335,8 +1501,9 @@ def build_maps_from_latent_features(
         res_xy=res_xy,
         z_min=z_min,
         z_max=z_max,
-        agg="max",
-        with_xyz_cond=False,
+        #agg="max",
+        #with_xyz_cond=False,
+        vis_mode="motion",      # <--- Request RGB Motion mode
     )
     # bev, meta = bev_from_voxels(tvox, bev_spec, include_free=True)
     return tvox, bev, meta
@@ -1458,6 +1625,49 @@ def _to_numpy_float32(x):
     return x
 
 def save_bev_png(bev: np.ndarray, meta: dict, path: str = "bev.png"):
+    """Save the BEV to a PNG with axes in meters. Handles both 2D occupancy and 3D RGB maps."""
+
+    # 1. Detect if this is an RGB image (Motion Mode) or standard 2D Map
+    is_rgb = (bev.ndim == 3 and bev.shape[2] == 3)
+
+    if not is_rgb:
+        # Standard 2D path: Convert to float for standard colormapping
+        bev = _to_numpy_float32(bev)
+        H, W = bev.shape
+    else:
+        # RGB path: Handle types for matplotlib
+        # If float and > 1.0 (e.g. converted from uint8 0-255), normalize to 0-1
+        if bev.dtype.kind == 'f' and bev.max() > 1.1:
+            bev = bev / 255.0
+        # If uint8, matplotlib handles it natively.
+        H, W = bev.shape[:2]
+
+    res = float(meta.get("resolution", 0.10))
+    ox, oy = meta.get("origin_xy", (0.0, 0.0))
+    extent = [ox, ox + W * res, oy, oy + H * res]
+
+    plt.figure()
+
+    if is_rgb:
+        # Plot RGB Image
+        plt.imshow(bev, origin="lower", extent=extent)
+        plt.title("BEV Motion (Red=New, Blue=Trail)")
+        # Note: No colorbar for RGB
+    else:
+        # Plot Standard Occupancy
+        plt.imshow(bev, origin="lower", extent=extent, cmap='viridis') # Added cmap for clarity
+        plt.title("BEV Occupancy")
+        plt.colorbar(label="occupancy value")
+
+    plt.xlabel("x [m]")
+    plt.ylabel("y [m]")
+    plt.tight_layout()
+    print("savfig ", path)
+    plt.savefig(path, dpi=200)
+    plt.close()
+    print(f"Saved {path}")
+
+def save_bev_png2(bev: np.ndarray, meta: dict, path: str = "bev.png"):
     """Save the BEV to a PNG with axes in meters."""
     bev = _to_numpy_float32(bev)  # ✅ convert here
 

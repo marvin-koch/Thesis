@@ -56,6 +56,9 @@ from sklearn.decomposition import PCA
 import matplotlib.pyplot as plt
 import PIL
 
+# Add this to your imports in train.py
+from pytorch3d.ops import knn_points
+
 
 STEP = 20
 
@@ -195,11 +198,9 @@ class VoxelUpdaterSystem(pl.LightningModule):
         #self.bev_window_m=(5.0, 5.0)
         self.bev_origin_xy=(-25.0, -25.0)
         #self.bev_origin_xy=(-10.0, -10.0)
-        self.z_band_bev=(1.0, 3.0)
-        self.z_band_bev=(-2.0, 3.5)
-        #self.z_band_bev=(-1.0, 2.0)
 
-        #self.z_band_bev=(-0.02, 0.1)
+        #self.z_band_bev=(-0.5, 2.0)
+        self.z_band_bev=(-2.0, 3.5)
 
         self.fp_weight = 0.0
 
@@ -490,7 +491,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
             z_band_bev=(self.z_band_bev[0], self.z_band_bev[1]),
             #z_band_bev=(self.z_band_bev[0] - 0.4, self.z_band_bev[1]),
             frame_ids=frame_ids,
-            radius= self.cfg.radius_m
+            radius= self.cfg.radius_m,
         )
 
         self.vox = vox
@@ -791,6 +792,57 @@ class VoxelUpdaterSystem(pl.LightningModule):
     
 
     
+    def compute_entropy_loss(self, logits: torch.Tensor) -> torch.Tensor:
+        """
+        Encourages high confidence (0 or 1).
+        """
+        if logits.numel() == 0:
+            return torch.tensor(0.0, device=self.device)
+
+        probs = torch.sigmoid(logits)
+        eps = 1e-6
+        # H(p) = -[p * log(p) + (1-p) * log(1-p)]
+        entropy = -(probs * torch.log(probs + eps) + (1 - probs) * torch.log(1 - probs + eps))
+        return entropy.mean()
+
+    def compute_tv_loss(self, logits: torch.Tensor, K: int = 5) -> torch.Tensor:
+        """
+        Calculates TV loss by finding spatial neighbors for sparse voxels.
+        """
+        if logits.numel() < 2:
+            return torch.tensor(0.0, device=self.device)
+
+        # 1. Get centers (Detached from graph for geometry, but probs map to them)
+        # Note: We rely on self.vox to get coordinates
+        centers = self.vox.voxel_centers().unsqueeze(0)  # (1, N, 3)
+
+        # 2. Find K Nearest Neighbors
+        # idx: (1, N, K), dists: (1, N, K) squared distances
+        res = knn_points(centers, centers, K=K, return_nn=False)
+        idx = res.idx[0]
+        dists = res.dists[0]
+
+        # 3. Filter for immediate neighbors (approx 1 voxel size away)
+        # dists are squared euclidean. Neighbor dist^2 should be close to voxel_size^2.
+        # We exclude 0 (self) and diagonals (> 1.5 * voxel_size^2).
+        vs2 = self.voxel_size ** 2
+        mask = (dists > 1e-6) & (dists < (1.3 * vs2))
+
+        # 4. Get probabilities (differentiable)
+        probs = torch.sigmoid(logits)
+
+        p_center = probs.unsqueeze(-1)      # (N, 1)
+        p_neighbors = probs[idx]            # (N, K)
+
+        # 5. Compute L1 difference
+        # We only count differences where valid spatial neighbors exist
+        diff = torch.abs(p_center - p_neighbors) * mask.float()
+
+        # Normalize by number of valid neighbors found
+        loss_tv = diff.sum() / (mask.sum() + 1e-8)
+
+        return loss_tv
+
     def training_step(self, batch: Dict, batch_idx: int):
         """
         One batch = one sequence.
@@ -1367,6 +1419,11 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 loss_ent = self.vox._last_entropy
             
             loss_tv = torch.tensor(0.0, device=device)
+            if cfg.lambda_tv > 0.0:
+                 loss_tv = self.compute_tv_loss(logit_pred_before)
+
+
+            loss_ent = self.compute_entropy_loss(logit_pred_before)
 
             # Combine Losses
             loss_t = cfg.lambda_occ * loss_occ + cfg.lambda_temp * loss_temp \
@@ -1894,6 +1951,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
         print(f"\n=== Starting Prediction for Seq: {seq_id} (T={T}) ===")
 
+        prev_probs = None
         for t in range(T):
             # print(f"Step {t}...")
             imgs = batch["imgs_t"][t]
@@ -2069,12 +2127,21 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 z_band=(self.z_band_bev[0], self.z_band_bev[1]),
             )
 
-            bev_gt, meta = bev_from_voxels(self.vox_gt, bev_spec, include_free=True)
+            #bev_gt, meta = bev_from_voxels(self.vox_gt, bev_spec, include_free=True)
+            
+            bev_gt, meta, prev_probs = bev_from_voxels(self.vox_gt, bev_spec, include_free=True, prev_probs=prev_probs, vis_mode="motion")
 
             bevs.append(bev)
             bevs_gt.append(bev_gt)
 
             self.vox.z_latent = self.vox.z_latent.detach()
+            save_dir = "debug_viz_pred"
+            os.makedirs(save_dir, exist_ok=True)
+            fname = f"{save_dir}/step_{t}.ply"
+            self.export_debug_ply(fname, t)
+            self.export_separated_ply(t, save_dir="debug_viz_pred")
+
+
             torch.cuda.empty_cache()
 
         # --- FINAL SUMMARY PRINT ---
@@ -2096,175 +2163,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
         return bevs, bevs_gt
 
-    """
-    def predict_step(self, batch: Dict, batch_idx: int, dataloader_idx: int = 0):
-        device = self.device
 
-        self.vox.reset_state()
-        self.vox = self.vox.to(self.device)
-
-        # Initialize an empty GT grid structure
-        self.vox_gt = TorchSparseVoxelGrid(
-            origin_xyz=np.zeros(3, dtype=np.float32),
-            params=VoxelParams(voxel_size=self.voxel_size, promote_hits=2),
-            device=self.device 
-        )
-        
-        # Buffers for temporal consistency
-        self._prev_keys = None
-        self._prev_probs = None
-
-        T = batch["timesteps"]
-       
-
-        seq_id = batch["seq_id"]
-        gt_root = os.path.join(self.cfg.dataset_root, self.cfg.gt_voxels_file)
-        precomputed_root = os.path.join(self.cfg.dataset_root, self.cfg.precomputed_cache_file)
-        pose_root = os.path.join(self.cfg.dataset_root, self.cfg.pose_file)
-
-        # Preload GT
-        gt_seq = []
-        for t in range(T):
-            if self.cfg.skip:
-                t = t * STEP
-            gt_path = os.path.join(gt_root, f"{seq_id}_t{t:04d}_gt.npz")
-            print(gt_path)
-
-            if os.path.exists(gt_path):
-                vox_gt_t = load_sparse_voxel_grid(gt_path, device)
-            else:
-                vox_gt_t = None
-            gt_seq.append(vox_gt_t)
-            
-        d = np.load(os.path.join(pose_root, f"{seq_id}_t0000_align.npz"), allow_pickle=True)
-
-        
-        Rmw = d["Rmw"]   # (3,3) float32
-        tmw = d["tmw"]   # (3,)  float32
-        scale_factor = float(d["scale"])
-        Rmw = to_torch(Rmw, device=self.device)
-        tmw = to_torch(tmw, device=self.device)
-        tmw_scaled = tmw * scale_factor
-
-        mst = False
-        
-        bevs = []
-        bevs_gt = []
-        for t in range(T):
-            # #print(f"== Val Step {t} ==")
-            imgs = batch["imgs_t"][t]
-            
-            self.vox_gt = gt_seq[t]
-            if self.vox_gt is None:
-                continue
-            
-            p = t * STEP
-            cache_path = os.path.join(precomputed_root, seq_id, f"t{p:04d}.pt")
-            if not os.path.exists(cache_path):
-                continue
-       
-    
-            predictions = torch.load(cache_path, map_location=self.device)
-            
-            
-            
-
-            R_w2m = np.array([[0, 0, -1],
-                            [-1, 0, 0],
-                            [0, -1, 0]], dtype=np.float32)
-            t_w2m = np.zeros(3, dtype=np.float32)
-
-            R_w2m = to_torch(R_w2m, device=self.device)
-            t_w2m = to_torch(t_w2m, device=self.device)
-
-            # 2. Rotate Points to World Frame (using Rmw/tmw from outside loop)
-            # Note: Rmw/tmw are defined before the loop in predict_step
-            WPTS_m = rotate_points(predictions["world_points"], R_w2m, t_w2m)
-            predictions["world_points"] = rotate_points(WPTS_m, Rmw, tmw)
-
-            # 3. Apply Scaling
-            raw_pts = predictions["world_points"]
-            predictions["world_points"] = raw_pts * scale_factor
-
-            # 4. Scale Camera Extrinsics
-            if isinstance(predictions["extrinsic"], torch.Tensor):
-                predictions["extrinsic"][:, :3, 3] *= scale_factor
-            elif isinstance(predictions["extrinsic"], list):
-                for i in range(len(predictions["extrinsic"])):
-                    predictions["extrinsic"][i][:3, 3] *= scale_factor
-  
-            stride = 1 if t == 0 else self.cfg.stride
-
-            if "world_points_conf" in predictions:
-                predictions["world_points_conf"] = predictions["world_points_conf"][..., ::stride, ::stride]
-
-                # Get NEW smaller target size (e.g. 128x128)
-                conf_tensor = predictions["world_points_conf"]
-                if isinstance(conf_tensor, list):
-                    ref = next((x for x in conf_tensor if x is not None), None)
-                    target_hw = ref.shape[-2:] if ref is not None else (128, 128)
-                else:
-                    target_hw = conf_tensor.shape[-2:]
-            else:
-                target_hw = (512 // stride, 512 // stride)
-
-            if "world_points" in predictions:
-                predictions["world_points"] = predictions["world_points"][..., ::stride, ::stride, :]
-
-            if "images" in predictions:
-                img = predictions["images"]
-                if img.shape[-3] == 3 and img.shape[-1] != 3:
-                     img = img.permute(0, 2, 3, 1) # (S, 3, H, W) -> (S, H, W, 3)
-                predictions["images"] = img[..., ::stride, ::stride, :]
-                del img
-
-            # --- PROCESS FEATURES ---
-            raw_feats_list = predictions["view_feats"]
-            projected_feats_map = []
-
-            for f_raw in raw_feats_list:
-                # Pass the dynamically inferred size
-                f_proj = self.apply_projector_to_map(f_raw, target_hw=target_hw)
-                projected_feats_map.append(f_proj)
-                
-            predictions["view_feats"] = projected_feats_map
-            del projected_feats_map
-            
-            with torch.enable_grad(): # (Keep grad enabled for inference/update parts if needed by model)
-                if not mst and t != 0:
-                    bev, mst, _, _ = self.inference(1, imgs, mst, Rmw, tmw_scaled, predictions, scale_factor)
-                else:
-                    bev, mst, _, _ = self.inference(t, imgs, mst, Rmw, tmw_scaled, predictions, scale_factor)
-            
-    
-
-            bev_spec = BevSpec(
-                resolution=self.vox_gt.p.voxel_size,
-                width_m=float(self.bev_window_m[0]),
-                height_m=float(self.bev_window_m[1]),
-                origin_xy=self.bev_origin_xy,
-                z_band=(self.z_band_bev[0], self.z_band_bev[1]),
-            )
-            
-            bev_gt, meta = bev_from_voxels(self.vox_gt, bev_spec, include_free=True)
-            
-            bevs.append(bev)
-            bevs_gt.append(bev_gt)
-            
-            
-            self.vox.z_latent = self.vox.z_latent.detach()
-            torch.cuda.empty_cache()
-            
-            save_dir = "debug_viz_pred"
-            os.makedirs(save_dir, exist_ok=True)
-            fname = f"{save_dir}/step_{t}.ply"
-            self.export_debug_ply(fname, t)
-            self.export_separated_ply(t, save_dir="debug_viz_pred")
-        
-        return bevs, bevs_gt
-
-
-    """
     def on_load_checkpoint(self, checkpoint):
         state_dict = checkpoint["state_dict"]
         # Check if the checkpoint contains voxel keys
@@ -2640,10 +2539,11 @@ class HabitatSeqDataset(Dataset):
         for t, td in enumerate(t_dirs):
             if t % self.step != 0 and self.skip:
                 continue
-            """
-            if t > 30:
+
+            
+            if t > 120:
                 break
-            """
+
             imgs = self._load_timestep(td)
             if imgs:
                 imgs_t.append(imgs)
@@ -2816,8 +2716,10 @@ def main():
         lambda_temp = 0.05,      # temporal consistency weight
         #lambda_temp = 0.0,      # temporal consistency weight
 
-        lambda_ent = 1e-3,      # routing entropy reg
-        lambda_tv = 1e-4 ,      # (optional) spatial TV on occupancy
+        #lambda_ent = 1e-2,      # routing entropy reg
+        lambda_ent = 0.0,      # routing entropy reg
+        #lambda_tv = 5e-4 ,      # (optional) spatial TV on occupancy
+        lambda_tv = 0.0,      # (optional) spatial TV on occupancy
     )
 
     dm = HabitatDataModule(
@@ -2842,9 +2744,9 @@ def main():
     #    cfg=cfg
     #)
     ckpt_cb = pl.callbacks.ModelCheckpoint(
-        dirpath="/cluster/scratch/kochmar/checkpoints/full7",       # Explicitly set a folder so you can find them
+        dirpath="/cluster/scratch/kochmar/checkpoints/full8",       # Explicitly set a folder so you can find them
         monitor="val_loss_total",
-        save_top_k=3,
+        save_top_k=5,
         mode="min",
         filename="voxup-{epoch:02d}-{val_loss_total:.4f}" # Match the key logged in validation_step
     )
@@ -2911,11 +2813,15 @@ def main():
     )
     #print(">>> before trainer.fit()", flush=True)
     #ckpt_path = "/cluster/scratch/kochmar/checkpoints/full/voxup-epoch=07-val_loss_total=10.9045.ckpt"
+    #ckpt_path = "/cluster/scratch/kochmar/checkpoints/full7/voxup-epoch=05-val_loss_total=8.4459.ckpt"
+    #ckpt_path = "/cluster/scratch/kochmar/checkpoints/full8/voxup-epoch=05-val_loss_total=7.9698.ckpt"
+    ckpt_path = "/cluster/scratch/kochmar/checkpoints/full8/voxup-epoch=02-val_loss_total=8.2243.ckpt"
 
 
 
-    #trainer.fit(sys, dm, ckpt_path=ckpt_path)
 
-    trainer.fit(sys, dm)
+    trainer.fit(sys, dm, ckpt_path=ckpt_path)
+
+    #trainer.fit(sys, dm)
 if __name__ == "__main__":
     main()

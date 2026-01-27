@@ -261,6 +261,7 @@ class LatentVoxelGrid(nn.Module):
         # routing controls
         self.routing_tau: float = 0.5   # temperature for softmax
         self.routing_topk: int = 16     # voxels per point (after radius prefilter)
+        self.prev_probs = None
         
         
         self.decoder = LatentToOccupancyDecoder(feature_dim, cond=None)
@@ -672,6 +673,8 @@ class LatentVoxelGrid(nn.Module):
             K_ball_bound = (2 * r_vox + 1) ** 3
             #K_ball_cap   = 32  # <--- Increased Cap to handle larger radius
             K_ball_cap   = 64  # <--- Increased Cap to handle larger radius
+            #K_ball_cap   = 96  # <--- Increased Cap to handle larger radius
+            #K_ball_cap   = 32  # <--- Increased Cap to handle larger radius
             K_ball = min(M, K_ball_bound, K_ball_cap)
         else:
             K_ball = 0
@@ -684,6 +687,8 @@ class LatentVoxelGrid(nn.Module):
 
         #WEIGHTED
         sigma = self.p.voxel_size * 3.0
+        #sigma = self.p.voxel_size * 2.0
+        #sigma = self.p.voxel_size * 1.0
 
         for i0 in range(0, N, CH):
             i1 = min(i0 + CH, N)
@@ -917,6 +922,147 @@ class LatentVoxelGrid(nn.Module):
 
     @torch.no_grad()
     def to_bev(
+        self,
+        x_range: tuple[float, float],
+        y_range: tuple[float, float],
+        res_xy: float,
+        z_min: float,
+        z_max: float,
+        agg: str = "max",
+        with_xyz_cond: bool = False,
+        occ_thresh: float = 0.5,
+        vis_mode: str = "occupancy",            # <--- NEW: "occupancy" (std) or "motion" (rgb)
+    ) -> tuple[np.ndarray, dict, torch.Tensor]: # <--- NEW: Returns (Map, Meta, RawProbs)
+
+        # --- 1. Setup Grid ---
+        x0, x1 = x_range
+        y0, y1 = y_range
+        Hx = int((x1 - x0) / res_xy)
+        Hy = int((y1 - y0) / res_xy)
+
+        prev_probs = self.prev_probs
+
+        # Initialize with -1.0 (Unknown)
+        # We use float32 to store raw probabilities [0.0, 1.0]
+        bev_probs = torch.full((Hy, Hx), -1.0, device=self.device, dtype=torch.float32)
+        meta = {"x0": x0, "y0": y0, "res": res_xy, "width": Hx, "height": Hy}
+
+        # --- 2. Get Centers ---
+        centers = self.voxel_centers()
+
+        # If empty, return blank
+        if centers.numel() == 0:
+            if vis_mode == "motion":
+                # Return Black Image for motion mode
+                empty_map = np.zeros((Hy, Hx, 3), dtype=np.uint8)
+            else:
+                empty_map = np.full((Hy, Hx), -1, dtype=np.int8)
+            return empty_map, meta, bev_probs
+
+        # --- 3. Filter Z-Band ---
+        z = centers[:, 2]
+        z_mask = (z >= z_min) & (z <= z_max)
+
+        if z_mask.any():
+            centers = centers[z_mask]
+            z_lat = self.z_latent[z_mask]
+
+            # --- 4. Decode ---
+            # Decode latents to probabilities [0, 1]
+            probs = self.decoder(z_lat, centers if with_xyz_cond else None)
+            probs = torch.sigmoid(probs)
+            probs = probs.to(dtype=bev_probs.dtype)
+
+            # --- 5. Project to 2D ---
+            gx = ((centers[:, 0] - x0) / res_xy).floor().to(torch.long)
+            gy = ((centers[:, 1] - y0) / res_xy).floor().to(torch.long)
+
+            keep = (gx >= 0) & (gx < Hx) & (gy >= 0) & (gy < Hy)
+            gx, gy, probs = gx[keep], gy[keep], probs[keep]
+
+            if probs.numel() > 0:
+                # --- 6. Rasterize ---
+                idx = gy * Hx + gx
+                flat = bev_probs.view(-1)
+                # Scatter max probability into the grid
+                flat.scatter_reduce_(0, idx, probs, reduce="amax", include_self=True)
+
+        # --- 7. Visualization Logic ---
+
+        # Create a raw copy for the next timestep before converting to numpy
+        # We replace -1.0 (unknown) with 0.0 (empty) for the history buffer to avoid math errors
+        raw_probs_for_next_step = bev_probs.clone()
+        raw_probs_for_next_step[raw_probs_for_next_step < 0] = 0.0
+
+        bev_np = bev_probs.cpu().numpy()
+
+
+        self.prev_probs = raw_probs_for_next_step
+
+        if vis_mode == "motion":
+            # --- RGB Motion Visualization ---
+            # Initialize Black Background (H, W, 3)
+            out_img = np.zeros((Hy, Hx, 3), dtype=np.uint8)
+
+            # Masks for current frame
+            curr_occ = bev_np > occ_thresh
+            known = bev_np > -0.5
+
+            if prev_probs is not None:
+                # Ensure previous probability map matches dimensions
+                if prev_probs.shape == bev_probs.shape:
+                    prev_np = prev_probs.cpu().numpy()
+
+                    # Calculate Delta
+                    # Positive = Appearing (0 -> 1)
+                    # Negative = Disappearing (1 -> 0)
+                    delta = np.zeros_like(bev_np)
+                    delta[known] = bev_np[known] - prev_np[known]
+
+                    # --- Color Coding ---
+
+                    # 1. Static Geometry (Occupied in both, Low Delta)
+                    # White / Light Grey
+                    static_mask = (curr_occ) & (np.abs(delta) < 0.3)
+                    out_img[static_mask] = [200, 200, 200]
+
+                    # 2. Moving / Appearing (Occupied now, wasn't before)
+                    # Red / Hot Pink
+                    appearing_mask = (delta > 0.25) & curr_occ
+                    out_img[appearing_mask] = [255, 0, 50]
+
+                    # 3. Disappearing / Trail (Empty now, was occupied)
+                    # Blue / Cyan (Optional: helps see ghosting)
+                    disappearing_mask = (delta < -0.25) & (prev_np > occ_thresh)
+
+                    #Remove ghosting for now
+                    #out_img[disappearing_mask] = [0, 150, 255]
+
+                else:
+                    # Fallback if shapes don't match (e.g. grid resized)
+                    out_img[curr_occ] = [200, 200, 200]
+            else:
+                # No history: Render standard occupancy in White
+                out_img[curr_occ] = [200, 200, 200]
+
+            return out_img, meta
+
+        else:
+            # --- Standard Int8 Map (-1, 0, 100) ---
+            out_map = np.full_like(bev_np, -1, dtype=np.int8)
+
+            known_mask = bev_np > -0.5
+            occupied_mask = (bev_np > occ_thresh) & known_mask
+            free_mask = (bev_np <= occ_thresh) & known_mask
+
+            out_map[free_mask] = 0
+            out_map[occupied_mask] = 100
+
+
+            return out_map, meta
+
+    @torch.no_grad()
+    def to_bev2(
         self,
         x_range: tuple[float, float],
         y_range: tuple[float, float],
