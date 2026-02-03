@@ -221,7 +221,7 @@ def inference_with_features(
     model,
     device,
     batch_size: int = 8,
-    verbose: bool = True,
+    verbose: bool = False,
     projector=None
 ):
     """
@@ -588,7 +588,7 @@ def schedule_pairs_mst(changed_gids, local2gid, pairs, budget,
         if len(run_set) > budget: break
         
         e = pick_for_image_mst(i, tau_mst, tau_extra)
-        print(e)
+        #print(e)
         if e is None: 
             continue
         run_set.add(e)
@@ -1579,6 +1579,7 @@ def get_reconstructed_scene_no_opt(
     # ITER 0: FULL RUN
     # =========================================================================
     if itr == 0:
+        print("recon itr 0")
         GA_CACHE["anchor"] = int(refid)
 
         if scenegraph.startswith("oneref"):
@@ -1591,10 +1592,10 @@ def get_reconstructed_scene_no_opt(
 
         pairs = make_pairs(imgs_clean, scene_graph='complete', prefilter=None, symmetrize=True)
 
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-            output, view_feats = inference_with_features(
-                        pairs, model, device, batch_size=32, verbose=not silent, projector=projector
-                    )
+        #with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+        output, view_feats = inference_with_features(
+                    pairs, model, device, batch_size=32, verbose=not silent, projector=projector
+                )
 
         mode = GlobalAlignerMode.PointCloudOptimizer if len(imgs) > 2 else GlobalAlignerMode.PairViewer
         scene = global_aligner(output, device=device, mode=mode, verbose=not silent)
@@ -1734,10 +1735,10 @@ def get_reconstructed_scene_no_opt(
 
     # --- INFERENCE ---
     if len(pairs_to_run):
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-            out_delta, view_feats = inference_with_features(
-                pairs_to_run, model, device, batch_size=32, verbose=not silent, projector=projector
-            )
+        #with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+        out_delta, view_feats = inference_with_features(
+            pairs_to_run, model, device, batch_size=32, verbose=not silent, projector=projector
+        )
     else:
         out_delta = {"view1":{"idx":[],"true_shape":[]}, "view2":{"idx":[],"true_shape":[]},
                      "pred1":{"pts3d":[],"conf":[]}, "pred2":{"pts3d_in_other_view":[],"conf":[]}}
@@ -1772,7 +1773,7 @@ def get_reconstructed_scene_no_opt(
 
     for e, (vi, vj) in enumerate(pairs_to_run):
         i = vi["idx"]; j = vj["idx"]
-        print(i,j)
+        #print(i,j)
 
         # Scalar tensor multiply
         s = scales[e] * pw_norm_scale_factor

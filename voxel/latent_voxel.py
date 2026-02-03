@@ -232,6 +232,7 @@ class LatentVoxelGrid(nn.Module):
 
         self.fusion_mlp = nn.Sequential(
             nn.Linear(feature_dim + 1, feature_dim),
+            #nn.Linear(2* feature_dim + 1, feature_dim),
             nn.LayerNorm(feature_dim),
             nn.ReLU(inplace=True),
             nn.Linear(feature_dim, feature_dim)
@@ -622,6 +623,64 @@ class LatentVoxelGrid(nn.Module):
             
             return phantom_pts, phantom_feats
  
+    def aggregate_neighbor_latents(self, query_indices: torch.Tensor) -> torch.Tensor:
+        """
+        For the voxels at 'query_indices', gather and average the latent vectors
+        of their 6 immediate neighbors (Up, Down, Left, Right, Front, Back).
+        """
+        N = query_indices.shape[0]
+        if N == 0:
+            return torch.zeros((0, self.feature_dim), device=self.device, dtype=self.dtype)
+
+        # 1. Get (i, j, k) coordinates of the active voxels
+        ijk = self._unhash_keys(self.keys[query_indices]) # (N, 3)
+
+        # 2. Define 6 neighbor offsets
+        offsets = torch.tensor([
+            [1,0,0], [-1,0,0],
+            [0,1,0], [0,-1,0],
+            [0,0,1], [0,0,-1]
+        ], device=self.device, dtype=ijk.dtype)
+
+        # 3. Generate all 6 neighbor coordinates
+        # Shape: (N, 6, 3)
+        neighbor_ijk = ijk.unsqueeze(1) + offsets.unsqueeze(0)
+
+        # Flatten to check existence: (N*6, 3)
+        neighbor_ijk_flat = neighbor_ijk.view(-1, 3)
+        neighbor_keys_flat = self._hash_ijk(neighbor_ijk_flat)
+
+        # 4. Find which neighbors actually exist in the hash map
+        # self.keys is sorted, so we use searchsorted (binary search) - Very Fast on GPU
+        idx_found = torch.searchsorted(self.keys, neighbor_keys_flat)
+
+        # Clamp to avoid out-of-bounds access
+        idx_found = idx_found.clamp(max=self.keys.shape[0] - 1)
+
+        # Check if the key at that index actually matches
+        is_match = (self.keys[idx_found] == neighbor_keys_flat)
+
+        # 5. Gather features
+        # Initialize with zeros (missing neighbors contribute 0)
+        neighbor_feats = torch.zeros(
+            (neighbor_keys_flat.shape[0], self.feature_dim),
+            device=self.device,
+            dtype=self.dtype
+        )
+
+        # Only copy where neighbors exist
+        if is_match.any():
+            neighbor_feats[is_match] = self.z_latent[idx_found[is_match]]
+
+        # 6. Reshape and Average
+        neighbor_feats = neighbor_feats.view(N, 6, self.feature_dim)
+
+        # Mean pooling: This creates the "Smoothed" context vector
+        # (You could also compute a weighted mean based on 'is_match' counts)
+        avg_neighbor_feat = neighbor_feats.mean(dim=1)
+
+        return avg_neighbor_feat
+
     def update_with_features(self,
                             pts_world: torch.Tensor,  # (N,3)
                             f_pts: torch.Tensor,      # (N,D)
@@ -836,10 +895,18 @@ class LatentVoxelGrid(nn.Module):
         # 3. Concatenate and Update
         # u_sel is your max-pooled feature (M, D)
         u_sel = u.to(self.z_latent.dtype)
+
         z_sel = self.z_latent[idx_upd]
 
         # Concatenate: [Features | Count]
         gru_input = torch.cat([u_sel, density_feature], dim=-1)
+
+
+        #neighbor_context = self.aggregate_neighbor_latents(idx_upd)
+
+        # Concatenate: [Features | Neighbor_Context | Count]
+        # Dimensions:   D      +       D          +   1
+        #gru_input = torch.cat([u_sel, neighbor_context, density_feature], dim=-1)
 
         refined_input = self.fusion_mlp(gru_input) # (M, D)
         # Pass expanded input to GRU
@@ -1023,13 +1090,13 @@ class LatentVoxelGrid(nn.Module):
 
                     # 1. Static Geometry (Occupied in both, Low Delta)
                     # White / Light Grey
-                    static_mask = (curr_occ) & (np.abs(delta) < 0.3)
+                    static_mask = (curr_occ) # & (np.abs(delta) < 0.3)
                     out_img[static_mask] = [200, 200, 200]
 
                     # 2. Moving / Appearing (Occupied now, wasn't before)
                     # Red / Hot Pink
                     appearing_mask = (delta > 0.25) & curr_occ
-                    out_img[appearing_mask] = [255, 0, 50]
+                    #out_img[appearing_mask] = [255, 0, 50]
 
                     # 3. Disappearing / Trail (Empty now, was occupied)
                     # Blue / Cyan (Optional: helps see ghosting)

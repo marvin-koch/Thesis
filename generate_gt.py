@@ -1054,7 +1054,10 @@ def build_gt_voxel_for_timestep(
     """
     POINTS = "world_points"
     CONF   = "world_points_conf"
+
     threshold = 1.0
+    threshold = 60.0
+
     z_clip_map = (-3.0, 3.0)
     #z_clip_map = (-0.1, 0.3)
 
@@ -1232,8 +1235,8 @@ def main():
     seqs = dataset.seq_paths
     print(f"[GT] Found {len(seqs)} sequences.")
 
-    out_root = os.path.join(dataset_root, "gt_voxels_per_timestep_new")
-    out_root_pose = os.path.join(dataset_root, "gt_poses_new")
+    out_root = os.path.join(dataset_root, "gt_voxels_per_timestep_new_60")
+    out_root_pose = os.path.join(dataset_root, "gt_poses_new_60")
     os.makedirs(out_root, exist_ok=True)
 
     for seq_idx in range(0, len(seqs)):
@@ -1258,6 +1261,12 @@ def main():
             if (t % step) != 0:
                 continue
 
+            """
+            if t > (120 * step):
+                break
+
+
+            """
             out_path = os.path.join(out_root, f"{seq_id}_t{t:04d}_gt.npz")
             if os.path.exists(out_path) and t != 0 and t!= step:
                 print(f"[GT]   skip t={t} (exists)")

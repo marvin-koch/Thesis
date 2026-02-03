@@ -22,11 +22,11 @@ import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 
 # Config
-SEQ_LIST = "/cluster/scratch/kochmar/renders/seq_manifest.json"
-DATA_ROOT = "/cluster/scratch/kochmar/renders/"
-SAVE_ROOT = "/cluster/scratch/kochmar/renders/precomputed_cache/"
+SEQ_LIST = "/cluster/scratch/kochmar/renders3/seq_manifest.json"
+DATA_ROOT = "/cluster/scratch/kochmar/renders3/"
+SAVE_ROOT = "/cluster/scratch/kochmar/renders3/precomputed_cache_2/"
 WEIGHTS_PATH = "/cluster/home/kochmar/Thesis/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth"
-STEP = 20
+STEP = 1
 
 POINTS = "world_points"
 CONF = "world_points_conf"
@@ -259,15 +259,17 @@ def precompute():
     print(f"Starting precomputation for {len(seqs)} sequences...")
 
 
-    #for seq_idx in (range(len(seqs))):
+    for seq_idx in (range(len(seqs))):
     #for seq_idx in (range(len(seqs)-1, -1, -1)):
-    for seq_idx in (range(126, -1, -1)):
+    #for seq_idx in (range(126, -1, -1)):
 
         print(seq_idx)
         batch = dataset[seq_idx]        # __getitem__ returns dict with seq info
         if batch is None:
             print("skip, already exists, batch is None")
             continue
+
+
         seq_id = batch["seq_id"]
         T = batch["timesteps"]
 
@@ -279,6 +281,8 @@ def precompute():
         for i in range(T):
             if i % STEP != 0:
                 continue
+            if i > (120 * STEP):
+                break
 
             save_path = os.path.join(seq_dir, f"t{i:04d}.pt")
             if os.path.exists(save_path) and i != 0:

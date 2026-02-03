@@ -6,8 +6,130 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import matplotlib.pyplot as plt
 
-
 def visualize_vggt_pointcloud(
+    predictions,
+    *,
+    key="world_points",
+    conf_key="world_points_conf",
+    threshold=50.0,
+    max_points=500_000,
+    z_band=None,
+    frame_stride=1,
+    save_path=None,
+    show=True,
+):
+    import numpy as np
+    import os
+    try:
+        import open3d as o3d
+    except Exception as e:
+        raise RuntimeError("Open3D is required (pip install open3d).") from e
+
+    # Helper to handle GPU/CPU conversion safely
+    def to_numpy(x):
+        try:
+            import torch
+            if isinstance(x, torch.Tensor):
+                return x.detach().cpu().numpy()
+        except Exception:
+            pass
+        return np.asarray(x)
+
+    if key not in predictions or "images" not in predictions:
+        raise KeyError(f"predictions must contain '{key}' and 'images'")
+
+    # 1. Load Data & Convert to Numpy (CPU)
+    WPTS = to_numpy(predictions[key])
+    IMGS = to_numpy(predictions["images"])
+    
+    # Handle Image Shapes: (S,3,H,W) -> (S,H,W,3)
+    if IMGS.ndim == 4 and IMGS.shape[1] == 3:
+        IMGS = np.transpose(IMGS, (0, 2, 3, 1))
+
+    S = WPTS.shape[0]
+
+    # 2. Select Frames
+    frames = np.arange(0, S, max(1, int(frame_stride)))
+    
+    # Flatten Geometry & Colors
+    P = WPTS[frames].reshape(-1, 3).astype(np.float32)
+    C = IMGS[frames].reshape(-1, 3).astype(np.float32)
+
+    # Normalize Colors
+    if C.max() > 1.0: 
+        C = C / 255.0
+    C = np.clip(C, 0.0, 1.0)
+    
+    # 3. Handle Confidence (The Fix)
+    # We use to_numpy() here to ensure it moves from Cuda -> CPU first
+    if conf_key in predictions:
+        # Extract specific frames first to save memory, then move to CPU
+        raw_conf = predictions[conf_key][frames] 
+        conf = to_numpy(raw_conf).reshape(-1)
+
+        conf_threshold = np.percentile(conf, threshold) if threshold > 0 else 0
+        valid = (conf >= conf_threshold) & (conf > 1e-5)
+    else:
+        valid = np.ones(len(P), dtype=bool)
+
+    # 4. Filter NaNs and Confidence
+    valid = valid & (~np.isnan(P).any(axis=1)) & np.isfinite(P).all(axis=1)
+    P = P[valid]
+    C = C[valid]
+
+    # 5. Z-band Filter
+    if z_band is not None:
+        P_in = (P[:, 2] >= z_band[0]) & (P[:, 2] <= z_band[1])
+        P = P[P_in]; C = C[P_in]
+
+    # 6. Downsample
+    if P.shape[0] > max_points:
+        idx = np.random.choice(P.shape[0], max_points, replace=False)
+        P = P[idx]; C = C[idx]
+
+    print(f"Visualizing {P.shape[0]} points...")
+
+    # 7. Create Open3D Geometry
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(P.astype(np.float64))
+    pcd.colors = o3d.utility.Vector3dVector(C.astype(np.float64))
+    
+    #axis_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=1.0)
+
+    # 2. Create Axis and convert it to Points ("Baking" it)
+    axis_mesh = o3d.geometry.TriangleMesh.create_coordinate_frame(size=1.0, origin=[0,0,0])
+
+    # Sample 2000 points from the axis arrows so they become part of the cloud
+    axis_pcd = axis_mesh.sample_points_uniformly(number_of_points=2000)
+
+    # Merge them: Your Data + Axis Data
+    pcd += axis_pcd
+
+    # 8. Save
+    if save_path:
+        ext = os.path.splitext(save_path)[1].lower()
+        if ext in ['.ply', '.pcd', '.xyz']:
+            print(f"Saving 3D Point Cloud to {save_path}...")
+            o3d.io.write_point_cloud(save_path, pcd)
+        elif ext in ['.png', '.jpg']:
+            print(f"Saving screenshot to {save_path}...")
+            vis = o3d.visualization.Visualizer()
+            vis.create_window(visible=False)
+            vis.add_geometry(pcd)
+            #vis.add_geometry(axis_frame)
+            vis.poll_events()
+            vis.update_renderer()
+            vis.capture_screen_image(save_path)
+            vis.destroy_window()
+
+    # 9. Show
+    """
+    if show:
+        o3d.visualization.draw_geometries([pcd, axis_frame], window_name="VGGT Point Cloud")
+
+    """
+
+def visualize_vggt_pointcloud2(
     predictions,
     *,
     key="world_points",

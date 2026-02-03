@@ -1064,17 +1064,17 @@ def bev_from_voxels(
             delta = curr_clean - prev_np
 
             # A. Static (Occupied NOW + Small Change) -> Grey
-            static_mask = (curr_occ) & (np.abs(delta) < 0.3)
+            static_mask = (curr_occ)# & (np.abs(delta) < 0.3)
             out_img[static_mask] = [200, 200, 200]
 
             # B. Appearing (Occupied NOW + Positive Delta) -> Red
             appearing_mask = (curr_occ) & (delta > 0.25)
-            out_img[appearing_mask] = [255, 0, 50]
+            #out_img[appearing_mask] = [255, 0, 50]
 
             # C. Disappearing (Occupied BEFORE + Negative Delta) -> Blue
             # We trust prev_np for existence check, since curr might be 0/Unknown
             disappearing_mask = (prev_np > occ_thresh) & (delta < -0.25)
-            out_img[disappearing_mask] = [0, 150, 255]
+            #out_img[disappearing_mask] = [0, 150, 255]
 
         else:
             # No History -> Standard White
@@ -1651,18 +1651,17 @@ def save_bev_png(bev: np.ndarray, meta: dict, path: str = "bev.png"):
     if is_rgb:
         # Plot RGB Image
         plt.imshow(bev, origin="lower", extent=extent)
-        plt.title("BEV Motion (Red=New, Blue=Trail)")
+        plt.title("2D Occupancy Grid")
         # Note: No colorbar for RGB
     else:
         # Plot Standard Occupancy
         plt.imshow(bev, origin="lower", extent=extent, cmap='viridis') # Added cmap for clarity
-        plt.title("BEV Occupancy")
+        plt.title("2D Occupancy Grid")
         plt.colorbar(label="occupancy value")
 
     plt.xlabel("x [m]")
     plt.ylabel("y [m]")
     plt.tight_layout()
-    print("savfig ", path)
     plt.savefig(path, dpi=200)
     plt.close()
     print(f"Saved {path}")
@@ -1691,12 +1690,13 @@ def save_bev(bev: np.ndarray, meta: dict, png_path="bev.png", npy_path="bev.npy"
     # keep your current PNG
     bev = _to_numpy_float32(bev)  # ✅ convert once
 
-    print("saving ", png_path)
     save_bev_png(bev, meta, png_path)
     # save raw values + metadata for evaluation
-    np.save(npy_path, bev)
+    if npy_path is not None:
+        np.save(npy_path, bev)
 
-    pathlib.Path(meta_path).write_text(json.dumps(meta, indent=2))
+    if meta_path is not None:
+        pathlib.Path(meta_path).write_text(json.dumps(meta, indent=2))
 
 
 def export_occupied_voxels_as_ply(vox, path: str = "voxels.ply", z_band: Tuple[float,float] = (0.0, 3.0)):

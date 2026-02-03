@@ -199,8 +199,10 @@ class VoxelUpdaterSystem(pl.LightningModule):
         self.bev_origin_xy=(-25.0, -25.0)
         #self.bev_origin_xy=(-10.0, -10.0)
 
-        #self.z_band_bev=(-0.5, 2.0)
-        self.z_band_bev=(-2.0, 3.5)
+        #self.z_band_bev=(-0.75, 2.0)
+        self.z_band_bev=(-2.0, 1.0)
+        self.z_band_bev=(-1.0, 1.0)
+        #self.z_band_bev=(-3.5, 4.5)
 
         self.fp_weight = 0.0
 
@@ -271,7 +273,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
         POINTS = "world_points"
         CONF = "world_points_conf"
         threshold = 1.0 
-        threshold = 2.0 
+        #threshold = 2.0 
+        threshold = 50.0 
         z_clip_map = (-3.0, 3.0)  
 
         R_w2m = np.array([[0, 0, -1],
@@ -514,6 +517,68 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
         return bev, mst, Rmw, tmw
     
+    def run_baseline_inference(self, predictions, baseline_vox, Rmw=None, tmw=None, scale_factor=1.0, threshold=60.0):
+        """
+        Runs the baseline reconstruction pipeline (Ray carving/Integration) on the provided predictions.
+        Matches the logic in test_voxel_dust3r_fast_no_opt.py
+        """
+        POINTS = "world_points"
+        CONF = "world_points_conf"
+        z_clip_map = (-3.0 * scale_factor, 3.0 * scale_factor)
+
+        # Standard rotation to camera frame
+        R_w2m = np.array([[0, 0, -1],
+                        [-1, 0, 0],
+                        [0, -1, 0]], dtype=np.float32)
+        t_w2m = np.zeros(3, dtype=np.float32)
+
+        R_w2m = to_torch(R_w2m, device=self.device)
+        t_w2m = to_torch(t_w2m, device=self.device)
+
+        # Combine transforms: World -> Model -> Aligned -> Scaled
+        # Note: predictions['world_points'] is already aligned and scaled in predict_step loop
+        # But for build_frames..., we pass Rmw/tmw to transform the camera centers.
+
+        camera_R = Rmw @ R_w2m
+        camera_t = t_w2m + tmw
+
+        # 1. Extract Frames
+        # Note: We skip 'view_feats' as baseline doesn't use them
+        frames_map, cam_centers_map, conf_map, images_map, _, (S,H,W), frame_ids = build_frames_and_centers_vectorized_torch(
+            predictions,
+            POINTS=POINTS,
+            CONF=CONF,
+            threshold=threshold,
+            Rmw=camera_R, tmw=camera_t,
+            z_clip_map=z_clip_map,
+            return_flat=True
+        )
+
+        # 2. Integrate into Baseline Voxel Grid
+        vox, bev, meta = build_maps_from_points_and_centers_torch(
+            frames_xyz=frames_map,
+            cam_centers=cam_centers_map,
+            conf_map=conf_map,
+            tvox=baseline_vox,
+            align_to_voxel=False,
+            voxel_size=self.voxel_size,
+            bev_window_m=self.bev_window_m,
+            bev_origin_xy=self.bev_origin_xy,
+            z_clip_vox=(-np.inf, np.inf),
+            z_band_bev=(self.z_band_bev[0], self.z_band_bev[1]),
+            max_range_m=None,
+            carve_free=True,
+            samples_per_voxel=2.0, #0.7,
+            ray_stride=4,
+            max_free_rays=10000,
+            frame_ids=frame_ids,
+            device=self.device
+        )
+
+        baseline_vox.next_epoch()
+
+        return bev, meta
+
     def inference_gt(self, i, imgs):
 
         POINTS = "world_points"
@@ -1292,13 +1357,15 @@ class VoxelUpdaterSystem(pl.LightningModule):
                     # --- THE BOUNTY FIX ---
 
                     # Boost "Appearing" slightly more to ensure we catch the jump
-                    weights[appearing_mask] *= 20.0
+                    #weights[appearing_mask] *= 20.0
+                    weights[appearing_mask] = 50.0
+
                     # (Total weight = pos_weight * 5.0 = 250ish)
 
                     # Boost "Disappearing" MASSIVELY to fix Precision/Ghosting
                     # Since the base weight was 1.0, we need to multiply it by pos_weight * 5
                     # to match the importance of the appearing objects.
-                    weights[disappearing_mask] = 20.0
+                    weights[disappearing_mask] = 50.0
                     # (Total weight = 250ish)
 
                     # 4. Calculate Loss
@@ -1331,6 +1398,37 @@ class VoxelUpdaterSystem(pl.LightningModule):
             pred_fp = logit_pred_before[~valid_mask]
             loss_fp = torch.tensor(0.0, device=self.device)
 
+            """
+            # In loss_fp (pred_fp covers keys in Pred but NOT in GT)
+            if pred_fp.numel() > 0:
+                tgt_fp = torch.zeros_like(pred_fp)
+                weights_fp = torch.ones_like(pred_fp) # Base weight 1.0
+
+                # --- Identify Ghosts using History ---
+                if self.vox_gt_prev is not None:
+                    # 1. Get the specific keys for these False Positives
+                    keys_fp = self.vox.keys[~valid_mask]
+
+                    # 2. Check if these exact keys were Walls in the PREVIOUS GT
+                    # (You need to align Prev GT to these specific FP keys)
+                    p_prev, valid_prev = self.align_probs_to_keys_soft(
+                         self.vox_gt_prev,
+                         torch.sigmoid(self.vox_gt_prev.vals_st * 10.0),
+                         type(self.vox)(self.vox.origin, self.vox.p), # Dummy wrapper
+                         keys_subset=keys_fp # Use subset if your helper supports it, or align full and slice
+                    )
+
+                    # 3. Ghost = Was Wall Previously (>0.5)
+                    ghost_mask = (p_prev > 0.5)
+
+                    # 4. Apply the Hammer
+                    weights_fp[ghost_mask] = 20.0  # <--- NOW the ghost hurts
+
+                loss_fp = F.binary_cross_entropy_with_logits(
+                    pred_fp, tgt_fp, weight=weights_fp, reduction='mean'
+                )
+
+            """
             if pred_fp.numel() > 0:
                 # Target is all zeros
                 tgt_fp = torch.zeros_like(pred_fp)
@@ -1897,6 +1995,12 @@ class VoxelUpdaterSystem(pl.LightningModule):
             device=self.device
         )
 
+        self.vox_baseline = TorchSparseVoxelGrid(
+            origin_xyz=np.zeros(3, dtype=np.float32),
+            params=VoxelParams(voxel_size=self.voxel_size, promote_hits=2),
+            device=self.device
+        )
+
         # Buffers for temporal consistency
         self._prev_keys = None
         self._prev_probs = None
@@ -1908,6 +2012,12 @@ class VoxelUpdaterSystem(pl.LightningModule):
             "occ_precision": [],
             "occ_precision_inter": [],
             "occ_recall": [],
+            # Baseline Metrics
+            "baseline_occ_iou": [],
+            "baseline_occ_precision": [],
+            "baseline_occ_precision_inter": [],
+            "baseline_occ_recall": [],
+
             "dyn_iou": [],
             "dyn_recall_appearing": [],
             "dyn_recall_disappearing": [],
@@ -1948,8 +2058,90 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
         bevs = []
         bevs_gt = []
+        bevs_baseline = []
 
         print(f"\n=== Starting Prediction for Seq: {seq_id} (T={T}) ===")
+
+        #step 0 for baseline
+        t = 0
+        # print(f"Step {t}...")
+        imgs = batch["imgs_t"][t]
+
+        self.vox_gt = gt_seq[t]
+
+        p = t * step
+        cache_path = os.path.join(precomputed_root, seq_id, f"t{p:04d}.pt")
+
+        predictions = torch.load(cache_path, map_location=self.device)
+
+        R_w2m = np.array([[0, 0, -1],
+                        [-1, 0, 0],
+                        [0, -1, 0]], dtype=np.float32)
+        t_w2m = np.zeros(3, dtype=np.float32)
+
+        R_w2m = to_torch(R_w2m, device=self.device)
+        t_w2m = to_torch(t_w2m, device=self.device)
+
+        # 2. Rotate Points to World Frame
+        WPTS_m = rotate_points(predictions["world_points"], R_w2m, t_w2m)
+        predictions["world_points"] = rotate_points(WPTS_m, Rmw, tmw)
+
+        # 3. Apply Scaling
+        raw_pts = predictions["world_points"]
+        predictions["world_points"] = raw_pts * scale_factor
+
+        # 4. Scale Camera Extrinsics
+        if isinstance(predictions["extrinsic"], torch.Tensor):
+            predictions["extrinsic"][:, :3, 3] *= scale_factor
+        elif isinstance(predictions["extrinsic"], list):
+            for i in range(len(predictions["extrinsic"])):
+                predictions["extrinsic"][i][:3, 3] *= scale_factor
+
+        stride = 1 if t == 0 else self.cfg.stride
+
+        if "world_points_conf" in predictions:
+            predictions["world_points_conf"] = predictions["world_points_conf"][..., ::stride, ::stride]
+            conf_tensor = predictions["world_points_conf"]
+            if isinstance(conf_tensor, list):
+                ref = next((x for x in conf_tensor if x is not None), None)
+                target_hw = ref.shape[-2:] if ref is not None else (128, 128)
+            else:
+                target_hw = conf_tensor.shape[-2:]
+        else:
+            target_hw = (512 // stride, 512 // stride)
+
+        if "world_points" in predictions:
+            predictions["world_points"] = predictions["world_points"][..., ::stride, ::stride, :]
+
+        if "images" in predictions:
+            img = predictions["images"]
+            if img.shape[-3] == 3 and img.shape[-1] != 3:
+                 img = img.permute(0, 2, 3, 1) # (S, 3, H, W) -> (S, H, W, 3)
+            predictions["images"] = img[..., ::stride, ::stride, :]
+            del img
+
+        # --- PROCESS FEATURES ---
+        raw_feats_list = predictions["view_feats"]
+        projected_feats_map = []
+
+        for f_raw in raw_feats_list:
+            f_proj = self.apply_projector_to_map(f_raw, target_hw=target_hw)
+            projected_feats_map.append(f_proj)
+
+        predictions["view_feats"] = projected_feats_map
+        del projected_feats_map
+
+        with torch.no_grad():
+             bev_base, meta_base = self.run_baseline_inference(
+                 predictions,
+                 self.vox_baseline,
+                 Rmw,
+                 tmw_scaled,
+                 scale_factor,
+                 threshold=50.0 # Or use config threshold
+             )
+
+
 
         prev_probs = None
         for t in range(T):
@@ -2030,6 +2222,17 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 else:
                     bev, mst, _, _ = self.inference(t, imgs, mst, Rmw, tmw_scaled, predictions, scale_factor)
 
+            with torch.no_grad():
+                 bev_base, meta_base = self.run_baseline_inference(
+                     predictions,
+                     self.vox_baseline,
+                     Rmw,
+                     tmw_scaled,
+                     scale_factor,
+                     threshold=50.0 # Or use config threshold
+                 )
+
+
             # ---------------------------------------------------------
             # METRICS CALCULATION
             # ---------------------------------------------------------
@@ -2072,6 +2275,143 @@ class VoxelUpdaterSystem(pl.LightningModule):
             metrics_buffer["occ_precision"].append(occ_precision.item())
             metrics_buffer["occ_precision_inter"].append(occ_precision_inter.item())
 
+            # ---------------------------------------------------------
+            # METRICS CALCULATION (BASELINE)
+            # ---------------------------------------------------------
+            
+            # 1. Decode Baseline (Log-Odds directly)
+            logit_base = self.vox_baseline._display_vals().clamp(-10.0, 10.0)
+            
+            # 2. Align GT keys to Baseline Keys
+            p_occ_tgt_base_aligned, valid_mask_base = self.align_probs_to_keys_soft(
+                 self.vox_gt, p_occ_tgt, self.vox_baseline, default=0.0
+            )
+            
+            # 3. Intersection Logic
+            base_intersect = logit_base[valid_mask_base]
+            tgt_intersect_base = p_occ_tgt_base_aligned[valid_mask_base]
+            base_fp = logit_base[~valid_mask_base]
+            
+            # Threshold: > 0.0 log-odds (0.5 prob) or use self.p.occ_thresh
+            base_bin_int = (base_intersect > self.vox_baseline.p.occ_thresh)
+            tgt_bin_base = (tgt_intersect_base > 0.5)
+            
+            tp_base = (base_bin_int & tgt_bin_base).sum()
+            fp_int_base = (base_bin_int & ~tgt_bin_base).sum()
+            fn_base = (~base_bin_int & tgt_bin_base).sum()
+            
+            fp_hallucination_base = (base_fp > self.vox_baseline.p.occ_thresh).sum()
+            total_fp_base = fp_int_base + fp_hallucination_base
+            
+            base_iou = tp_base / (tp_base + total_fp_base + fn_base + 1e-8)
+            base_recall = tp_base / (tp_base + fn_base + 1e-8)
+            base_precision = tp_base / (tp_base + total_fp_base + 1e-8)
+            base_precision_inter = tp_base / (tp_base + fp_int_base + 1e-8)
+
+            metrics_buffer["baseline_occ_iou"].append(base_iou.item())
+            metrics_buffer["baseline_occ_recall"].append(base_recall.item())
+            metrics_buffer["baseline_occ_precision"].append(base_precision.item())
+            metrics_buffer["baseline_occ_precision_inter"].append(base_precision_inter.item())
+
+
+            # ---------------------------------------------------------
+            # DYNAMIC METRICS (The New Part)
+            # ---------------------------------------------------------
+            # Compare Current GT (t) vs Previous GT (t-1)
+            if t > 0 and gt_seq[t-1] is not None:
+                vox_gt_prev = gt_seq[t-1]
+
+                # Align Prev GT to Current Keys
+                p_occ_prev_aligned, _ = self.align_probs_to_keys_soft(
+                    vox_gt_prev,
+                    torch.sigmoid(vox_gt_prev.vals_st * 10.0),
+                    self.vox,
+                    default=0.0
+                )
+
+                # Define Masks
+                gt_curr = (tgt_intersect > 0.5)
+                # Note: We align Previous GT to Current Keys, so we use valid_mask of current keys
+                gt_prev = (p_occ_prev_aligned[valid_mask] > 0.5)
+
+                mask_appearing    = (~gt_prev & gt_curr)  # Empty -> Occupied
+                mask_disappearing = (gt_prev & ~gt_curr)  # Occupied -> Empty
+                mask_dynamic      = (gt_prev != gt_curr)
+
+                # A. Appearing Recall (Do we see new objects?)
+                if mask_appearing.sum() > 0:
+                    pred_appearing = (pred_intersect[mask_appearing] > 0.0)
+                    metrics_buffer["dyn_recall_appearing"].append(pred_appearing.float().mean().item())
+
+                # B. Disappearing / Ghosting (Do we clear old objects?)
+                if mask_disappearing.sum() > 0:
+                    pred_ghosts = (pred_intersect[mask_disappearing] > 0.0)
+                    metrics_buffer["dyn_ghost_rate"].append(pred_ghosts.float().mean().item())
+                    metrics_buffer["dyn_recall_disappearing"].append((~pred_ghosts).float().mean().item())
+
+                # C. Dynamic IoU
+                if mask_dynamic.sum() > 0:
+                    pred_dyn = (pred_intersect[mask_dynamic] > 0.0)
+                    gt_dyn   = gt_curr[mask_dynamic]
+                    intersection = (pred_dyn & gt_dyn).sum()
+                    union        = (pred_dyn | gt_dyn).sum()
+                    metrics_buffer["dyn_iou"].append((intersection / (union + 1e-8)).item())
+
+            # ---------------------------------------------------------
+            # END METRICS
+            # ---------------------------------------------------------
+
+            bev_spec = BevSpec(
+                resolution=self.vox_gt.p.voxel_size,
+                width_m=float(self.bev_window_m[0]),
+                height_m=float(self.bev_window_m[1]),
+                origin_xy=self.bev_origin_xy,
+                z_band=(self.z_band_bev[0], self.z_band_bev[1]),
+            )
+
+            #bev_gt, meta = bev_from_voxels(self.vox_gt, bev_spec, include_free=True)
+            
+            bev_gt, meta, prev_probs = bev_from_voxels(self.vox_gt, bev_spec, include_free=True, prev_probs=prev_probs, vis_mode="motion")
+            bev_base, meta_base, _ = bev_from_voxels(self.vox_baseline, bev_spec, include_free=True, prev_probs=prev_probs, vis_mode="motion")
+
+            bevs.append(bev)
+            bevs_gt.append(bev_gt)
+            bevs_baseline.append(bev_base)
+
+            self.vox.z_latent = self.vox.z_latent.detach()
+            save_dir = "debug_viz_pred"
+            os.makedirs(save_dir, exist_ok=True)
+            fname = f"{save_dir}/step_{t}.ply"
+            self.export_debug_ply(fname, t)
+            self.export_separated_ply(t, save_dir="debug_viz_pred")
+
+
+            torch.cuda.empty_cache()
+
+        # --- FINAL SUMMARY PRINT ---
+        print("-" * 60)
+        print(f"SEQUENCE REPORT: {seq_id}")
+        print("-" * 60)
+        print(f"  MODEL Metrics:")
+        print(f"    IoU:                 {self.get_avg(metrics_buffer, 'occ_iou'):.4f}")
+        print(f"    Recall:              {self.get_avg(metrics_buffer, 'occ_recall'):.4f}")
+        print(f"    Precision:           {self.get_avg(metrics_buffer, 'occ_precision'):.4f}")
+        print("-" * 60)
+        print(f"  BASELINE Metrics:")
+        print(f"    IoU:                 {self.get_avg(metrics_buffer, 'baseline_occ_iou'):.4f}")
+        print(f"    Recall:              {self.get_avg(metrics_buffer, 'baseline_occ_recall'):.4f}")
+        print(f"    Precision:           {self.get_avg(metrics_buffer, 'baseline_occ_precision'):.4f}")
+        print("-" * 60)
+        print(f"  Dynamic Metrics (Changes Only):")
+        print(f"    Dynamic IoU:         {self.get_avg(metrics_buffer, 'dyn_iou'):.4f}")
+        print(f"    Appearing Recall:    {self.get_avg(metrics_buffer, 'dyn_recall_appearing'):.4f}  (High = Fast reaction to new objects)")
+        print(f"    Disappearing Recall: {self.get_avg(metrics_buffer, 'dyn_recall_disappearing'):.4f}  (High = Good cleanup)")
+        print(f"    Ghost Rate:          {self.get_avg(metrics_buffer, 'dyn_ghost_rate'):.4f}  (High = Objects leave trails)")
+        print("-" * 60)
+        print("\n")
+
+        return bevs, bevs_gt, bevs_baseline
+        """
             # ---------------------------------------------------------
             # DYNAMIC METRICS (The New Part)
             # ---------------------------------------------------------
@@ -2162,6 +2502,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
         print("\n")
 
         return bevs, bevs_gt
+        """
 
 
     def on_load_checkpoint(self, checkpoint):
@@ -2541,10 +2882,13 @@ class HabitatSeqDataset(Dataset):
                 continue
 
             
+            """
             if t > 120:
                 break
 
+            """
             imgs = self._load_timestep(td)
+
             if imgs:
                 imgs_t.append(imgs)
 
@@ -2707,11 +3051,11 @@ def main():
         lr=3e-3,
         max_epochs=200,
         batch_size=1,
-        num_workers=0,
+        num_workers=2,
         precision="bf16",
         skip=True,
-        weight_decay=0.05,
-        #weight_decay=0.00,
+        #weight_decay=0.05,
+        weight_decay=0.00,
         lambda_occ= 1.0,
         lambda_temp = 0.05,      # temporal consistency weight
         #lambda_temp = 0.0,      # temporal consistency weight
@@ -2744,7 +3088,7 @@ def main():
     #    cfg=cfg
     #)
     ckpt_cb = pl.callbacks.ModelCheckpoint(
-        dirpath="/cluster/scratch/kochmar/checkpoints/full8",       # Explicitly set a folder so you can find them
+        dirpath="/cluster/scratch/kochmar/checkpoints/full9",       # Explicitly set a folder so you can find them
         monitor="val_loss_total",
         save_top_k=5,
         mode="min",
@@ -2803,7 +3147,7 @@ def main():
         precision=cfg.precision,
         #gradient_clip_val=1.0,
         log_every_n_steps=1,
-        check_val_every_n_epoch=3,
+        check_val_every_n_epoch=2,
         callbacks=[ckpt_cb, lr_cb],
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=1,
@@ -2814,8 +3158,9 @@ def main():
     #print(">>> before trainer.fit()", flush=True)
     #ckpt_path = "/cluster/scratch/kochmar/checkpoints/full/voxup-epoch=07-val_loss_total=10.9045.ckpt"
     #ckpt_path = "/cluster/scratch/kochmar/checkpoints/full7/voxup-epoch=05-val_loss_total=8.4459.ckpt"
-    #ckpt_path = "/cluster/scratch/kochmar/checkpoints/full8/voxup-epoch=05-val_loss_total=7.9698.ckpt"
-    ckpt_path = "/cluster/scratch/kochmar/checkpoints/full8/voxup-epoch=02-val_loss_total=8.2243.ckpt"
+
+    #ckpt_path = "/cluster/scratch/kochmar/checkpoints/full9/voxup-epoch=01-val_loss_total=7.5519.ckpt"
+    ckpt_path = "/cluster/scratch/kochmar/checkpoints/full9/voxup-epoch=03-val_loss_total=8.5959.ckpt"
 
 
 
