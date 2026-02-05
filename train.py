@@ -1762,10 +1762,18 @@ class VoxelUpdaterSystem(pl.LightningModule):
              )
 
 
-
+        # Initialize CUDA events for high-precision timing
+        t_start_pre  = torch.cuda.Event(enable_timing=True)
+        t_end_pre    = torch.cuda.Event(enable_timing=True)
+        t_start_inf  = torch.cuda.Event(enable_timing=True)
+        t_end_inf    = torch.cuda.Event(enable_timing=True)
+        t_start_base = torch.cuda.Event(enable_timing=True)
+        t_end_base   = torch.cuda.Event(enable_timing=True)
+        
         prev_probs = None
         for t in range(T):
             # print(f"Step {t}...")
+
             imgs = batch["imgs_t"][t]
 
             self.vox_gt = gt_seq[t]
@@ -1778,7 +1786,10 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 continue
 
             predictions = torch.load(cache_path, map_location=self.device)
-
+            
+            
+            t_start_pre.record()
+            
             R_w2m = np.array([[0, 0, -1],
                             [1, 0, 0],
                             [0, -1, 0]], dtype=np.float32)
@@ -1835,13 +1846,21 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
             predictions["view_feats"] = projected_feats_map
             del projected_feats_map
-
+            
+            
+            t_end_pre.record()
+            
+            t_start_inf.record()
             with torch.enable_grad():
                 if not mst and t != 0:
                     bev, mst, _, _ = self.inference(1, imgs, mst, Rmw, tmw_scaled, predictions, scale_factor)
                 else:
                     bev, mst, _, _ = self.inference(t, imgs, mst, Rmw, tmw_scaled, predictions, scale_factor)
-
+            
+            t_end_inf.record()     
+                   
+            t_start_base.record()
+            
             with torch.no_grad():
                  bev_base, meta_base = self.run_baseline_inference(
                      predictions,
@@ -1851,6 +1870,26 @@ class VoxelUpdaterSystem(pl.LightningModule):
                      scale_factor,
                      threshold=50.0 # Or use config threshold
                  )
+                 
+            t_end_base.record()           
+            torch.cuda.synchronize()
+            
+            # Calculate durations in milliseconds
+            ms_pre  = t_start_pre.elapsed_time(t_end_pre)
+            ms_inf  = t_start_inf.elapsed_time(t_end_inf)
+            ms_base = t_start_base.elapsed_time(t_end_base)
+
+            # Total times
+            total_model_time = ms_pre + ms_inf
+            total_baseline_time = ms_pre + ms_base
+
+            print(f"Step {t} Timing:")
+            print(f"  Shared Preprocessing: {ms_pre:.2f} ms")
+            print(f"  Model Inference Only: {ms_inf:.2f} ms")
+            print(f"  Base Inference Only:  {ms_base:.2f} ms")
+            print(f"  >> TOTAL MODEL:       {total_model_time:.2f} ms")
+            print(f"  >> TOTAL BASELINE:    {total_baseline_time:.2f} ms")
+                    
 
 
             # ---------------------------------------------------------
