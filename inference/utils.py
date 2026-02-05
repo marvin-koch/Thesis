@@ -531,7 +531,7 @@ def schedule_pairs(changed_gids, local2gid, pairs, budget,
         if len(run_set) > budget: break
         
         e = pick_for_image_mst(i, tau_mst, tau_extra)
-        print(e)
+        # print(e)
         if e is None: 
             continue
         run_set.add(e)
@@ -698,7 +698,7 @@ def get_reconstructed_scene_unaligned(
         
         # print(view_feats)
         
-        print(output.keys())
+        # print(output.keys())
         mode = GlobalAlignerMode.PointCloudOptimizer if len(imgs) > 2 else GlobalAlignerMode.PairViewer
         scene = global_aligner(output, device=device, mode=mode, verbose=not silent)
 
@@ -848,11 +848,11 @@ def get_reconstructed_scene_unaligned(
         refresh_one_stale_mst=True
     )
     
-    print("running pairs")
+    # print("running pairs")
     
     pairs_to_run_tuples = [(vi["idx"], vj["idx"]) for (vi, vj) in pairs_to_run]
-    for (vi, vj) in pairs_to_run:
-        print(vi["idx"], vj["idx"])
+    # for (vi, vj) in pairs_to_run:
+    #     print(vi["idx"], vj["idx"])
     # Run the network ONLY for needed edges
     if len(pairs_to_run):
         # out_delta = inference(pairs_to_run, model, device, batch_size=4, verbose=not silent)
@@ -983,7 +983,7 @@ def get_reconstructed_scene_unaligned(
             s = scene.get_pw_scale()[e]
             if score > best_depthmaps.get(i, (0,))[0] and (i,j) in pairs_to_run_tuples:
                 best_depthmaps[i] = score, i_j, s
-                print(score)
+                # print(score)
       
 
         # init all image poses
@@ -996,7 +996,7 @@ def get_reconstructed_scene_unaligned(
                 continue  # skip if not found
             score, i_j, scale = item
 
-            print(score, i_j)
+            # print(score, i_j)
             depth = scene.pred_i[i_j][:, :, 2]
             scene._set_depthmap(n, depth * scale)
 
@@ -1052,7 +1052,7 @@ def get_reconstructed_scene_unaligned(
 
 
     err = np.linalg.norm(Twc0[anchor_gid][:3,3] - Twc_sub[anchor_local][:3,3])
-    print(f"[snap] anchor translation error after align: {err:.6f}")  # should be ~0
+    # print(f"[snap] anchor translation error after align: {err:.6f}")  # should be ~0
 
    
     
@@ -1284,11 +1284,11 @@ def get_reconstructed_scene(
         refresh_one_stale_mst=True
     )
     
-    print("running pairs")
+    # print("running pairs")
     
     pairs_to_run_tuples = [(vi["idx"], vj["idx"]) for (vi, vj) in pairs_to_run]
-    for (vi, vj) in pairs_to_run:
-        print(vi["idx"], vj["idx"])
+    # for (vi, vj) in pairs_to_run:
+    #     print(vi["idx"], vj["idx"])
 
     # max_count = 4
     # for e, (vi, vj) in enumerate(pairs):
@@ -1508,7 +1508,7 @@ def get_reconstructed_scene(
 
 
     err = np.linalg.norm(Twc0[anchor_gid][:3,3] - Twc_sub[anchor_local][:3,3])
-    print(f"[snap] anchor translation error after align: {err:.6f}")  # should be ~0
+    # print(f"[snap] anchor translation error after align: {err:.6f}")  # should be ~0
 
    
     
@@ -1721,7 +1721,7 @@ def get_reconstructed_scene_no_opt(
         GA_CACHE["incident_mst"]   = {i: deque(sort_by_score(v)) for i, v in incident_mst.items()}
         GA_CACHE["incident_extra"] = {i: deque(sort_by_score(v)) for i, v in incident_extra.items()}
 
-    print("ONLY MST", time.time() - start)
+    # print("ONLY MST", time.time() - start)
     start = time.time()
 
     B = max(1, len(imgs))
@@ -1730,7 +1730,7 @@ def get_reconstructed_scene_no_opt(
         tau_mst=0.0, tau_extra=0.5, max_count=4, refresh_one_stale_mst=True
     )
 
-    print("ONLY SCHEDULE PAIRS", time.time() - start)
+    # print("ONLY SCHEDULE PAIRS", time.time() - start)
     start = time.time()
 
     # --- INFERENCE ---
@@ -1743,7 +1743,7 @@ def get_reconstructed_scene_no_opt(
         out_delta = {"view1":{"idx":[],"true_shape":[]}, "view2":{"idx":[],"true_shape":[]},
                      "pred1":{"pts3d":[],"conf":[]}, "pred2":{"pts3d_in_other_view":[],"conf":[]}}
 
-    print("ONLY INFERENCE", time.time() - start)
+    # print("ONLY INFERENCE", time.time() - start)
     start = time.time()
 
     # --- PROCESS UPDATES (ALL TORCH) ---
@@ -1823,7 +1823,7 @@ def get_reconstructed_scene_no_opt(
 
     view_feats_filtered = [feat for l, feat in enumerate(view_feats) if l in final_changed]
 
-    print("global alignment", time.time() - start)
+    # print("global alignment", time.time() - start)
 
     # --- FINAL RETURN (TENSORS) ---
     predictions = {

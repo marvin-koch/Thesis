@@ -475,11 +475,11 @@ def build_frames_and_centers_vectorized_torch(
         I = torch.from_numpy(I)
     I = I.to(device=device, dtype=torch.float32)  # (S, H, W, 3)
 
-    print("frames shapes")
-    print(P.shape)
-    print(I.shape)
-    if FEAT is not None:
-        print(F.shape)
+    # print("frames shapes")
+    # print(P.shape)
+    # print(I.shape)
+    # if FEAT is not None:
+    #     print(F.shape)
         
     EXTR = predictions[EXTR_KEY]
     if not isinstance(EXTR, torch.Tensor):
@@ -635,11 +635,11 @@ def build_frames_and_centers_vectorized_torch(
         I = torch.from_numpy(I)
     I = I.to(device=device, dtype=torch.float32)  # (S, H, W, 3)
 
-    print("frames shapes")
-    print(P.shape)
-    print(I.shape)
-    if FEAT is not None:
-        print(F.shape)
+    # print("frames shapes")
+    # print(P.shape)
+    # print(I.shape)
+    # if FEAT is not None:
+    #     print(F.shape)
         
     EXTR = predictions[EXTR_KEY]
     if not isinstance(EXTR, torch.Tensor):
@@ -1298,7 +1298,6 @@ def build_maps_from_points_and_centers_torch(
                 CONF_dev = CONF.to(device=device, dtype=torch.float32)
                 valid_frames.append((P_dev, C_dev, CONF_dev))
         
-        print("1")
         if not valid_frames:
             bev_spec = BevSpec(
                 resolution=voxel_size, 
@@ -1310,7 +1309,6 @@ def build_maps_from_points_and_centers_torch(
             bev, meta = bev_from_voxels(tvox, bev_spec, include_free=True)
             return tvox, bev, meta
 
-        print("2")
 
         # 2) Concatenate all frames at once
         lengths = [pf.shape[0] for pf, _, _ in valid_frames]
@@ -1324,7 +1322,6 @@ def build_maps_from_points_and_centers_torch(
         
         CONF_all = torch.cat([c for _, _, c in valid_frames], dim=0)  # (M,)
 
-        print("3")
 
         # 3) Drop NaNs/Infs early (keeps alignment)
         keep = torch.isfinite(P_all).all(dim=1) & torch.isfinite(C_all).all(dim=1) & torch.isfinite(CONF_all)
@@ -1332,7 +1329,6 @@ def build_maps_from_points_and_centers_torch(
         C_all = C_all[keep]
         CONF_all = CONF_all[keep]
         
-        print("4")
 
         # 4) Optional alignment
         if align_to_voxel:
@@ -1364,7 +1360,7 @@ def build_maps_from_points_and_centers_torch(
             pts = P_all
             cameras = C_all
 
-    print(f"Points shape: {pts.shape}")
+    # print(f"Points shape: {pts.shape}")
     
     # 5) Integrate once (optionally in chunks to cap memory)
     num_points = pts.shape[0]
@@ -1379,7 +1375,7 @@ def build_maps_from_points_and_centers_torch(
             ray_stride=ray_stride,
             max_free_rays=max_free_rays,
         )
-        print("INTEGRATED")
+        # print("INTEGRATED")
     else:
         for s in range(0, num_points, batch_chunk_points):
             e = min(s + batch_chunk_points, num_points)
@@ -1393,7 +1389,7 @@ def build_maps_from_points_and_centers_torch(
                 ray_stride=ray_stride,
                 max_free_rays=max_free_rays,
             )
-            print(f"INTEGRATED chunk {s//batch_chunk_points + 1}")
+            # print(f"INTEGRATED chunk {s//batch_chunk_points + 1}")
 
     # 6) Generate BEV
     bev_spec = BevSpec(
@@ -1435,7 +1431,7 @@ def build_maps_from_latent_features(
     if frame_ids is not None:
         # All points are already concatenated
         pts = frames_xyz[0]
-        print("Beg", len(pts))
+        # print("Beg", len(pts))
         # Expand camera centers by frame_ids
         CONF_all = conf_map[0]
         
@@ -1445,7 +1441,7 @@ def build_maps_from_latent_features(
         keep = torch.isfinite(pts).all(dim=1) & torch.isfinite(cameras).all(dim=1) & torch.isfinite(CONF_all)
 
         pts = pts[keep]
-        print("Keep finite", len(pts))
+        # print("Keep finite", len(pts))
         CONF_all = CONF_all[keep]
         fts = F_all[keep]
         cameras = cameras[keep]
@@ -1456,7 +1452,6 @@ def build_maps_from_latent_features(
     # 2) Integrate once (optionally in chunks to cap memory)
     if i == 0:
         # Initialize voxel latents + (optionally) occupancy
-        print("here0")
         tvox.initialize_latents_from_full_cloud(
             pts_world=pts, f_pts=fts, cam_centers=cameras)
     else:
@@ -1470,14 +1465,12 @@ def build_maps_from_latent_features(
         pts_total = torch.cat([pts, pts_phantom], dim=0)
         feats_total = torch.cat([fts, feats_phantom], dim=0)
         if batch_chunk_points is None or pts_total.shape[0] <= batch_chunk_points:
-            print("here")
             tvox.update_with_features(
                                 pts_total,  # (N,3)
                                 feats_total,      # (N,D)
                                 radius=radius)
             #print("INTEGRATED")
         else:
-            print("herechunk")
             m = pts_total.shape[0]
             for s in range(0, m, batch_chunk_points):
                 e = min(s + batch_chunk_points, m)
@@ -1511,7 +1504,7 @@ def build_maps_from_latent_features(
 def load_images(target_dir, device="cpu"): 
     image_names = glob.glob(os.path.join(target_dir, "*"))
     image_names = sorted(image_names)
-    print(f"Found {len(image_names)} images")
+    # print(f"Found {len(image_names)} images")
     if len(image_names) == 0:
         raise ValueError("No images found. Check your upload.")
 
@@ -1521,7 +1514,7 @@ def load_images(target_dir, device="cpu"):
 
 def run_model(model, images, dtype=torch.float32):
 
-    print("Running Inference with VGGT")
+    # print("Running Inference")
 
     with torch.no_grad():
         with torch.cuda.amp.autocast(dtype=dtype):
@@ -1542,7 +1535,7 @@ def run_model(model, images, dtype=torch.float32):
     predictions['pose_enc_list'] = None # remove pose_enc_list
 
     # Generate world points from depth map
-    print("Computing world points from depth map...")
+    # print("Computing world points from depth map...")
     depth_map = predictions["depth"]  # (S, H, W, 1)
     world_points = unproject_depth_map_to_point_map(depth_map, predictions["extrinsic"], predictions["intrinsic"])
     predictions["world_points_from_depth"] = world_points
@@ -1664,7 +1657,7 @@ def save_bev_png(bev: np.ndarray, meta: dict, path: str = "bev.png"):
     plt.tight_layout()
     plt.savefig(path, dpi=200)
     plt.close()
-    print(f"Saved {path}")
+    # print(f"Saved {path}")
 
 def save_bev_png2(bev: np.ndarray, meta: dict, path: str = "bev.png"):
     """Save the BEV to a PNG with axes in meters."""
@@ -1681,10 +1674,10 @@ def save_bev_png2(bev: np.ndarray, meta: dict, path: str = "bev.png"):
     plt.title("BEV")
     plt.colorbar(label="occupancy value")
     plt.tight_layout()
-    print("savfig ", path)
+    # print("savfig ", path)
     plt.savefig(path, dpi=200)
     plt.close()
-    print(f"Saved {path}")
+    # print(f"Saved {path}")
 
 def save_bev(bev: np.ndarray, meta: dict, png_path="bev.png", npy_path="bev.npy", meta_path="bev_meta.json"):
     # keep your current PNG
@@ -1711,7 +1704,7 @@ def export_occupied_voxels_as_ply(vox, path: str = "voxels.ply", z_band: Tuple[f
         f.write("end_header\n")
         for p in centers:
             f.write(f"{p[0]} {p[1]} {p[2]}\n")
-    print(f"Saved {N} voxel centers to {path}")
+    # print(f"Saved {N} voxel centers to {path}")
 
 
 def _to_tuple3(x):
@@ -1779,9 +1772,9 @@ def export_occupied_voxels(vox, ply_path="voxels.ply", npy_path="voxels_ijk.npy"
     }
     Path(meta_path).write_text(json.dumps(meta, indent=2))
 
-    print(f"Saved {N} voxel centers → {ply_path}")
-    print(f"Saved occupied IJK → {npy_path}")
-    print(f"Saved meta → {meta_path}")
+    # print(f"Saved {N} voxel centers → {ply_path}")
+    # print(f"Saved occupied IJK → {npy_path}")
+    # print(f"Saved meta → {meta_path}")
 
 
 

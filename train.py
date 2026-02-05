@@ -375,58 +375,10 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 
  
         start = time.time()
-        """
-        WPTS_m = rotate_points(predictions[POINTS], R_w2m, t_w2m)
-        if Rmw is None or tmw is None:
-            Rmw, tmw, info = align_pointcloud_torch_fast(WPTS_m, inlier_dist=self.voxel_size*0.75, ransac_iters=500, point_chunk=5_000_000, cand_chunk=4096)
-        WPTS_m = rotate_points(WPTS_m, Rmw, tmw)
-        """
+       
         WPTS_m = predictions[POINTS]
 
-        """
-        if self.vox_gt is not None and self.vox_gt.keys.numel() > 0:
-            # 1. Get GT Points
-            gt_ijk = self.vox_gt._unhash_keys(self.vox_gt.keys)
-            gt_pts = self.vox_gt.origin + (gt_ijk.float() + 0.5) * self.vox_gt.p.voxel_size
-
-            # 2. Flatten Prediction
-            pred_flat = WPTS_m.reshape(-1, 3)
-            valid = torch.isfinite(pred_flat).all(dim=1)
-            pred_valid = pred_flat[valid]
-
-            if pred_valid.shape[0] > 0 and gt_pts.shape[0] > 0:
-                # --- A. Centering ---
-                pred_c = pred_valid.mean(dim=0)
-                gt_c = gt_pts.mean(dim=0)
-
-                pred_centered = pred_valid - pred_c
-                gt_centered = gt_pts - gt_c
-
-                # --- B. Scaling (Root Mean Square distance from center) ---
-                # How "spread out" are the points?
-                dist_pred = torch.norm(pred_centered, dim=1).mean()
-                dist_gt = torch.norm(gt_centered, dim=1).mean()
-
-                # Calculate scale factor
-                scale = dist_gt / (dist_pred + 1e-8)
-
-                #print(f"[Align] Fixing Scale. GT_spread={dist_gt:.2f}, Pred_spread={dist_pred:.2f}, Scale={scale:.4f}")
-
-                # --- C. Apply Transform ---
-                # New_Pos = (Old_Pos - Old_Center) * Scale + New_Center
-
-                # Apply to the full (S, H, W, 3) tensor
-                # Broadcast center subtraction
-                WPTS_m = (WPTS_m - pred_c.view(1,1,1,3)) * scale + gt_c.view(1,1,1,3)
-
-                # Fix Camera Translation too (approximate)
-                if tmw is not None:
-                     # This is tricky for tmw alone, but sticking to point alignment is key for IoU
-                     pass
-
-            else:
-                 #print("[Align] Warning: Empty clouds, skipping align.")
-            """
+       
 
 
 
@@ -578,144 +530,6 @@ class VoxelUpdaterSystem(pl.LightningModule):
         baseline_vox.next_epoch()
 
         return bev, meta
-
-    def inference_gt(self, i, imgs):
-
-        POINTS = "world_points"
-        CONF = "world_points_conf"
-        threshold = 1.0     
-        z_clip_map = (-0.1, 0.3)   
-
-        R_w2m = np.array([[0, 0, -1],
-                        [-1, 0, 0],
-                        [0, -1, 0]], dtype=np.float32)
-
-        t_w2m = np.zeros(3, dtype=np.float32)
-
-
-
-        R_w2m = to_torch(R_w2m, device=self.device)
-        t_w2m = to_torch(t_w2m, device=self.device)
-        
-       
-        
-        image_tensors = torch.stack([d["img"] for d in imgs])
-
-        image_tensors = []
-        for d in imgs:
-            t = d["img"]                        # (1,3,H,W), likely float in [0,1]
-            if t.ndim == 4 and t.shape[0] == 1:
-                t = t[0]                        # -> (3,H,W)
-            t = t.detach().cpu()
-            if not t.dtype.is_floating_point:
-                t = t.float()
-            if t.max() > 1.0:                   # in case values are 0..255
-                t = t / 255.0
-            image_tensors.append(t.clamp(0,1))
-            
-        image_tensors = torch.stack(image_tensors, dim=0)  
-
-
-        
-        start = time.time()
-
-        predictions = get_reconstructed_scene_no_opt(0, ".", imgs, self.model, self.device, False, 512, "", "linear", 50, 1, True, False, True, False, 0.05, "oneref", 1, 0)
-        
-        # self.keyframes = image_tensors.clone()
-        
-        end = time.time()
-        length = end - start
-
-        #print("Running inference took", length, "seconds!")
-        
-
-
-        # Keep tensors; only extract what we need later.
-        # If you truly need NumPy later, convert specific keys then.
-        needed = {
-            "images","extrinsic", POINTS, CONF
-        }
-        for k in list(predictions.keys()):
-            if k not in needed:
-                del predictions[k]  # drop unneeded heavy stuff early
-
-
-
-        start = time.time()
-        with torch.no_grad():
-
-            # WPTS_m = torch.from_numpy(predictions[POINTS]).to(device=self.device)
-
-            WPTS_m = rotate_points(predictions[POINTS], R_w2m, t_w2m)
-            if Rmw is None and tmw is None:
-                #print("aligning floor")
-                Rmw, tmw, info = align_pointcloud_torch_fast(WPTS_m, inlier_dist=self.voxel_size*0.75)
-
-            WPTS_m = rotate_points(WPTS_m, Rmw, tmw)
-            predictions[POINTS] = WPTS_m
-
-
-            camera_R = R_w2m @ Rmw
-            camera_t = t_w2m + tmw
-            frames_map, cam_centers_map, conf_map, images_map, _, (S,H,W), frame_ids = build_frames_and_centers_vectorized_torch(
-                predictions,
-                POINTS=POINTS,
-                CONF=CONF,
-                # IMG="images",
-                threshold=threshold,
-                Rmw=camera_R, tmw=camera_t,
-                z_clip_map=z_clip_map,   # or None
-                return_flat=True
-
-            )   
-            end = time.time()
-            length = end - start
-
-            #print("Aligning and building frames/camera centers took", length, "seconds!")
-
-            start = time.time()
-
-            align_to_voxel = False #(i > 0)
-        
-            with autocast(enabled=False):
-
-                vox, bev, meta = build_maps_from_points_and_centers_torch(
-                    frames_map,
-                    cam_centers_map,
-                    conf_map,
-                    self.vox_gt,
-                    align_to_voxel=align_to_voxel,
-                    voxel_size=self.voxel_size,           # 10 cm
-                    bev_window_m=(5.0, 5.0), # local 20x20 m
-                    bev_origin_xy=(-2.0, -2.0),
-                    z_clip_vox=(-np.inf, np.inf),
-                    z_band_bev=(0.02, 0.5),
-                    samples_per_voxel=0.7,#1,
-                    ray_stride=6,#2,
-                    max_free_rays=10000,
-                    frame_ids=frame_ids
-                 ) 
-
-            self.vox_gt = vox
-        
-                
-            end = time.time()
-            length = end - start
-
-            #print("Building Voxel and BEV took", length, "seconds!")
-
-            
-                
-            #self.vox_gt.next_epoch()
-            
-        
-          # after build_frames_and_centers_vectorized(...)
-        del predictions  # drops images, view_feats, etc. all at once
-
-        # after build_maps_from_latent_features(...)
-        del frames_map, cam_centers_map, conf_map, images_map, image_tensors
-
-        return bev, Rmw, tmw
   
 
 
@@ -997,7 +811,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
 
         for t in range(T):
-            print(t)
+            #print(t)
             imgs = batch["imgs_t"][t]
 
             self.vox_gt = gt_seq[t]
@@ -1044,29 +858,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
             raw_pts = predictions["world_points"]
 
-            """
-            if t == 0:
-                # Calculate current scale (how big is the scene?)
-                current_size = torch.median(torch.norm(raw_pts, dim=1))
-
-                # 1. Calculate Centroid (Robust to outliers)
-                valid_mask = torch.isfinite(raw_pts).all(dim=-1)
-                if valid_mask.any():
-                    centroid = raw_pts[valid_mask].median(dim=0).values
-                else:
-                    centroid = torch.zeros(3, device=device)
-
-                # 2. Measure Size relative to CENTROID (Fixes the "Origin" bug)
-                # This ensures we measure the ROOM size, not the distance to (0,0,0)
-                centered_pts = raw_pts - centroid
-                current_size = torch.median(torch.norm(centered_pts[valid_mask], dim=1))
-
-                # Target 5.0 meters
-                target_size = 5.0
-                scale_factor = (target_size / (current_size + 1e-6)).item()
-
-                print(f"[GT] Scaling Scene: {current_size:.2f}m -> 5.00m (Factor: {scale_factor:.2f}x)")
-            """
+        
             
             
             # 1. Scale Points
@@ -1128,8 +920,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 f_proj = self.apply_projector_to_map(f_raw, target_hw=target_hw)
 
                 # Inside the loop where you process features
-                print(f"Feat Stats: Min={f_proj.min()}, Max={f_proj.max()}, Mean={f_proj.mean()}")
-                print(f"Non-Zero Ratio: {(f_proj.abs() > 1e-5).float().mean()}")
+                #print(f"Feat Stats: Min={f_proj.min()}, Max={f_proj.max()}, Mean={f_proj.mean()}")
+                #print(f"Non-Zero Ratio: {(f_proj.abs() > 1e-5).float().mean()}")
                 
                 projected_feats_map.append(f_proj)
                 
@@ -1191,7 +983,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
             )      
            
             gt_covered = valid_gt.sum()
-            print("GT coverage", gt_covered / total_gt)
+            #print("GT coverage", gt_covered / total_gt)
 
 
             pred_intersect = logit_pred_before[valid_mask]
@@ -1209,64 +1001,6 @@ class VoxelUpdaterSystem(pl.LightningModule):
             # ---------------------------------------------------------
 
 
-
-
-            # We need a mask that says: "Did this specific voxel CHANGE since the last frame?"
-            """
-            change_mask = torch.zeros_like(tgt_intersect, dtype=torch.bool)
-
-            # Check if we have history stored
-            if vox_gt_prev is not None:
-                # Query the PREVIOUS GT structure using CURRENT keys.
-                # This aligns the past world to the current view.
-                _, tgt_prev_aligned = self.align_probs_to_keys_soft(
-                     self.vox, torch.ones_like(logit_pred_before), vox_gt_prev, default=0.0
-                )
-
-                # Extract the same subset of valid voxels
-                tgt_prev_intersect = tgt_prev_aligned[valid_mask]
-
-                # Calculate Change: XOR Logic (Wall->Empty OR Empty->Wall)
-                # We treat >0.5 as occupied.
-                current_bool = (tgt_intersect > 0.5)
-                prev_bool    = (tgt_prev_intersect > 0.5)
-                change_mask  = (current_bool != prev_bool)
-
-            # ---------------------------------------------------------
-
-            loss_intersect = torch.tensor(0.0, device=self.device)
-
-            if pred_intersect.numel() > 0:
-                # A. Calculate Spatial Balance (Walls vs Empty) - EXISTING LOGIC
-                pos_mask = (tgt_intersect > 0.5)
-                num_pos = pos_mask.sum()
-                num_neg = (~pos_mask).sum()
-
-                pos_weight = torch.tensor(1.0, device=self.device)
-                if num_pos > 0:
-                    pos_weight = (num_neg.float() / (num_pos.float() + 1e-8)).clamp(min=1.0, max=20.0)
-
-                # Start with base weights
-                weights = torch.ones_like(tgt_intersect, device=self.device)
-                weights[pos_mask] = pos_weight
-
-                # B. Inject Temporal Bounty - NEW LOGIC
-                # Multiply the weight of changed voxels by 10.0 (The Bounty)
-                # This stacks with pos_weight! A moving wall gets 20.0 * 10.0 = 200.0 weight.
-                temporal_bounty = 10.0
-                weights[change_mask] *= temporal_bounty
-
-                # C. Use Standard BCE (Manual Weighting gives you more control than FocalLoss here)
-                loss_intersect = F.binary_cross_entropy_with_logits(
-                    pred_intersect,
-                    tgt_intersect,
-                    weight=weights,  # <--- Passing the "Sniper" weights
-                    reduction='mean'
-                )
-
-            vox_gt_prev = self.vox_gt
-            """
-
             if pred_intersect.numel() > 0:
                 # Calculate weight for positives just like before
                 pos_mask = (tgt_intersect > 0.5)
@@ -1283,51 +1017,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 weights = torch.ones_like(tgt_intersect, device=self.device)
                 weights[pos_mask] = pos_weight
                 
-                # with autocast(enabled=False):
-
-                #     loss_intersect = F.binary_cross_entropy(
-                #         pred_intersect.float().clamp(1e-5, 1-1e-5),
-                #         tgt_intersect.float().clamp(1e-5, 1-1e-5),
-                #         weight=weights,
-                #         reduction="mean"
-                #     )
-                    
-
-
-
-                """
-                if self.vox_gt_prev is not None:
-
-                    p_occ_tgt_gt_aligned_prev, valid_mask_prev = self.align_probs_to_keys_soft(
-                        self.vox_gt_prev, self.tgt_prev, self.vox, default=0.0
-                    )
-
-                    tgt_intersect_prev = p_occ_tgt_gt_aligned_prev[valid_mask]
-                    # 2. Identify voxels where the GROUND TRUTH actually flipped
-                    # tgt_intersect is your GT for the current frame
-                    curr_bool = (tgt_intersect > 0.5)
-                    prev_bool = (tgt_intersect_prev > 0.5)
-
-                    # change_mask is True only where a voxel went Air -> Wall or Wall -> Air
-                    change_mask = (curr_bool != prev_bool)
-
-                    # 3. Apply the Bounty
-                    weights = torch.ones_like(tgt_intersect)
-
-                    # Keep your existing weighting for occupied voxels
-                    pos_mask = (tgt_intersect > 0.5)
-                    weights[pos_mask] = pos_weight
-
-                    # HEAVY penalty for missing a change
-                    weights[change_mask] *= 10.0
-
-                    # 4. Calculate the reactive loss
-                    loss_intersect = F.binary_cross_entropy_with_logits(
-                        pred_intersect, tgt_intersect, weight=weights, reduction='mean'
-                    )
-
-
-                """
+              
                 if self.vox_gt_prev is not None:
                     # 1. Align Past to Present
                     p_occ_tgt_gt_aligned_prev, _ = self.align_probs_to_keys_soft(
@@ -1398,37 +1088,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
             pred_fp = logit_pred_before[~valid_mask]
             loss_fp = torch.tensor(0.0, device=self.device)
 
-            """
-            # In loss_fp (pred_fp covers keys in Pred but NOT in GT)
-            if pred_fp.numel() > 0:
-                tgt_fp = torch.zeros_like(pred_fp)
-                weights_fp = torch.ones_like(pred_fp) # Base weight 1.0
-
-                # --- Identify Ghosts using History ---
-                if self.vox_gt_prev is not None:
-                    # 1. Get the specific keys for these False Positives
-                    keys_fp = self.vox.keys[~valid_mask]
-
-                    # 2. Check if these exact keys were Walls in the PREVIOUS GT
-                    # (You need to align Prev GT to these specific FP keys)
-                    p_prev, valid_prev = self.align_probs_to_keys_soft(
-                         self.vox_gt_prev,
-                         torch.sigmoid(self.vox_gt_prev.vals_st * 10.0),
-                         type(self.vox)(self.vox.origin, self.vox.p), # Dummy wrapper
-                         keys_subset=keys_fp # Use subset if your helper supports it, or align full and slice
-                    )
-
-                    # 3. Ghost = Was Wall Previously (>0.5)
-                    ghost_mask = (p_prev > 0.5)
-
-                    # 4. Apply the Hammer
-                    weights_fp[ghost_mask] = 20.0  # <--- NOW the ghost hurts
-
-                loss_fp = F.binary_cross_entropy_with_logits(
-                    pred_fp, tgt_fp, weight=weights_fp, reduction='mean'
-                )
-
-            """
+        
             if pred_fp.numel() > 0:
                 # Target is all zeros
                 tgt_fp = torch.zeros_like(pred_fp)
@@ -1437,11 +1097,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 # but here we start with 1.0 (strict precision).
                 # with autocast(enabled=False):
 
-                #     loss_fp = F.binary_cross_entropy(
-                #         pred_fp.float().clamp(1e-5, 1-1e-5),
-                #         tgt_fp.float(), 
-                #         reduction="mean"
-                #     )
+            
                     
                 loss_fp = F.binary_cross_entropy_with_logits(
                     pred_fp, 
@@ -1457,9 +1113,9 @@ class VoxelUpdaterSystem(pl.LightningModule):
             loss_occ = loss_intersect + (self.fp_weight * loss_fp)
 
 
-            print("Loss Occ", loss_occ)
-            print("Loss Intersect", loss_intersect)
-            print("Loss Fp", loss_fp)
+            # print("Loss Occ", loss_occ)
+            # print("Loss Intersect", loss_intersect)
+            # print("Loss Fp", loss_fp)
 
             # --- Metrics: Global IoU (Including FP Hallucinations) ---
             # Valid/Intersect Part
@@ -1685,7 +1341,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
         mst = False
         for t in range(T):
-            print("Val ", t)
+            # print("Val ", t)
             # #print(f"== Val Step {t} ==")
             imgs = batch["imgs_t"][t]
             
@@ -1734,31 +1390,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
 
             raw_pts = predictions["world_points"]
-            
-            """
-            if t == 0:
-                # Calculate current scale (how big is the scene?)
-                current_size = torch.median(torch.norm(raw_pts, dim=1))
-
-                # 1. Calculate Centroid (Robust to outliers)
-                valid_mask = torch.isfinite(raw_pts).all(dim=-1)
-                if valid_mask.any():
-                    centroid = raw_pts[valid_mask].median(dim=0).values
-                else:
-                    centroid = torch.zeros(3, device=device)
-
-                # 2. Measure Size relative to CENTROID (Fixes the "Origin" bug)
-                # This ensures we measure the ROOM size, not the distance to (0,0,0)
-                centered_pts = raw_pts - centroid
-                current_size = torch.median(torch.norm(centered_pts[valid_mask], dim=1))
-
-                # Target 5.0 meters
-                target_size = 5.0
-                scale_factor = (target_size / (current_size + 1e-6)).item()
-
-                print(f"[GT] Scaling Scene: {current_size:.2f}m -> 5.00m (Factor: {scale_factor:.2f}x)")
-
-            """
+           
            
             # 1. Scale Points
             predictions["world_points"] = raw_pts * scale_factor
@@ -1835,9 +1467,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 logit_pred_before = torch.nan_to_num(logit_pred_before, nan=0.001)
             
             # 1. Align GT to Prediction
-            #p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys(
-            #     self.vox_gt.keys, p_occ_tgt, self.vox.keys, default=0.0
-            #)      
+               
             p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys_soft(
                 self.vox_gt, p_occ_tgt, self.vox, default=0.0
             )      
@@ -1870,17 +1500,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
             if pred_fp.numel() > 0:
                 # Target is all zeros
                 tgt_fp = torch.zeros_like(pred_fp)
-                
-                # Weighting: You might want to weigh this less than intersection
-                # but here we start with 1.0 (strict precision).
-                # with autocast(enabled=False):
-
-                #     loss_fp = F.binary_cross_entropy(
-                #         pred_fp.float().clamp(1e-5, 1-1e-5),
-                #         tgt_fp.float(), 
-                #         reduction="mean"
-                #     )
-                    
+           
                 loss_fp = F.binary_cross_entropy_with_logits(
                     pred_fp, 
                     tgt_fp, 
@@ -2391,120 +2011,28 @@ class VoxelUpdaterSystem(pl.LightningModule):
             torch.cuda.empty_cache()
 
         # --- FINAL SUMMARY PRINT ---
-        print("-" * 60)
-        print(f"SEQUENCE REPORT: {seq_id}")
-        print("-" * 60)
-        print(f"  MODEL Metrics:")
-        print(f"    IoU:                 {self.get_avg(metrics_buffer, 'occ_iou'):.4f}")
-        print(f"    Recall:              {self.get_avg(metrics_buffer, 'occ_recall'):.4f}")
-        print(f"    Precision:           {self.get_avg(metrics_buffer, 'occ_precision'):.4f}")
-        print("-" * 60)
-        print(f"  BASELINE Metrics:")
-        print(f"    IoU:                 {self.get_avg(metrics_buffer, 'baseline_occ_iou'):.4f}")
-        print(f"    Recall:              {self.get_avg(metrics_buffer, 'baseline_occ_recall'):.4f}")
-        print(f"    Precision:           {self.get_avg(metrics_buffer, 'baseline_occ_precision'):.4f}")
-        print("-" * 60)
-        print(f"  Dynamic Metrics (Changes Only):")
-        print(f"    Dynamic IoU:         {self.get_avg(metrics_buffer, 'dyn_iou'):.4f}")
-        print(f"    Appearing Recall:    {self.get_avg(metrics_buffer, 'dyn_recall_appearing'):.4f}  (High = Fast reaction to new objects)")
-        print(f"    Disappearing Recall: {self.get_avg(metrics_buffer, 'dyn_recall_disappearing'):.4f}  (High = Good cleanup)")
-        print(f"    Ghost Rate:          {self.get_avg(metrics_buffer, 'dyn_ghost_rate'):.4f}  (High = Objects leave trails)")
-        print("-" * 60)
-        print("\n")
+        # print("-" * 60)
+        # print(f"SEQUENCE REPORT: {seq_id}")
+        # print("-" * 60)
+        # print(f"  MODEL Metrics:")
+        # print(f"    IoU:                 {self.get_avg(metrics_buffer, 'occ_iou'):.4f}")
+        # print(f"    Recall:              {self.get_avg(metrics_buffer, 'occ_recall'):.4f}")
+        # print(f"    Precision:           {self.get_avg(metrics_buffer, 'occ_precision'):.4f}")
+        # print("-" * 60)
+        # print(f"  BASELINE Metrics:")
+        # print(f"    IoU:                 {self.get_avg(metrics_buffer, 'baseline_occ_iou'):.4f}")
+        # print(f"    Recall:              {self.get_avg(metrics_buffer, 'baseline_occ_recall'):.4f}")
+        # print(f"    Precision:           {self.get_avg(metrics_buffer, 'baseline_occ_precision'):.4f}")
+        # print("-" * 60)
+        # print(f"  Dynamic Metrics (Changes Only):")
+        # print(f"    Dynamic IoU:         {self.get_avg(metrics_buffer, 'dyn_iou'):.4f}")
+        # print(f"    Appearing Recall:    {self.get_avg(metrics_buffer, 'dyn_recall_appearing'):.4f}  (High = Fast reaction to new objects)")
+        # print(f"    Disappearing Recall: {self.get_avg(metrics_buffer, 'dyn_recall_disappearing'):.4f}  (High = Good cleanup)")
+        # print(f"    Ghost Rate:          {self.get_avg(metrics_buffer, 'dyn_ghost_rate'):.4f}  (High = Objects leave trails)")
+        # print("-" * 60)
+        # print("\n")
 
         return bevs, bevs_gt, bevs_baseline
-        """
-            # ---------------------------------------------------------
-            # DYNAMIC METRICS (The New Part)
-            # ---------------------------------------------------------
-            # Compare Current GT (t) vs Previous GT (t-1)
-            if t > 0 and gt_seq[t-1] is not None:
-                vox_gt_prev = gt_seq[t-1]
-
-                # Align Prev GT to Current Keys
-                p_occ_prev_aligned, _ = self.align_probs_to_keys_soft(
-                    vox_gt_prev,
-                    torch.sigmoid(vox_gt_prev.vals_st * 10.0),
-                    self.vox,
-                    default=0.0
-                )
-
-                # Define Masks
-                gt_curr = (tgt_intersect > 0.5)
-                # Note: We align Previous GT to Current Keys, so we use valid_mask of current keys
-                gt_prev = (p_occ_prev_aligned[valid_mask] > 0.5)
-
-                mask_appearing    = (~gt_prev & gt_curr)  # Empty -> Occupied
-                mask_disappearing = (gt_prev & ~gt_curr)  # Occupied -> Empty
-                mask_dynamic      = (gt_prev != gt_curr)
-
-                # A. Appearing Recall (Do we see new objects?)
-                if mask_appearing.sum() > 0:
-                    pred_appearing = (pred_intersect[mask_appearing] > 0.0)
-                    metrics_buffer["dyn_recall_appearing"].append(pred_appearing.float().mean().item())
-
-                # B. Disappearing / Ghosting (Do we clear old objects?)
-                if mask_disappearing.sum() > 0:
-                    pred_ghosts = (pred_intersect[mask_disappearing] > 0.0)
-                    metrics_buffer["dyn_ghost_rate"].append(pred_ghosts.float().mean().item())
-                    metrics_buffer["dyn_recall_disappearing"].append((~pred_ghosts).float().mean().item())
-
-                # C. Dynamic IoU
-                if mask_dynamic.sum() > 0:
-                    pred_dyn = (pred_intersect[mask_dynamic] > 0.0)
-                    gt_dyn   = gt_curr[mask_dynamic]
-                    intersection = (pred_dyn & gt_dyn).sum()
-                    union        = (pred_dyn | gt_dyn).sum()
-                    metrics_buffer["dyn_iou"].append((intersection / (union + 1e-8)).item())
-
-            # ---------------------------------------------------------
-            # END METRICS
-            # ---------------------------------------------------------
-
-            bev_spec = BevSpec(
-                resolution=self.vox_gt.p.voxel_size,
-                width_m=float(self.bev_window_m[0]),
-                height_m=float(self.bev_window_m[1]),
-                origin_xy=self.bev_origin_xy,
-                z_band=(self.z_band_bev[0], self.z_band_bev[1]),
-            )
-
-            #bev_gt, meta = bev_from_voxels(self.vox_gt, bev_spec, include_free=True)
-            
-            bev_gt, meta, prev_probs = bev_from_voxels(self.vox_gt, bev_spec, include_free=True, prev_probs=prev_probs, vis_mode="motion")
-
-            bevs.append(bev)
-            bevs_gt.append(bev_gt)
-
-            self.vox.z_latent = self.vox.z_latent.detach()
-            save_dir = "debug_viz_pred"
-            os.makedirs(save_dir, exist_ok=True)
-            fname = f"{save_dir}/step_{t}.ply"
-            self.export_debug_ply(fname, t)
-            self.export_separated_ply(t, save_dir="debug_viz_pred")
-
-
-            torch.cuda.empty_cache()
-
-        # --- FINAL SUMMARY PRINT ---
-        print("-" * 60)
-        print(f"SEQUENCE REPORT: {seq_id}")
-        print("-" * 60)
-        print(f"  Standard Metrics:")
-        print(f"    IoU:                 {self.get_avg(metrics_buffer, 'occ_iou'):.4f}")
-        print(f"    Recall:              {self.get_avg(metrics_buffer, 'occ_recall'):.4f}")
-        print(f"    Precision:           {self.get_avg(metrics_buffer, 'occ_precision'):.4f}")
-        print("-" * 60)
-        print(f"  Dynamic Metrics (Changes Only):")
-        print(f"    Dynamic IoU:         {self.get_avg(metrics_buffer, 'dyn_iou'):.4f}")
-        print(f"    Appearing Recall:    {self.get_avg(metrics_buffer, 'dyn_recall_appearing'):.4f}  (High = Fast reaction to new objects)")
-        print(f"    Disappearing Recall: {self.get_avg(metrics_buffer, 'dyn_recall_disappearing'):.4f}  (High = Good cleanup)")
-        print(f"    Ghost Rate:          {self.get_avg(metrics_buffer, 'dyn_ghost_rate'):.4f}  (High = Objects leave trails)")
-        print("-" * 60)
-        print("\n")
-
-        return bevs, bevs_gt
-        """
 
 
     def on_load_checkpoint(self, checkpoint):
@@ -3069,26 +2597,7 @@ class HabitatDataModule(pl.LightningDataModule):
         self.seq_list = seq_list
         self.step = step
     def setup(self, stage: Optional[str] = None):
-        #print("getting seqs")
-        # all_seqs = _sequence_dirs_from_root(self.dataset_root)
-        
-        
-        # gt_root = os.path.join(self.dataset_root, "gt_voxels_per_timestep")
-        # if self.skip:
-        #     filtered = []
-        #     for seq_dir in all_seqs:
-        #         # reconstruct seq_id exactly like __getitem__
-        #         p = seq_dir.rstrip("/")
-        #         basis = os.path.basename(os.path.dirname(p)).replace(".basis", "")
-        #         final = os.path.basename(p)
-        #         seq_id = f"{basis}_{final}"
-
-        #         # we just check for t=0 GT; adjust if you need stricter checks
-        #         gt_path_t0 = os.path.join(gt_root, f"{seq_id}_t0000_gt.npz")
-        #         if os.path.exists(gt_path_t0):
-        #             filtered.append(seq_dir)
-        #     all_seqs = filtered
-            
+ 
         with open(self.seq_list) as f:
             all_entries = json.load(f)
 
