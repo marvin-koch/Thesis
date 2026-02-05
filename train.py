@@ -1025,7 +1025,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
             
             R_w2m = np.array([[0, 0, -1],
-                            [-1, 0, 0],
+                            [1, 0, 0],
                             [0, -1, 0]], dtype=np.float32)
 
             t_w2m = np.zeros(3, dtype=np.float32)
@@ -1712,7 +1712,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
 
             R_w2m = np.array([[0, 0, -1],
-                            [-1, 0, 0],
+                            [1, 0, 0],
                             [0, -1, 0]], dtype=np.float32)
 
             t_w2m = np.zeros(3, dtype=np.float32)
@@ -2075,7 +2075,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
         predictions = torch.load(cache_path, map_location=self.device)
 
         R_w2m = np.array([[0, 0, -1],
-                        [-1, 0, 0],
+                        [1, 0, 0],
                         [0, -1, 0]], dtype=np.float32)
         t_w2m = np.zeros(3, dtype=np.float32)
 
@@ -2160,7 +2160,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
             predictions = torch.load(cache_path, map_location=self.device)
 
             R_w2m = np.array([[0, 0, -1],
-                            [-1, 0, 0],
+                            [1, 0, 0],
                             [0, -1, 0]], dtype=np.float32)
             t_w2m = np.zeros(3, dtype=np.float32)
 
@@ -2379,11 +2379,13 @@ class VoxelUpdaterSystem(pl.LightningModule):
             bevs_baseline.append(bev_base)
 
             self.vox.z_latent = self.vox.z_latent.detach()
-            save_dir = "debug_viz_pred"
+            save_dir = f"debug_viz_pred/{batch_idx}"
             os.makedirs(save_dir, exist_ok=True)
             fname = f"{save_dir}/step_{t}.ply"
             self.export_debug_ply(fname, t)
-            self.export_separated_ply(t, save_dir="debug_viz_pred")
+            self.export_separated_ply(t, save_dir=save_dir)
+            self.export_latent_colored_ply(f"{save_dir}/latent_step_{t}.ply", t)
+            self.export_kmeans_ply(f"{save_dir}/kmeans_{t}.ply", t)
 
 
             torch.cuda.empty_cache()
@@ -2555,6 +2557,133 @@ class VoxelUpdaterSystem(pl.LightningModule):
     
     
      
+    def export_latent_colored_ply(self, filename, step_idx):
+        """
+        Exports occupancy colored by PCA of z_latent.
+        Uses Whitening + Robust Scaling to maximize color distinctness.
+        """
+        # 1. Decode occupancy
+        logit_pred = self.vox.decode_occupancy(with_xyz_cond=False)
+        prob_pred = torch.sigmoid(logit_pred)
+        mask_pred_occ = prob_pred > 0.5
+
+        # 2. Geometry
+        keys_pred = self.vox.keys[mask_pred_occ]
+        if keys_pred.numel() == 0:
+            return
+
+        xyz = self.vox._unhash_keys(keys_pred).float()
+        xyz = self.vox.origin + (xyz + 0.5) * self.vox.p.voxel_size
+        pts = xyz.detach().cpu().numpy()
+
+        # 3. Latents
+        latents = self.vox.z_latent[mask_pred_occ].detach().cpu().numpy()
+
+        # 4. Polarized Projection
+        if latents.shape[0] >= 3:
+            # A. Whiten=True forces component variances to be equal.
+            # This prevents the first component (Red) from dominating the map.
+            pca = PCA(n_components=3, whiten=True)
+            rgb_pca = pca.fit_transform(latents)
+
+            # B. Robust Scaling (The "Polarizer")
+            # Clip the bottom 5% and top 5% of values.
+            # This ignores outliers and stretches the core data to full contrast.
+            q_min = np.quantile(rgb_pca, 0.05, axis=0)
+            q_max = np.quantile(rgb_pca, 0.95, axis=0)
+
+            rgb_pca = np.clip(rgb_pca, q_min, q_max)
+
+            # Normalize to 0-1
+            rgb_norm = (rgb_pca - q_min) / (q_max - q_min + 1e-8)
+
+            colors = (rgb_norm * 255).astype(np.uint8)
+        else:
+            colors = np.full((pts.shape[0], 3), 128, dtype=np.uint8)
+
+        # 5. Write PLY
+        header = f"""ply
+        format ascii 1.0
+        element vertex {pts.shape[0]}
+        property float x
+        property float y
+        property float z
+        property uchar red
+        property uchar green
+        property uchar blue
+        end_header
+        """
+
+        with open(filename, "w") as f:
+            f.write(header)
+            for p, c in zip(pts, colors):
+                f.write(f"{p[0]:.4f} {p[1]:.4f} {p[2]:.4f} {c[0]} {c[1]} {c[2]}\n")
+
+        print(f"Saved polarized latent PLY: {filename}")
+
+    def export_kmeans_ply(self, filename, step_idx, n_clusters=4):
+        """
+        Exports occupancy colored by K-Means clustering of latents.
+        This demonstrates 'unsupervised semantic segmentation'.
+        """
+        # 1. Decode occupancy
+        logit_pred = self.vox.decode_occupancy(with_xyz_cond=False)
+        prob_pred = torch.sigmoid(logit_pred)
+        mask_pred_occ = prob_pred > 0.5
+
+        # 2. Geometry
+        keys_pred = self.vox.keys[mask_pred_occ]
+        if keys_pred.numel() == 0:
+            return
+
+        xyz = self.vox._unhash_keys(keys_pred).float()
+        xyz = self.vox.origin + (xyz + 0.5) * self.vox.p.voxel_size
+        pts = xyz.detach().cpu().numpy()
+
+        # 3. Latents
+        latents = self.vox.z_latent[mask_pred_occ].detach().cpu().numpy()
+
+        # 4. K-Means Clustering
+        if latents.shape[0] >= n_clusters:
+            from sklearn.cluster import KMeans
+            # Use a fixed random_state for consistency across timesteps/runs
+            kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+            labels = kmeans.fit_predict(latents)
+
+            # 5. Map Clusters to Distinct Colors (using matplotlib tab10/tab20)
+            import matplotlib.cm as cm
+            cmap = cm.get_cmap('tab10') # Distinct categorical colors
+
+            # Map labels 0..K to colors 0..255
+            colors = np.zeros((pts.shape[0], 3), dtype=np.uint8)
+            for i in range(pts.shape[0]):
+                # Get RGBA from cmap, drop alpha, convert to 0-255
+                rgba = cmap(labels[i] / max(1, n_clusters - 1)) # Normalize to 0-1
+                colors[i] = (np.array(rgba[:3]) * 255).astype(np.uint8)
+
+        else:
+            colors = np.full((pts.shape[0], 3), 128, dtype=np.uint8)
+
+        # 6. Write PLY
+        header = f"""ply
+        format ascii 1.0
+        element vertex {pts.shape[0]}
+        property float x
+        property float y
+        property float z
+        property uchar red
+        property uchar green
+        property uchar blue
+        end_header
+        """
+
+        with open(filename, "w") as f:
+            f.write(header)
+            for p, c in zip(pts, colors):
+                f.write(f"{p[0]:.4f} {p[1]:.4f} {p[2]:.4f} {c[0]} {c[1]} {c[2]}\n")
+
+        print(f"Saved K-Means PLY: {filename}")
+
     def export_separated_ply(self, step_idx, save_dir="debug_viz"):
         """
         Exports GT and Prediction to separate PLY files.
