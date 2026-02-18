@@ -61,6 +61,10 @@ import copy
 from pytorch3d.ops import knn_points
 
 from sklearn.manifold import TSNE
+from pytorch3d.ops import knn_points
+from voxel.utils import build_maps_from_points_and_centers_torch, rotate_points
+
+
 try:
     import umap
     HAS_UMAP = True
@@ -114,6 +118,7 @@ class TrainConfig:
     # data
     dataset_root: str
     voxel_size: float = 0.10
+    real_gt_voxels_file: str = None,
     gt_voxels_file: str = "gt_voxels_per_timestep_005_v2",
     precomputed_cache_file: str ="precomputed_cache",
     pose_file: str ="gt_pose",
@@ -1749,9 +1754,136 @@ class VoxelUpdaterSystem(pl.LightningModule):
     
 
     def predict_step(self, batch: Dict, batch_idx: int, dataloader_idx: int = 0, step=1):
-        from pytorch3d.ops import knn_points
+        def build_voxel_from_sim_data(sim_data, voxel_size=0.2, device="cuda"):
+            """
+            Converts loaded sim 'tensors.pt' data into a TorchSparseVoxelGrid.
+
+            Args:
+                sim_data: Dict loaded via torch.load("tensors.pt")
+                voxel_size: Size of voxel side in meters
+            """
+            # 1. Coordinate Setup (Matches generate_gt.py)
+            # Rotation to map Habitat world -> your model's metric frame
+            R_w2m = torch.tensor([[0, 0, -1],
+                                  [1, 0, 0],
+                                  [0, -1, 0]], dtype=torch.float32, device=device)
+            t_w2m = torch.zeros(3, device=device)
+
+            # 2. Extract and Move Data to Device
+            pts = sim_data["world_points"].to(device)
+            conf = sim_data["world_points_conf"].to(device)
+            # Extrinsics are (N, 4, 4) [R | t] where t is camera position
+            extrinsics = sim_data["extrinsic"].to(device)
+
+            """
+            # 3. Apply Frame Alignment
+            # Rotate raw points into the metric frame
+            pts_m = rotate_points(pts, R_w2m, t_w2m)
+
+            # 4. Apply Scaling Logic (Matches your 5.0m target size logic)
+            valid_mask = torch.isfinite(pts_m).all(dim=-1)
+            centroid = pts_m[valid_mask].median(dim=0).values
+            centered_pts = pts_m - centroid
+            current_size = torch.median(torch.norm(centered_pts[valid_mask], dim=1))
+
+            target_size = 5.0
+            scale_factor = (target_size / (current_size + 1e-6)).item()
+
+            # Scale points and camera positions
+            pts_scaled = pts_m * scale_factor
+            cam_centers_world = extrinsics[:, :3, 3] # (N, 3)
+            cam_centers_m = (cam_centers_world @ R_w2m.T) + t_w2m
+            cam_centers_scaled = cam_centers_m * scale_factor
+            """
+
+            z_clip_map = (-3.0, 3.0)
+
+            renders_map, cam_centers_map, conf_map, images_map, _, (S, H, W), frame_ids = \
+                build_frames_and_centers_vectorized_torch(
+                    sim_data,
+                    POINTS="world_points",
+                    CONF="world_points_conf",
+                    threshold=1.0,      # Matches your generate_gt.py logic
+                    Rmw=None,        # Your aligned Rotation
+                    tmw=None,        # Your aligned Translation
+                    z_clip_map=z_clip_map,
+                    return_flat=True,
+                )
+            # 5. Prepare for Voxelization
+            # We need to treat the points as coming from different "renders" (cameras)
+            # If sim_data saved points as one big cloud, we must split them or
+            # assign them to the nearest camera for ray-casting.
+            # (Assuming world_points is already the concatenated cloud from N cameras)
+
+
+            # Create fresh grid
+            vox_real = TorchSparseVoxelGrid(
+                origin_xyz=np.zeros(3, dtype=np.float32),
+                params=VoxelParams(voxel_size=voxel_size, promote_hits=2),
+                device=device,
+            )
+
+            # Note: build_maps_from_points_and_centers_torch expects lists of tensors per view
+            # Since this is GT, we can pass them as single-item lists
+            vox_real, bev, meta = build_maps_from_points_and_centers_torch(
+                renders_map,          # List of point tensors
+                cam_centers_map,
+                conf_map,
+                vox_real,
+                align_to_voxel=False,
+                voxel_size=voxel_size,
+                bev_window_m=(5.0, 5.0),
+                bev_origin_xy=(-2.0, -2.0),
+                z_clip_vox=(-np.inf, np.inf),
+                z_band_bev=(0.02, 0.5),
+                samples_per_voxel=2.0,
+                ray_stride=4,          # Speed up integration
+                max_free_rays=10000,
+                frame_ids=frame_ids
+            )
+
+            return vox_real
+
+        def kabsch_umeyama_sim3(src, dst):
+            """
+            Computes the optimal Sim(3) transform that aligns src to dst.
+            src, dst: (N, 3) tensors
+            Returns: R (3,3), t (3,), s (float)
+            Equation: dst = s * (src @ R.T) + t
+            """
+            # 1. Centroid subtraction
+            mu_src = src.mean(dim=0)
+            mu_dst = dst.mean(dim=0)
+            
+            src_c = src - mu_src
+            dst_c = dst - mu_dst
+
+            # 2. Compute Scale (s)
+            # Scale is the ratio of root-mean-square deviations from centroids
+            var_src = (src_c**2).sum(dim=-1).mean()
+            var_dst = (dst_c**2).sum(dim=-1).mean()
+            scale = torch.sqrt(var_dst / var_src)
+
+            # 3. Compute Rotation (R) using SVD
+            # Correlation matrix
+            H = src_c.T @ dst_c
+            U, S, Vh = torch.linalg.svd(H)
+            
+            # Correction for reflection
+            d = torch.sign(torch.linalg.det(U @ Vh))
+            diag = torch.ones(3, device=src.device)
+            diag[2] = d
+            
+            R = Vh.T @ torch.diag(diag) @ U.T
+
+            # 4. Compute Translation (t)
+            # t = mu_dst - s * (R @ mu_src)
+            translation = mu_dst - scale * (R @ mu_src)
+
+            return R, translation, scale
 
         def compute_chamfer_dist(vox_pred, vox_gt):
+
             """
             Measures the average distance (in meters) between occupied voxels.
             """
@@ -1782,6 +1914,17 @@ class VoxelUpdaterSystem(pl.LightningModule):
         self.vox = self.vox.to(self.device)
 
         # Initialize an empty GT grid structure
+        self.prev_vox_real_gt = TorchSparseVoxelGrid(
+            origin_xyz=np.zeros(3, dtype=np.float32),
+            params=VoxelParams(voxel_size=self.voxel_size, promote_hits=2),
+            device=self.device
+        )
+        self.vox_real_gt = TorchSparseVoxelGrid(
+            origin_xyz=np.zeros(3, dtype=np.float32),
+            params=VoxelParams(voxel_size=self.voxel_size, promote_hits=2),
+            device=self.device
+        )
+
         self.vox_gt = TorchSparseVoxelGrid(
             origin_xyz=np.zeros(3, dtype=np.float32),
             params=VoxelParams(voxel_size=self.voxel_size, promote_hits=2),
@@ -1807,6 +1950,11 @@ class VoxelUpdaterSystem(pl.LightningModule):
             "occ_precision": [],
             "occ_precision_inter": [],
             "occ_recall": [],
+
+            "gt_occ_iou": [],
+            "gt_occ_precision": [],
+            "gt_occ_precision_inter": [],
+            "gt_occ_recall": [],
             # Baseline Metrics
             "baseline_occ_iou": [],
             "baseline_occ_precision": [],
@@ -1822,6 +1970,13 @@ class VoxelUpdaterSystem(pl.LightningModule):
             "dyn_recall_appearing": [],
             "dyn_recall_disappearing": [],
             "dyn_ghost_rate": [],
+
+            "gt_dyn_iou": [],
+            "gt_dyn_recall_appearing": [],
+            "gt_dyn_recall_disappearing": [],
+            "gt_dyn_ghost_rate": [],
+
+
 
 
             "baseline_dyn_iou": [],
@@ -1842,6 +1997,11 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
         T = batch["timesteps"]
         seq_id = batch["seq_id"]
+
+        if self.cfg.real_gt_voxels_file:
+            real_gt_root = os.path.join(self.cfg.dataset_root, self.cfg.real_gt_voxels_file)
+
+
 
         gt_root = os.path.join(self.cfg.dataset_root, self.cfg.gt_voxels_file)
         precomputed_root = os.path.join(self.cfg.dataset_root, self.cfg.precomputed_cache_file)
@@ -1972,6 +2132,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
         for t in range(T):
             # print(f"Step {t}...")
 
+
             imgs = batch["imgs_t"][t]
 
             self.vox_gt = gt_seq[t]
@@ -1984,6 +2145,21 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 continue
 
             predictions = torch.load(cache_path, map_location=self.device)
+
+            if self.cfg.real_gt_voxels_file:
+                real_gt_path = os.path.join(real_gt_root, f"{seq_id}_t{p:04d}.pt")
+                real_gt_path = real_gt_path.replace(".glb", "")
+                if not os.path.exists(real_gt_path):
+                    print("skip, real GT not found")
+                    print(real_gt_path)
+                    continue
+
+                real_gt = torch.load(real_gt_path, map_location=self.device)
+
+
+ 
+
+
             
             
             t_start_pre.record()
@@ -2047,8 +2223,120 @@ class VoxelUpdaterSystem(pl.LightningModule):
             
             
             t_end_pre.record()
+
+
+            if self.cfg.real_gt_voxels_file:
+                with torch.cuda.amp.autocast(enabled=False):
+                    if t == 0:
+                        gt_cams = real_gt["extrinsic"][:, :3, 3]
+                        pred_cams = predictions["extrinsic"][:, :3, 3]
+                        R_kabsch, t_kabsch, s_kabsch = kabsch_umeyama_sim3(gt_cams, pred_cams)
+                        S_init, H_init, W_init, _ = predictions["world_points"].shape
+
+                gt_pts = real_gt["world_points"]
+                aligned_gt_pts = s_kabsch * (gt_pts @ R_kabsch.T) + t_kabsch
+
+                old_ex = real_gt["extrinsic"]
+                new_ex = old_ex.clone()
+
+                # Update Rotation: R_new = R_sim3 @ R_old
+                # This rotates the camera's orientation to match the new world frame
+                new_ex[:, :3, :3] = torch.matmul(R_kabsch, old_ex[:, :3, :3])
+
+                # Update Translation: Camera Centers
+                # This is exactly the same transformation as the points
+                # (Using the aligned centers we calculated earlier)
+                new_ex[:, :3, 3] = s_kabsch * (gt_cams @ R_kabsch.T) + t_kabsch
+
+                # Save it back to the dictionary
+                real_gt["extrinsic"] = new_ex
+
+                real_gt["world_points"] = aligned_gt_pts
+
+                pts = real_gt["world_points"].flatten()
+
+                # 2. Calculate how many (x,y,z) triplets we have per frame (S)
+                # We use // to make sure it's an integer
+                total_triplets = pts.numel() // 3
+                triplets_per_frame = total_triplets // S_init
+
+                # 3. Determine H and W (making them as square as possible)
+                H = H_init
+                W = triplets_per_frame // H_init
+
+                # 4. CRITICAL: Trim the tensor so it fits S * H * W * 3 EXACTLY
+
+                # Your current size (7848276) is not divisible by 30, so we must drop the extra
+                """
+                clean_size = S_init * H * W * 3
+                pts_trimmed = pts[:clean_size]
+
+
+                try:
+                    real_gt["world_points"] = pts_trimmed.view(S_init, H, W, 3)
+
+                    # Do the same for confidence (assuming it's also flattened/needs same shape)
+                    conf = real_gt["world_points_conf"].flatten()[:(S_init * H * W)] # usually conf is 1 value per point
+                    real_gt["world_points_conf"] = conf.view(S_init, H, W)
+
+                    # Note: Images are usually (S, 3, H, W)
+                    img_flat = real_gt["images"].flatten()[:(S_init * 3 * H * W)]
+                    real_gt["images"] = img_flat.view(S_init, 3, H, W)
+
+                except RuntimeError as e:
+                    print(f"Shape Mismatch: real_gt has {real_gt['world_points'].numel()//3} points, "
+                          f"but predictions expects {S*H*W} points.")
+                    raise e
+
+
+
+                """
+                # 1. Calculate the target number of points for the (S, H, W) grid
+                target_n = S_init * H * W
+
+                # 2. Flatten current data for sampling (keeping XYZ and RGB triplets together)
+                pts_flat = real_gt["world_points"].reshape(-1, 3)
+                conf_flat = real_gt["world_points_conf"].reshape(-1)
+
+                # Ensure images are in (S, H, W, 3) format so they align with the points
+                # utils.py expects channels at the end during its internal reshape
+                if real_gt["images"].dim() == 4 and real_gt["images"].shape[1] == 3:
+                    # Convert (S, 3, H, W) -> (S, H, W, 3) before flattening
+                    img_flat = real_gt["images"].permute(0, 2, 3, 1).reshape(-1, 3)
+                else:
+                    img_flat = real_gt["images"].reshape(-1, 3)
+
+                current_n = pts_flat.shape[0]
+
+                # 3. Synchronized Random Sampling
+                # We generate indices ONCE and apply them to all three tensors to keep them synced
+                indices = torch.randint(0, current_n, (target_n,), device=pts_flat.device)
+
+                # 4. View back to the required 4D shapes
+                try:
+                    # Update Points
+                    real_gt["world_points"] = pts_flat[indices].view(S_init, H, W, 3)
+                    
+                    # Update Confidence (1 value per point)
+                    real_gt["world_points_conf"] = conf_flat[indices].view(S_init, H, W)
+                    
+                    # Update Images (3 values per point)
+                    # Reshaping to (S, H, W, 3) ensures the colors match the points in the voxel grid
+                    real_gt["images"] = img_flat[indices].view(S_init, H, W, 3)
+
+                except RuntimeError as e:
+                    print(f"Sampling failed: Expected {target_n} points but indices produced an invalid shape.")
+                    raise e
+
+                self.prev_vox_real_gt = copy.deepcopy(self.vox_real_gt)
+                self.vox_real_gt = build_voxel_from_sim_data(real_gt, voxel_size=self.cfg.voxel_size, device=self.device)
+
+
+
+
             
             t_start_inf.record()
+
             with torch.enable_grad():
                 if not mst and t != 0:
                     bev, mst, _, _ = self.inference(1, imgs, mst, Rmw, tmw_scaled, predictions, scale_factor, threshold=threshold)
@@ -2091,25 +2379,125 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 static_baseline_vox = copy.deepcopy(self.vox)
 
 
-            metrics_buffer["chamfer_dist"].append(compute_chamfer_dist(self.vox, self.vox_gt).item())
-            metrics_buffer["baseline_chamfer_dist"].append(compute_chamfer_dist(self.vox_baseline, self.vox_gt).item())
-            metrics_buffer["static_chamfer_dist"].append(compute_chamfer_dist(static_baseline_vox, self.vox_gt).item())
+            if self.cfg.real_gt_voxels_file:
+                metrics_buffer["chamfer_dist"].append(compute_chamfer_dist(self.vox, self.vox_real_gt).item())
+                metrics_buffer["baseline_chamfer_dist"].append(compute_chamfer_dist(self.vox_baseline, self.vox_real_gt).item())
+                metrics_buffer["static_chamfer_dist"].append(compute_chamfer_dist(static_baseline_vox, self.vox_real_gt).item())
+            else:
+                metrics_buffer["chamfer_dist"].append(compute_chamfer_dist(self.vox, self.vox_gt).item())
+                metrics_buffer["baseline_chamfer_dist"].append(compute_chamfer_dist(self.vox_baseline, self.vox_gt).item())
+                metrics_buffer["static_chamfer_dist"].append(compute_chamfer_dist(static_baseline_vox, self.vox_gt).item())
 
 
-
-
+            if self.cfg.real_gt_voxels_file:                   
 
                     
+                # ---------------------------------------------------------
+                # METRICS CALCULATION GT
+                # ---------------------------------------------------------
+
+                logit_pred_before = self.vox_gt.vals_st.clamp(-10.0, 10.0)
+                logit_pred_before = torch.sigmoid(logit_pred_before * 10.0) # Sharp GT
+
+
+
+
+                #NEW
+                #logit_pred_before = (logit_pred_before / 0.75) - 1.0
+
+                if not torch.isfinite(logit_pred_before).all():
+                    logit_pred_before = torch.nan_to_num(logit_pred_before, nan=0.001)
+
+                # 3. Align GT keys to Prediction keys
+                if self.cfg.real_gt_voxels_file:
+                    # 1. Prepare Ground Truth
+                    logit_gt = self.vox_real_gt.vals_st.clamp(-10.0, 10.0)
+                    p_occ_tgt = torch.sigmoid(logit_gt * 10.0) # Sharp GT
+
+
+                    p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys_soft(
+                        self.vox_real_gt, p_occ_tgt, self.vox_gt, default=0.0
+                    )
+
+
+                # 4. Standard IoU Calculation
+                pred_intersect = logit_pred_before[valid_mask]
+                tgt_intersect  = p_occ_tgt_aligned[valid_mask]
+                pred_fp = logit_pred_before[~valid_mask]
+
+                pred_bin_int = (pred_intersect > 0.0) # Logit > 0 is Prob > 0.5
+                tgt_bin_int  = (tgt_intersect  > 0.5)
+
+                tp = (pred_bin_int & tgt_bin_int).sum()
+                fp_int = (pred_bin_int & ~tgt_bin_int).sum()
+                fn = (~pred_bin_int & tgt_bin_int).sum()
+
+                fp_hallucination = (pred_fp > 0.0).sum()
+                total_fp = fp_int + fp_hallucination
+
+                occ_iou = tp / (tp + total_fp + fn + 1e-8)
+                occ_recall = tp / (tp + fn + 1e-8)
+                occ_precision = tp / (tp + total_fp + 1e-8)
+                occ_precision_inter = tp / (tp + fp_int + 1e-8)
+
+                metrics_buffer["gt_occ_iou"].append(occ_iou.item())
+                metrics_buffer["gt_occ_recall"].append(occ_recall.item())
+                metrics_buffer["gt_occ_precision"].append(occ_precision.item())
+                metrics_buffer["gt_occ_precision_inter"].append(occ_precision_inter.item())
+
+                # ---------------------------------------------------------
+                # DYNAMIC METRICS (Model)
+                # ---------------------------------------------------------
+                # Compare Current GT (t) vs Previous GT (t-1)
+                if t > 0 and gt_seq[t-1] is not None:
+                    if self.cfg.real_gt_voxels_file:
+                        vox_gt_prev = self.prev_vox_real_gt
+                        
+
+                        # Align Prev GT to Current Keys
+                        p_occ_prev_aligned, _ = self.align_probs_to_keys_soft(
+                            vox_gt_prev,
+                            torch.sigmoid(vox_gt_prev.vals_st * 10.0),
+                            self.vox_gt,
+                            default=0.0
+                        )
+
+                    # Define Masks
+                    gt_curr = (tgt_intersect > 0.5)
+                    # Note: We align Previous GT to Current Keys, so we use valid_mask of current keys
+                    gt_prev = (p_occ_prev_aligned[valid_mask] > 0.5)
+
+                    mask_appearing    = (~gt_prev & gt_curr)  # Empty -> Occupied
+                    mask_disappearing = (gt_prev & ~gt_curr)  # Occupied -> Empty
+                    mask_dynamic      = (gt_prev != gt_curr)
+
+                    # A. Appearing Recall (Do we see new objects?)
+                    if mask_appearing.sum() > 0:
+                        pred_appearing = (pred_intersect[mask_appearing] > 0.0)
+                        metrics_buffer["gt_dyn_recall_appearing"].append(pred_appearing.float().mean().item())
+
+                    # B. Disappearing / Ghosting (Do we clear old objects?)
+                    if mask_disappearing.sum() > 0:
+                        pred_ghosts = (pred_intersect[mask_disappearing] > 0.0)
+                        metrics_buffer["gt_dyn_ghost_rate"].append(pred_ghosts.float().mean().item())
+                        metrics_buffer["gt_dyn_recall_disappearing"].append((~pred_ghosts).float().mean().item())
+
+                    # C. Dynamic IoU
+                    if mask_dynamic.sum() > 0:
+                        pred_dyn = (pred_intersect[mask_dynamic] > 0.0)
+                        gt_dyn   = gt_curr[mask_dynamic]
+                        intersection = (pred_dyn & gt_dyn).sum()
+                        union        = (pred_dyn | gt_dyn).sum()
+                        metrics_buffer["gt_dyn_iou"].append((intersection / (union + 1e-8)).item())
+
+
+
 
 
             # ---------------------------------------------------------
             # METRICS CALCULATION
             # ---------------------------------------------------------
-            # 1. Prepare Ground Truth
-            logit_gt = self.vox_gt.vals_st.clamp(-10.0, 10.0)
-            p_occ_tgt = torch.sigmoid(logit_gt * 10.0) # Sharp GT
 
-            # 2. Decode Prediction
             logit_pred_before = self.vox.decode_occupancy(with_xyz_cond=False)
 
             #NEW
@@ -2119,9 +2507,25 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 logit_pred_before = torch.nan_to_num(logit_pred_before, nan=0.001)
 
             # 3. Align GT keys to Prediction keys
-            p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys_soft(
-                self.vox_gt, p_occ_tgt, self.vox, default=0.0
-            )
+            if self.cfg.real_gt_voxels_file:
+                print("real gt")
+                # 1. Prepare Ground Truth
+                logit_gt = self.vox_real_gt.vals_st.clamp(-10.0, 10.0)
+                p_occ_tgt = torch.sigmoid(logit_gt * 10.0) # Sharp GT
+
+
+                p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys_soft(
+                    self.vox_real_gt, p_occ_tgt, self.vox, default=0.0
+                )
+            else:
+
+                # 1. Prepare Ground Truth
+                logit_gt = self.vox_gt.vals_st.clamp(-10.0, 10.0)
+                p_occ_tgt = torch.sigmoid(logit_gt * 10.0) # Sharp GT
+
+                p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys_soft(
+                    self.vox_gt, p_occ_tgt, self.vox, default=0.0
+                )
 
             # 4. Standard IoU Calculation
             pred_intersect = logit_pred_before[valid_mask]
@@ -2152,15 +2556,26 @@ class VoxelUpdaterSystem(pl.LightningModule):
             # ---------------------------------------------------------
             # Compare Current GT (t) vs Previous GT (t-1)
             if t > 0 and gt_seq[t-1] is not None:
-                vox_gt_prev = gt_seq[t-1]
+                if self.cfg.real_gt_voxels_file:
+                    vox_gt_prev = self.prev_vox_real_gt
 
-                # Align Prev GT to Current Keys
-                p_occ_prev_aligned, _ = self.align_probs_to_keys_soft(
-                    vox_gt_prev,
-                    torch.sigmoid(vox_gt_prev.vals_st * 10.0),
-                    self.vox,
-                    default=0.0
-                )
+                    # Align Prev GT to Current Keys
+                    p_occ_prev_aligned, _ = self.align_probs_to_keys_soft(
+                        vox_gt_prev,
+                        torch.sigmoid(vox_gt_prev.vals_st * 10.0),
+                        self.vox,
+                        default=0.0
+                    )
+                else:
+                    vox_gt_prev = gt_seq[t-1]
+
+                    # Align Prev GT to Current Keys
+                    p_occ_prev_aligned, _ = self.align_probs_to_keys_soft(
+                        vox_gt_prev,
+                        torch.sigmoid(vox_gt_prev.vals_st * 10.0),
+                        self.vox,
+                        default=0.0
+                    )
 
                 # Define Masks
                 gt_curr = (tgt_intersect > 0.5)
@@ -2199,10 +2614,29 @@ class VoxelUpdaterSystem(pl.LightningModule):
             # 1. Decode Baseline (Log-Odds directly)
             logit_base = self.vox_baseline._display_vals().clamp(-10.0, 10.0)
             
-            # 2. Align GT keys to Baseline Keys
-            p_occ_tgt_base_aligned, valid_mask_base = self.align_probs_to_keys_soft(
-                 self.vox_gt, p_occ_tgt, self.vox_baseline, default=0.0
-            )
+
+
+            # 3. Align GT keys to Prediction keys
+            if self.cfg.real_gt_voxels_file:
+                # 1. Prepare Ground Truth
+                logit_gt = self.vox_real_gt.vals_st.clamp(-10.0, 10.0)
+                p_occ_tgt = torch.sigmoid(logit_gt * 10.0) # Sharp GT
+
+
+                p_occ_tgt_base_aligned, valid_mask_base = self.align_probs_to_keys_soft(
+                    self.vox_real_gt, p_occ_tgt, self.vox_baseline, default=0.0
+                )
+            else:
+
+                # 1. Prepare Ground Truth
+                logit_gt = self.vox_gt.vals_st.clamp(-10.0, 10.0)
+                p_occ_tgt = torch.sigmoid(logit_gt * 10.0) # Sharp GT
+
+                p_occ_tgt_base_aligned, valid_mask_base = self.align_probs_to_keys_soft(
+                    self.vox_gt, p_occ_tgt, self.vox_baseline, default=0.0
+                )
+
+ 
             
             # 3. Intersection Logic
             base_intersect = logit_base[valid_mask_base]
@@ -2235,12 +2669,28 @@ class VoxelUpdaterSystem(pl.LightningModule):
             if t > 0 and gt_seq[t-1] is not None:
                 # 1. Align Previous GT to Baseline's current keys
                 # (We need to see what the baseline "sees" relative to what changed in GT)
-                p_occ_prev_base_aligned, _ = self.align_probs_to_keys_soft(
-                    vox_gt_prev, 
-                    torch.sigmoid(vox_gt_prev.vals_st * 10.0), 
-                    self.vox_baseline, 
-                    default=0.0
-                )
+                if self.cfg.real_gt_voxels_file:
+                    vox_gt_prev = self.prev_vox_real_gt
+
+
+                    # Align Prev GT to Current Keys
+                    p_occ_prev_base_aligned, _ = self.align_probs_to_keys_soft(
+                        vox_gt_prev,
+                        torch.sigmoid(vox_gt_prev.vals_st * 10.0),
+                        self.vox_baseline,
+                        default=0.0
+                    )
+                else:
+                    vox_gt_prev = gt_seq[t-1]
+
+                    # Align Prev GT to Current Keys
+                    p_occ_prev_base_aligned, _ = self.align_probs_to_keys_soft(
+                        vox_gt_prev,
+                        torch.sigmoid(vox_gt_prev.vals_st * 10.0),
+                        self.vox_baseline,
+                        default=0.0
+                    )
+
 
                 # 2. Define Dynamic Masks for Baseline spatial context
                 # Use the aligned current GT from the baseline intersection logic above
@@ -2278,10 +2728,6 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
             # ---------------------------------------------------------
             # METRICS CALCULATION (STATIC)
-            # 1. Prepare Ground Truth
-            logit_gt = self.vox_gt.vals_st.clamp(-10.0, 10.0)
-            p_occ_tgt = torch.sigmoid(logit_gt * 10.0) # Sharp GT
-
 
 
             # 2. Decode Prediction
@@ -2295,9 +2741,29 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 static_logit_pred_before = torch.nan_to_num(static_logit_pred_before, nan=0.001)
 
             # 3. Align GT keys to Prediction keys
-            static_p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys_soft(
-                self.vox_gt, p_occ_tgt, static_baseline_vox, default=0.0
-            )
+            if self.cfg.real_gt_voxels_file:
+                # 1. Prepare Ground Truth
+                logit_gt = self.vox_real_gt.vals_st.clamp(-10.0, 10.0)
+                p_occ_tgt = torch.sigmoid(logit_gt * 10.0) # Sharp GT
+
+
+                static_p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys_soft(
+                    self.vox_real_gt, p_occ_tgt, static_baseline_vox, default=0.0
+                )
+
+            else:
+
+                # 1. Prepare Ground Truth
+                logit_gt = self.vox_gt.vals_st.clamp(-10.0, 10.0)
+                p_occ_tgt = torch.sigmoid(logit_gt * 10.0) # Sharp GT
+
+                static_p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys_soft(
+                    self.vox_gt, p_occ_tgt, static_baseline_vox, default=0.0
+                )
+
+ 
+            
+ 
 
             # 4. Standard IoU Calculation
             pred_intersect = static_logit_pred_before[valid_mask]
@@ -2329,16 +2795,28 @@ class VoxelUpdaterSystem(pl.LightningModule):
             # ---------------------------------------------------------
             # Compare Current GT (t) vs Previous GT (t-1)
             if t > 0 and gt_seq[t-1] is not None:
-                vox_gt_prev = gt_seq[t-1]
 
-                # Align Prev GT to Current Keys
-                p_occ_prev_aligned, _ = self.align_probs_to_keys_soft(
-                    vox_gt_prev,
-                    torch.sigmoid(vox_gt_prev.vals_st * 10.0),
-                    static_baseline_vox,
-                    default=0.0
-                )
+                if self.cfg.real_gt_voxels_file:
+                    vox_gt_prev = self.prev_vox_real_gt
 
+
+                    # Align Prev GT to Current Keys
+                    p_occ_prev_aligned, _ = self.align_probs_to_keys_soft(
+                        vox_gt_prev,
+                        torch.sigmoid(vox_gt_prev.vals_st * 10.0),
+                        static_baseline_vox,
+                        default=0.0
+                    )
+                else:
+                    vox_gt_prev = gt_seq[t-1]
+
+                    # Align Prev GT to Current Keys
+                    p_occ_prev_aligned, _ = self.align_probs_to_keys_soft(
+                        vox_gt_prev,
+                        torch.sigmoid(vox_gt_prev.vals_st * 10.0),
+                        static_baseline_vox,
+                        default=0.0
+                    )
                 # Define Masks
                 gt_curr = (tgt_intersect > 0.5)
                 # Note: We align Previous GT to Current Keys, so we use valid_mask of current keys
@@ -2426,6 +2904,13 @@ class VoxelUpdaterSystem(pl.LightningModule):
         # --- FINAL SUMMARY PRINT ---
         print("-" * 60)
         print(f"SEQUENCE REPORT: {seq_id}")
+        if self.cfg.real_gt_voxels_file:                   
+            print("-" * 60)
+            print(f"  GT Metrics:")
+            print(f"    IoU:                 {self.get_avg(metrics_buffer, 'gt_occ_iou'):.4f}")
+            print(f"    Recall:              {self.get_avg(metrics_buffer, 'gt_occ_recall'):.4f}")
+            print(f"    Precision:           {self.get_avg(metrics_buffer, 'gt_occ_precision'):.4f}")
+            
         print("-" * 60)
         print(f"  MODEL Metrics:")
         print(f"    IoU:                 {self.get_avg(metrics_buffer, 'occ_iou'):.4f}")
@@ -2441,8 +2926,15 @@ class VoxelUpdaterSystem(pl.LightningModule):
         print(f"    IoU:                 {self.get_avg(metrics_buffer, 'static_occ_iou'):.4f}")
         print(f"    Recall:              {self.get_avg(metrics_buffer, 'static_occ_recall'):.4f}")
         print(f"    Precision:           {self.get_avg(metrics_buffer, 'static_occ_precision'):.4f}")
-        print("-" * 60)
-        print(f"  Dynamic Metrics (Changes Only):")
+        if self.cfg.real_gt_voxels_file:                   
+            print("-" * 60)
+            print(f"  Dynamic Metrics GT (Changes Only):")
+            print(f"    Dynamic IoU:         {self.get_avg(metrics_buffer, 'gt_dyn_iou'):.4f}")
+            print(f"    Appearing Recall:    {self.get_avg(metrics_buffer, 'gt_dyn_recall_appearing'):.4f}  (High = Fast reaction to new objects)")
+            print(f"    Disappearing Recall: {self.get_avg(metrics_buffer, 'gt_dyn_recall_disappearing'):.4f}  (High = Good cleanup)")
+            print(f"    Ghost Rate:          {self.get_avg(metrics_buffer, 'gt_dyn_ghost_rate'):.4f}  (High = Objects leave trails)")
+            print("-" * 60)
+        print(f"  Dynamic Metrics Model (Changes Only):")
         print(f"    Dynamic IoU:         {self.get_avg(metrics_buffer, 'dyn_iou'):.4f}")
         print(f"    Appearing Recall:    {self.get_avg(metrics_buffer, 'dyn_recall_appearing'):.4f}  (High = Fast reaction to new objects)")
         print(f"    Disappearing Recall: {self.get_avg(metrics_buffer, 'dyn_recall_disappearing'):.4f}  (High = Good cleanup)")
@@ -2937,6 +3429,26 @@ class VoxelUpdaterSystem(pl.LightningModule):
             )
 
 
+        if self.cfg.real_gt_voxels_file:
+            # GT uses vals_st directly
+            mask_real = self.vox_real_gt.occupied_mask()
+
+            if mask_real.any():
+                # Get centers of occupied GT voxels
+                centers_real = self.vox_real_gt.voxel_centers()[mask_real].detach().cpu().numpy()
+
+                # Create Green colors (0, 255, 0)
+                colors_real = np.zeros_like(centers_real)
+                colors_real[:, 1] = 255
+
+                self._write_ply(
+                    os.path.join(save_dir, f"step_{step_idx}_real_gt.ply"),
+                    centers_real,
+                    colors_real
+                )
+
+
+
         # -----------------------------
         # 2. Export Prediction (Red)
         # -----------------------------
@@ -3236,7 +3748,8 @@ class HabitatSeqDataset(Dataset):
                 continue
 
             
-            if t > 120:
+            if t > 10:
+            #if t > 120:
                 break
 
             imgs = self._load_timestep(td)
@@ -3368,13 +3881,23 @@ def main():
         # dataset_root="/Users/marvin/Documents/Thesis/repo/dataset_generation/habitat/",
         #dataset_root="/home/mpk40/Documents/data/",
         #dataset_root="/cluster/scratch/kochmar/renders/",
-        dataset_root="/cluster/scratch/kochmar/eval_train/",
+        #dataset_root="/cluster/scratch/kochmar/eval_train/",
+        dataset_root="/cluster/scratch/kochmar/hm3d_gt_2/",
+
+        real_gt_voxels_file="hm3d_voxels_2",
+
         #gt_voxels_file="gt_voxels_per_timestep_new",
-        gt_voxels_file="gt_voxels_per_timestep_new_3",
+        #gt_voxels_file="gt_voxels_per_timestep_new_3",
+        gt_voxels_file="gt_voxels_per_timestep_new",
+
         #precomputed_cache_file="precomputed_cache",
-        precomputed_cache_file="precomputed_cache_2",
+        #precomputed_cache_file="precomputed_cache_2",
+        precomputed_cache_file="precomputed_cache",
+
         #pose_file="gt_poses_new",
-        pose_file="gt_poses_new_3",
+        #pose_file="gt_poses_new_3",
+        pose_file="gt_poses_new",
+
         seq_file="seq_manifest.json",
         voxel_size=0.2,
         radius_m=1,
