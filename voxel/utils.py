@@ -1406,6 +1406,86 @@ def build_maps_from_points_and_centers_torch(
 
 def build_maps_from_latent_features(
     i,
+    frames_xyz: list[np.ndarray],
+    conf_map: list[np.ndarray],
+    features: list[np.ndarray],
+    camera_centers: list[np.ndarray],
+    tvox,
+    *,
+    voxel_size: float = 0.10,
+    bev_window_m=(20.0, 20.0),
+    bev_origin_xy=(-10.0, -10.0),
+    z_clip_vox=(-np.inf, np.inf),
+    z_band_bev=(0.05, 1.80),
+    device: str = "cpu",
+    batch_chunk_points: int = 500000,
+    frame_ids: Optional[torch.Tensor] = None,
+    radius=0.25,
+):
+    # Setup internal timers
+    def get_event():
+        return torch.cuda.Event(enable_timing=True)
+
+    sub_events = {k: (get_event(), get_event()) for k in ["prep_data", "phantom_gen", "voxel_update", "bev_proj"]}
+
+    sub_events["prep_data"][0].record()
+    if frame_ids is not None:
+        pts = frames_xyz[0]
+        CONF_all = conf_map[0]
+        cameras = camera_centers[0][frame_ids]
+        F_all = features[0]
+        keep = torch.isfinite(pts).all(dim=1) & torch.isfinite(cameras).all(dim=1) & torch.isfinite(CONF_all)
+        pts = pts[keep]
+        CONF_all = CONF_all[keep]
+        fts = F_all[keep]
+        cameras = cameras[keep]
+    sub_events["prep_data"][1].record()
+
+    if i == 0:
+        sub_events["voxel_update"][0].record()
+        tvox.initialize_latents_from_full_cloud(pts_world=pts, f_pts=fts, cam_centers=cameras)
+        sub_events["voxel_update"][1].record()
+    else:
+        sub_events["phantom_gen"][0].record()
+        # Potential bottleneck: Generating 5 samples per point
+        pts_phantom, feats_phantom = tvox.generate_phantom_points(cameras, pts, n_samples=5)
+        pts_total = torch.cat([pts, pts_phantom], dim=0)
+        feats_total = torch.cat([fts, feats_phantom], dim=0)
+        sub_events["phantom_gen"][1].record()
+
+        sub_events["voxel_update"][0].record()
+        m = pts_total.shape[0]
+        for s in range(0, m, batch_chunk_points):
+            e = min(s + batch_chunk_points, m)
+            tvox.update_with_features(pts_total[s:e], feats_total[s:e], radius=radius)
+        sub_events["voxel_update"][1].record()
+
+    sub_events["bev_proj"][0].record()
+    x0, y0 = float(bev_origin_xy[0]), float(bev_origin_xy[1])
+    W_m, H_m = float(bev_window_m[0]), float(bev_window_m[1])
+    bev, meta = tvox.to_bev(
+        x_range=(x0, x0 + W_m), y_range=(y0, y0 + H_m),
+        res_xy=float(voxel_size), z_min=float(z_band_bev[0]), z_max=float(z_band_bev[1]),
+        vis_mode="motion",
+    )
+    sub_events["bev_proj"][1].record()
+
+    # --- Print Sub-Breakdown ---
+    torch.cuda.synchronize()  # Wait for GPU to finish
+    print(f"    [Internal build_maps Breakdown]")
+    for name, (start, end) in sub_events.items():
+        # query() returns True if the event was recorded
+        if start.query() and end.query():
+            try:
+                ms = start.elapsed_time(end)
+                print(f"      {name:15}: {ms:8.2f} ms")
+            except Exception as e:
+                # Fallback in case of race conditions
+                pass
+    return tvox, bev, meta
+
+def build_maps_from_latent_featuresOG(
+    i,
     frames_xyz: list[np.ndarray],          # list of (N_i,3) in MAP frame
     conf_map: list[np.ndarray],         
     features: list[np.ndarray],

@@ -55,12 +55,20 @@ from sklearn.decomposition import PCA
 
 import matplotlib.pyplot as plt
 import PIL
+import copy
 
 # Add this to your imports in train.py
 from pytorch3d.ops import knn_points
 
+from sklearn.manifold import TSNE
+try:
+    import umap
+    HAS_UMAP = True
+except ImportError:
+    HAS_UMAP = False
 
-STEP = 20
+
+STEP = 1
 
 def load_sparse_voxel_grid(path, device):
     data = np.load(path)
@@ -137,8 +145,8 @@ class TrainConfig:
     teacher_beam_every_t: bool = True  # run teacher for every timestep (offline precomputed if possible)
     skip: bool = False
     
-    n_accum: int = 4               # gradient accumulation steps
-    #n_accum: int = 1               # gradient accumulation steps
+    #n_accum: int = 4               # gradient accumulation steps
+    n_accum: int = 1               # gradient accumulation steps
     stride: int = 4               # ray stride for voxel supervision
 
 
@@ -267,14 +275,143 @@ class VoxelUpdaterSystem(pl.LightningModule):
         return proj
     
 
-    def inference(self, i, imgs, mst, Rmw=None, tmw=None, predictions=None, scale_factor=None):
+    def inference(self, i, imgs, mst, Rmw=None, tmw=None, predictions=None, scale_factor=None, threshold=1.0):
+        # --- GPU Timer Setup ---
+        def get_event():
+            return torch.cuda.Event(enable_timing=True)
+
+        events = {k: (get_event(), get_event()) for k in [
+            "prep_images", "dust3r_recon", "change_detection",
+            "alignment", "voxel_building"
+        ]}
+
+        POINTS = "world_points"
+        CONF = "world_points_conf"
+        z_clip_map = (-3.0, 3.0)
+
+        R_w2m = np.array([[0, 0, -1], [-1, 0, 0], [0, -1, 0]], dtype=np.float32)
+        t_w2m = np.zeros(3, dtype=np.float32)
+        R_w2m = to_torch(R_w2m, device=self.device)
+        t_w2m = to_torch(t_w2m, device=self.device)
+
+        if predictions is None:
+            events["prep_images"][0].record() # Start Prep
+            image_tensors = []
+            for d in imgs:
+                t = d["img"]
+                if t.ndim == 4 and t.shape[0] == 1: t = t[0]
+                t = t.detach().cpu().float()
+                if t.max() > 1.0: t = t / 255.0
+                image_tensors.append(t.clamp(0,1))
+            image_tensors = torch.stack(image_tensors, dim=0).to(self.device)
+            events["prep_images"][1].record() # End Prep
+
+            if i < 1:
+                events["dust3r_recon"][0].record()
+                predictions = get_reconstructed_scene_no_opt(
+                    i, ".", imgs, self.model, self.device, False, 512, "", "linear",
+                    50, 1, True, False, True, False, 0.05, "oneref", 1, 0,
+                    projector=self.projector
+                )
+                self.keyframes = image_tensors.clone()
+                events["dust3r_recon"][1].record()
+            else:
+                events["change_detection"][0].record()
+                changed_idx = changed_images(image_tensors, self.keyframes, thresh=0.000005)
+                events["change_detection"][1].record()
+
+                if len(changed_idx) < 2:
+                    return None, None, None, None
+
+                changed_idx = [0] + [x for x in changed_idx if x != 0]
+                idx_t = torch.tensor(changed_idx, device=self.device, dtype=torch.long)
+                self.keyframes.index_copy_(0, idx_t, image_tensors.index_select(0, idx_t))
+
+                events["dust3r_recon"][0].record()
+                mst = True
+                predictions = get_reconstructed_scene_no_opt(
+                    i, ".", imgs, self.model, self.device, False, 512, "", "linear",
+                    50, 1, True, False, True, False, 0.05, "oneref", 1, 0,
+                    changed_gids=changed_idx, projector=self.projector
+                )
+                events["dust3r_recon"][1].record()
+
+            # Early cleanup of heavy prediction keys
+            needed = {"images", "extrinsic", POINTS, CONF, "view_feats"}
+            for k in list(predictions.keys()):
+                if k not in needed: del predictions[k]
+
+        # --- Transformation & Filtering ---
+        events["alignment"][0].record()
+        camera_R = Rmw @ R_w2m
+        camera_t = t_w2m + tmw
+        z_clip_map = (scale_factor * z_clip_map[0], scale_factor * z_clip_map[1])
+
+        frames_map, conf_map, images_map, features_map, camera_centers, (S,H,W), frame_ids = filter_frames(
+            predictions, POINTS=POINTS, CONF=CONF, FEAT="view_feats",
+            threshold=threshold, Rmw=camera_R, tmw=camera_t, z_clip_map=z_clip_map,
+        )
+        events["alignment"][1].record()
+
+        # --- Map Building (Deep Dive) ---
+        v_events = {k: (get_event(), get_event()) for k in [
+            "latent_aggregation", "sparse_insertion", "bev_generation"
+        ]}
+        v_events["latent_aggregation"][0].record()
+        # This function likely does the heavy lifting:
+        # project-and-pool features from 2D maps into 3D space
+        vox, bev, meta = build_maps_from_latent_features(
+            i,
+            frames_map,
+            conf_map,
+            features_map,
+            camera_centers,
+            self.vox,
+            voxel_size=self.voxel_size,
+            bev_window_m=self.bev_window_m,
+            bev_origin_xy=self.bev_origin_xy,
+            z_clip_vox=(-np.inf, np.inf),
+            z_band_bev=(self.z_band_bev[0], self.z_band_bev[1]),
+            frame_ids=frame_ids,
+            radius=self.cfg.radius_m,
+        )
+        v_events["latent_aggregation"][1].record()
+
+        self.vox = vox
+        events["voxel_building"][1].record()
+
+        # --- Report Granular Voxel Stats ---
+        torch.cuda.synchronize()
+        print(f"  [Voxel Breakdown]")
+        for name, (start, end) in v_events.items():
+            try:
+                ms = start.elapsed_time(end)
+                if ms > 0: print(f"    {name:20}: {ms:8.2f} ms")
+            except: pass
+
+        # --- Summary Timing ---
+        torch.cuda.synchronize() # Wait for all GPU work to finish
+        print(f"\n[Inference {i} Profiling]")
+        for name, (start, end) in events.items():
+            # Check if events were actually recorded (e.g. change detection might be skipped at i=0)
+            try:
+                ms = start.elapsed_time(end)
+                if ms > 0:
+                    print(f"  {name:20}: {ms:8.2f} ms")
+            except: pass
+        print("-" * 35)
+
+        del predictions, frames_map, conf_map, images_map, features_map
+        return bev, mst, Rmw, tmw
+
+    def inferenceOG(self, i, imgs, mst, Rmw=None, tmw=None, predictions=None, scale_factor=None, threshold=1.0):
 
 
         POINTS = "world_points"
         CONF = "world_points_conf"
-        threshold = 1.0 
         #threshold = 2.0 
-        threshold = 50.0 
+        #threshold = 50.0 
+
         z_clip_map = (-3.0, 3.0)  
 
         R_w2m = np.array([[0, 0, -1],
@@ -469,7 +606,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
         return bev, mst, Rmw, tmw
     
-    def run_baseline_inference(self, predictions, baseline_vox, Rmw=None, tmw=None, scale_factor=1.0, threshold=60.0):
+    def run_baseline_inference(self, predictions, Rmw=None, tmw=None, scale_factor=1.0, threshold=50.0):
         """
         Runs the baseline reconstruction pipeline (Ray carving/Integration) on the provided predictions.
         Matches the logic in test_voxel_dust3r_fast_no_opt.py
@@ -480,7 +617,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
         # Standard rotation to camera frame
         R_w2m = np.array([[0, 0, -1],
-                        [-1, 0, 0],
+                        [1, 0, 0],
                         [0, -1, 0]], dtype=np.float32)
         t_w2m = np.zeros(3, dtype=np.float32)
 
@@ -511,7 +648,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
             frames_xyz=frames_map,
             cam_centers=cam_centers_map,
             conf_map=conf_map,
-            tvox=baseline_vox,
+            tvox=self.vox_baseline,
             align_to_voxel=False,
             voxel_size=self.voxel_size,
             bev_window_m=self.bev_window_m,
@@ -520,14 +657,16 @@ class VoxelUpdaterSystem(pl.LightningModule):
             z_band_bev=(self.z_band_bev[0], self.z_band_bev[1]),
             max_range_m=None,
             carve_free=True,
-            samples_per_voxel=2.0, #0.7,
+            samples_per_voxel=0.7, #0.7,
             ray_stride=4,
             max_free_rays=10000,
             frame_ids=frame_ids,
             device=self.device
         )
 
-        baseline_vox.next_epoch()
+        self.vox_baseline = vox
+
+        self.vox_baseline.next_epoch()
 
         return bev, meta
   
@@ -928,10 +1067,12 @@ class VoxelUpdaterSystem(pl.LightningModule):
             predictions["view_feats"] = projected_feats_map
             del projected_feats_map
         
+            threshold = 50.0
             if not mst and t != 0:
-                bev, mst, _, _ = self.inference(1, imgs, mst, Rmw, tmw_scaled, predictions, scale_factor)
+                bev, mst, _, _ = self.inference(1, imgs, mst, Rmw, tmw_scaled, predictions, scale_factor, threshold=threshold)
             else:
-                bev, mst, _, _ = self.inference(t, imgs, mst, Rmw, tmw_scaled, predictions, scale_factor)
+                bev, mst, _, _ = self.inference(t, imgs, mst, Rmw, tmw_scaled, predictions, scale_factor, threshold=threshold)
+
         
             #with autocast(enabled=False):
             # (D) decode current occupancy
@@ -1048,14 +1189,14 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
                     # Boost "Appearing" slightly more to ensure we catch the jump
                     #weights[appearing_mask] *= 20.0
-                    weights[appearing_mask] = 50.0
+                    weights[appearing_mask] = 20.0
 
                     # (Total weight = pos_weight * 5.0 = 250ish)
 
                     # Boost "Disappearing" MASSIVELY to fix Precision/Ghosting
                     # Since the base weight was 1.0, we need to multiply it by pos_weight * 5
                     # to match the importance of the appearing objects.
-                    weights[disappearing_mask] = 50.0
+                    weights[disappearing_mask] = 20.0
                     # (Total weight = 250ish)
 
                     # 4. Calculate Loss
@@ -1447,13 +1588,16 @@ class VoxelUpdaterSystem(pl.LightningModule):
             predictions["view_feats"] = projected_feats_map
             del projected_feats_map
             
+
+
+            threshold = 50.0
             with torch.enable_grad(): # (Keep grad enabled for inference/update parts if needed by model)
                 if not mst and t != 0:
-                    bev, mst, _, _ = self.inference(1, imgs, mst, Rmw, tmw_scaled, predictions, scale_factor)
+                    bev, mst, _, _ = self.inference(1, imgs, mst, Rmw, tmw_scaled, predictions, scale_factor, threshold=threshold)
                 else:
-                    bev, mst, _, _ = self.inference(t, imgs, mst, Rmw, tmw_scaled, predictions, scale_factor)
-            
+                    bev, mst, _, _ = self.inference(t, imgs, mst, Rmw, tmw_scaled, predictions, scale_factor, threshold=threshold)
 
+        
             # Validation Loss Calculation (No Autocast needed strictly, but good for consistency)
             # with autocast(enabled=False):
             # p_occ_tgt = torch.sigmoid(self.vox_gt.vals_st)
@@ -1577,11 +1721,13 @@ class VoxelUpdaterSystem(pl.LightningModule):
             self.vox.z_latent = self.vox.z_latent.detach()
             torch.cuda.empty_cache()
             
+            """
             save_dir = "debug_viz_val"
             os.makedirs(save_dir, exist_ok=True)
             fname = f"{save_dir}/step_{t}.ply"
             self.export_debug_ply(fname, t)
             self.export_separated_ply(t, save_dir="debug_viz_val")
+            """
 
 
         # Average over sequence
@@ -1603,7 +1749,34 @@ class VoxelUpdaterSystem(pl.LightningModule):
     
 
     def predict_step(self, batch: Dict, batch_idx: int, dataloader_idx: int = 0, step=1):
+        from pytorch3d.ops import knn_points
+
+        def compute_chamfer_dist(vox_pred, vox_gt):
+            """
+            Measures the average distance (in meters) between occupied voxels.
+            """
+            # 1. Get centers of occupied voxels
+            mask_p = vox_pred.occupied_mask()
+            mask_g = vox_gt.occupied_mask()
+
+            if not mask_p.any() or not mask_g.any():
+                return torch.tensor(0.0, device=vox_pred.device)
+
+            # Use voxel_centers() helper from your classes
+            centers_p = vox_pred.voxel_centers()[mask_p].unsqueeze(0) # (1, N, 3)
+            centers_g = vox_gt.voxel_centers()[mask_g].unsqueeze(0) # (1, M, 3)
+
+            # 2. Bidirectional Nearest Neighbors
+            # dists are squared Euclidean distances
+            dist_p_to_g, _, _ = knn_points(centers_p, centers_g, K=1)
+            dist_g_to_p, _, _ = knn_points(centers_g, centers_p, K=1)
+
+            # 3. Mean distance in meters
+            chamfer = (torch.sqrt(dist_p_to_g).mean() + torch.sqrt(dist_g_to_p).mean()) / 2.0
+            return chamfer
+
         device = self.device
+
 
         self.vox.reset_state()
         self.vox = self.vox.to(self.device)
@@ -1617,13 +1790,15 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
         self.vox_baseline = TorchSparseVoxelGrid(
             origin_xyz=np.zeros(3, dtype=np.float32),
-            params=VoxelParams(voxel_size=self.voxel_size, promote_hits=2),
+            params=VoxelParams(voxel_size=self.voxel_size, promote_epochs=2),
             device=self.device
         )
 
         # Buffers for temporal consistency
         self._prev_keys = None
         self._prev_probs = None
+
+        threshold = 1.0
 
         # --- METRICS BUFFER ---
         # Initialize all keys so get_avg doesn't crash if a sequence has no dynamic events
@@ -1638,10 +1813,31 @@ class VoxelUpdaterSystem(pl.LightningModule):
             "baseline_occ_precision_inter": [],
             "baseline_occ_recall": [],
 
+            "static_occ_iou": [],
+            "static_occ_precision": [],
+            "static_occ_precision_inter": [],
+            "static_occ_recall": [],
+
             "dyn_iou": [],
             "dyn_recall_appearing": [],
             "dyn_recall_disappearing": [],
-            "dyn_ghost_rate": []
+            "dyn_ghost_rate": [],
+
+
+            "baseline_dyn_iou": [],
+            "baseline_dyn_recall_appearing": [],
+            "baseline_dyn_recall_disappearing": [],
+            "baseline_dyn_ghost_rate": [],
+
+            "static_dyn_iou": [],
+            "static_dyn_recall_appearing": [],
+            "static_dyn_recall_disappearing": [],
+            "static_dyn_ghost_rate": [],
+
+
+            "chamfer_dist": [],
+            "static_chamfer_dist": [],
+            "baseline_chamfer_dist": [],
         }
 
         T = batch["timesteps"]
@@ -1754,11 +1950,10 @@ class VoxelUpdaterSystem(pl.LightningModule):
         with torch.no_grad():
              bev_base, meta_base = self.run_baseline_inference(
                  predictions,
-                 self.vox_baseline,
                  Rmw,
                  tmw_scaled,
                  scale_factor,
-                 threshold=50.0 # Or use config threshold
+                 threshold=threshold # Or use config threshold
              )
 
 
@@ -1771,6 +1966,9 @@ class VoxelUpdaterSystem(pl.LightningModule):
         t_end_base   = torch.cuda.Event(enable_timing=True)
         
         prev_probs = None
+        latent_history, coord_history, prob_history, gt_history = [], [], [], []
+
+        static_baseline_vox = None
         for t in range(T):
             # print(f"Step {t}...")
 
@@ -1853,9 +2051,9 @@ class VoxelUpdaterSystem(pl.LightningModule):
             t_start_inf.record()
             with torch.enable_grad():
                 if not mst and t != 0:
-                    bev, mst, _, _ = self.inference(1, imgs, mst, Rmw, tmw_scaled, predictions, scale_factor)
+                    bev, mst, _, _ = self.inference(1, imgs, mst, Rmw, tmw_scaled, predictions, scale_factor, threshold=threshold)
                 else:
-                    bev, mst, _, _ = self.inference(t, imgs, mst, Rmw, tmw_scaled, predictions, scale_factor)
+                    bev, mst, _, _ = self.inference(t, imgs, mst, Rmw, tmw_scaled, predictions, scale_factor, threshold=threshold)
             
             t_end_inf.record()     
                    
@@ -1864,11 +2062,10 @@ class VoxelUpdaterSystem(pl.LightningModule):
             with torch.no_grad():
                  bev_base, meta_base = self.run_baseline_inference(
                      predictions,
-                     self.vox_baseline,
                      Rmw,
                      tmw_scaled,
                      scale_factor,
-                     threshold=50.0 # Or use config threshold
+                     threshold=threshold
                  )
                  
             t_end_base.record()           
@@ -1889,6 +2086,19 @@ class VoxelUpdaterSystem(pl.LightningModule):
             print(f"  Base Inference Only:  {ms_base:.2f} ms")
             print(f"  >> TOTAL MODEL:       {total_model_time:.2f} ms")
             print(f"  >> TOTAL BASELINE:    {total_baseline_time:.2f} ms")
+
+            if t == 0:
+                static_baseline_vox = copy.deepcopy(self.vox)
+
+
+            metrics_buffer["chamfer_dist"].append(compute_chamfer_dist(self.vox, self.vox_gt).item())
+            metrics_buffer["baseline_chamfer_dist"].append(compute_chamfer_dist(self.vox_baseline, self.vox_gt).item())
+            metrics_buffer["static_chamfer_dist"].append(compute_chamfer_dist(static_baseline_vox, self.vox_gt).item())
+
+
+
+
+
                     
 
 
@@ -1901,6 +2111,10 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
             # 2. Decode Prediction
             logit_pred_before = self.vox.decode_occupancy(with_xyz_cond=False)
+
+            #NEW
+            #logit_pred_before = (logit_pred_before / 0.75) - 1.0
+
             if not torch.isfinite(logit_pred_before).all():
                 logit_pred_before = torch.nan_to_num(logit_pred_before, nan=0.001)
 
@@ -1933,48 +2147,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
             metrics_buffer["occ_recall"].append(occ_recall.item())
             metrics_buffer["occ_precision"].append(occ_precision.item())
             metrics_buffer["occ_precision_inter"].append(occ_precision_inter.item())
-
             # ---------------------------------------------------------
-            # METRICS CALCULATION (BASELINE)
-            # ---------------------------------------------------------
-            
-            # 1. Decode Baseline (Log-Odds directly)
-            logit_base = self.vox_baseline._display_vals().clamp(-10.0, 10.0)
-            
-            # 2. Align GT keys to Baseline Keys
-            p_occ_tgt_base_aligned, valid_mask_base = self.align_probs_to_keys_soft(
-                 self.vox_gt, p_occ_tgt, self.vox_baseline, default=0.0
-            )
-            
-            # 3. Intersection Logic
-            base_intersect = logit_base[valid_mask_base]
-            tgt_intersect_base = p_occ_tgt_base_aligned[valid_mask_base]
-            base_fp = logit_base[~valid_mask_base]
-            
-            # Threshold: > 0.0 log-odds (0.5 prob) or use self.p.occ_thresh
-            base_bin_int = (base_intersect > self.vox_baseline.p.occ_thresh)
-            tgt_bin_base = (tgt_intersect_base > 0.5)
-            
-            tp_base = (base_bin_int & tgt_bin_base).sum()
-            fp_int_base = (base_bin_int & ~tgt_bin_base).sum()
-            fn_base = (~base_bin_int & tgt_bin_base).sum()
-            
-            fp_hallucination_base = (base_fp > self.vox_baseline.p.occ_thresh).sum()
-            total_fp_base = fp_int_base + fp_hallucination_base
-            
-            base_iou = tp_base / (tp_base + total_fp_base + fn_base + 1e-8)
-            base_recall = tp_base / (tp_base + fn_base + 1e-8)
-            base_precision = tp_base / (tp_base + total_fp_base + 1e-8)
-            base_precision_inter = tp_base / (tp_base + fp_int_base + 1e-8)
-
-            metrics_buffer["baseline_occ_iou"].append(base_iou.item())
-            metrics_buffer["baseline_occ_recall"].append(base_recall.item())
-            metrics_buffer["baseline_occ_precision"].append(base_precision.item())
-            metrics_buffer["baseline_occ_precision_inter"].append(base_precision_inter.item())
-
-
-            # ---------------------------------------------------------
-            # DYNAMIC METRICS (The New Part)
+            # DYNAMIC METRICS (Model)
             # ---------------------------------------------------------
             # Compare Current GT (t) vs Previous GT (t-1)
             if t > 0 and gt_seq[t-1] is not None:
@@ -2016,6 +2190,187 @@ class VoxelUpdaterSystem(pl.LightningModule):
                     union        = (pred_dyn | gt_dyn).sum()
                     metrics_buffer["dyn_iou"].append((intersection / (union + 1e-8)).item())
 
+
+
+            # ---------------------------------------------------------
+            # METRICS CALCULATION (BASELINE)
+            # ---------------------------------------------------------
+            
+            # 1. Decode Baseline (Log-Odds directly)
+            logit_base = self.vox_baseline._display_vals().clamp(-10.0, 10.0)
+            
+            # 2. Align GT keys to Baseline Keys
+            p_occ_tgt_base_aligned, valid_mask_base = self.align_probs_to_keys_soft(
+                 self.vox_gt, p_occ_tgt, self.vox_baseline, default=0.0
+            )
+            
+            # 3. Intersection Logic
+            base_intersect = logit_base[valid_mask_base]
+            tgt_intersect_base = p_occ_tgt_base_aligned[valid_mask_base]
+            base_fp = logit_base[~valid_mask_base]
+            
+            # Threshold: > 0.0 log-odds (0.5 prob) or use self.p.occ_thresh
+            base_bin_int = (base_intersect > self.vox_baseline.p.occ_thresh)
+            tgt_bin_base = (tgt_intersect_base > 0.5)
+            
+            tp_base = (base_bin_int & tgt_bin_base).sum()
+            fp_int_base = (base_bin_int & ~tgt_bin_base).sum()
+            fn_base = (~base_bin_int & tgt_bin_base).sum()
+            
+            fp_hallucination_base = (base_fp > self.vox_baseline.p.occ_thresh).sum()
+            total_fp_base = fp_int_base + fp_hallucination_base
+            
+            base_iou = tp_base / (tp_base + total_fp_base + fn_base + 1e-8)
+            base_recall = tp_base / (tp_base + fn_base + 1e-8)
+            base_precision = tp_base / (tp_base + total_fp_base + 1e-8)
+            base_precision_inter = tp_base / (tp_base + fp_int_base + 1e-8)
+
+            metrics_buffer["baseline_occ_iou"].append(base_iou.item())
+            metrics_buffer["baseline_occ_recall"].append(base_recall.item())
+            metrics_buffer["baseline_occ_precision"].append(base_precision.item())
+            metrics_buffer["baseline_occ_precision_inter"].append(base_precision_inter.item())
+           # ---------------------------------------------------------
+            # DYNAMIC METRICS (BASELINE)
+            # ---------------------------------------------------------
+            if t > 0 and gt_seq[t-1] is not None:
+                # 1. Align Previous GT to Baseline's current keys
+                # (We need to see what the baseline "sees" relative to what changed in GT)
+                p_occ_prev_base_aligned, _ = self.align_probs_to_keys_soft(
+                    vox_gt_prev, 
+                    torch.sigmoid(vox_gt_prev.vals_st * 10.0), 
+                    self.vox_baseline, 
+                    default=0.0
+                )
+
+                # 2. Define Dynamic Masks for Baseline spatial context
+                # Use the aligned current GT from the baseline intersection logic above
+                gt_curr_base = (tgt_intersect_base > 0.5)
+                gt_prev_base = (p_occ_prev_base_aligned[valid_mask_base] > 0.5)
+
+                mask_app_base  = (~gt_prev_base & gt_curr_base)
+                mask_dis_base  = (gt_prev_base & ~gt_curr_base)
+                mask_dyn_base  = (gt_prev_base != gt_curr_base)
+
+                # 3. Baseline Appearing Recall (New objects)
+                if mask_app_base.sum() > 0:
+                    base_app_pred = (base_intersect[mask_app_base] > self.vox_baseline.p.occ_thresh)
+                    metrics_buffer["baseline_dyn_recall_appearing"].append(base_app_pred.float().mean().item())
+
+                # 4. Baseline Ghosting / Disappearing (Clearing old objects)
+                if mask_dis_base.sum() > 0:
+                    base_ghosts = (base_intersect[mask_dis_base] > self.vox_baseline.p.occ_thresh)
+                    metrics_buffer["baseline_dyn_ghost_rate"].append(base_ghosts.float().mean().item())
+                    metrics_buffer["baseline_dyn_recall_disappearing"].append((~base_ghosts).float().mean().item())
+
+                # 5. Baseline Dynamic IoU
+                if mask_dyn_base.sum() > 0:
+                    base_dyn_pred = (base_intersect[mask_dyn_base] > self.vox_baseline.p.occ_thresh)
+                    gt_dyn_base   = gt_curr_base[mask_dyn_base]
+                    
+                    int_dyn_base = (base_dyn_pred & gt_dyn_base).sum()
+                    uni_dyn_base = (base_dyn_pred | gt_dyn_base).sum()
+                    metrics_buffer["baseline_dyn_iou"].append((int_dyn_base / (uni_dyn_base + 1e-8)).item())
+
+
+
+
+
+
+            # ---------------------------------------------------------
+            # METRICS CALCULATION (STATIC)
+            # 1. Prepare Ground Truth
+            logit_gt = self.vox_gt.vals_st.clamp(-10.0, 10.0)
+            p_occ_tgt = torch.sigmoid(logit_gt * 10.0) # Sharp GT
+
+
+
+            # 2. Decode Prediction
+            if t == 0:
+                static_logit_pred_before = self.vox.decode_occupancy(with_xyz_cond=False)
+
+            #NEW
+            #logit_pred_before = (logit_pred_before / 0.75) - 1.0
+
+            if not torch.isfinite(logit_pred_before).all():
+                static_logit_pred_before = torch.nan_to_num(static_logit_pred_before, nan=0.001)
+
+            # 3. Align GT keys to Prediction keys
+            static_p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys_soft(
+                self.vox_gt, p_occ_tgt, static_baseline_vox, default=0.0
+            )
+
+            # 4. Standard IoU Calculation
+            pred_intersect = static_logit_pred_before[valid_mask]
+            tgt_intersect  = static_p_occ_tgt_aligned[valid_mask]
+            pred_fp = static_logit_pred_before[~valid_mask]
+
+            pred_bin_int = (pred_intersect > 0.0) # Logit > 0 is Prob > 0.5
+            tgt_bin_int  = (tgt_intersect  > 0.5)
+
+            tp = (pred_bin_int & tgt_bin_int).sum()
+            fp_int = (pred_bin_int & ~tgt_bin_int).sum()
+            fn = (~pred_bin_int & tgt_bin_int).sum()
+
+            fp_hallucination = (pred_fp > 0.0).sum()
+            total_fp = fp_int + fp_hallucination
+
+            occ_iou = tp / (tp + total_fp + fn + 1e-8)
+            occ_recall = tp / (tp + fn + 1e-8)
+            occ_precision = tp / (tp + total_fp + 1e-8)
+            occ_precision_inter = tp / (tp + fp_int + 1e-8)
+
+            metrics_buffer["static_occ_iou"].append(occ_iou.item())
+            metrics_buffer["static_occ_recall"].append(occ_recall.item())
+            metrics_buffer["static_occ_precision"].append(occ_precision.item())
+            metrics_buffer["static_occ_precision_inter"].append(occ_precision_inter.item())
+
+            # ---------------------------------------------------------
+            # DYNAMIC METRICS (Static)
+            # ---------------------------------------------------------
+            # Compare Current GT (t) vs Previous GT (t-1)
+            if t > 0 and gt_seq[t-1] is not None:
+                vox_gt_prev = gt_seq[t-1]
+
+                # Align Prev GT to Current Keys
+                p_occ_prev_aligned, _ = self.align_probs_to_keys_soft(
+                    vox_gt_prev,
+                    torch.sigmoid(vox_gt_prev.vals_st * 10.0),
+                    static_baseline_vox,
+                    default=0.0
+                )
+
+                # Define Masks
+                gt_curr = (tgt_intersect > 0.5)
+                # Note: We align Previous GT to Current Keys, so we use valid_mask of current keys
+                gt_prev = (p_occ_prev_aligned[valid_mask] > 0.5)
+
+                mask_appearing    = (~gt_prev & gt_curr)  # Empty -> Occupied
+                mask_disappearing = (gt_prev & ~gt_curr)  # Occupied -> Empty
+                mask_dynamic      = (gt_prev != gt_curr)
+
+                # A. Appearing Recall (Do we see new objects?)
+                if mask_appearing.sum() > 0:
+                    pred_appearing = (pred_intersect[mask_appearing] > 0.0)
+                    metrics_buffer["static_dyn_recall_appearing"].append(pred_appearing.float().mean().item())
+
+                # B. Disappearing / Ghosting (Do we clear old objects?)
+                if mask_disappearing.sum() > 0:
+                    pred_ghosts = (pred_intersect[mask_disappearing] > 0.0)
+                    metrics_buffer["static_dyn_ghost_rate"].append(pred_ghosts.float().mean().item())
+                    metrics_buffer["static_dyn_recall_disappearing"].append((~pred_ghosts).float().mean().item())
+
+                # C. Dynamic IoU
+                if mask_dynamic.sum() > 0:
+                    pred_dyn = (pred_intersect[mask_dynamic] > 0.0)
+                    gt_dyn   = gt_curr[mask_dynamic]
+                    intersection = (pred_dyn & gt_dyn).sum()
+                    union        = (pred_dyn | gt_dyn).sum()
+                    metrics_buffer["static_dyn_iou"].append((intersection / (union + 1e-8)).item())
+
+
+
+
+
             # ---------------------------------------------------------
             # END METRICS
             # ---------------------------------------------------------
@@ -2041,35 +2396,75 @@ class VoxelUpdaterSystem(pl.LightningModule):
             save_dir = f"debug_viz_pred/{batch_idx}"
             os.makedirs(save_dir, exist_ok=True)
             fname = f"{save_dir}/step_{t}.ply"
-            self.export_debug_ply(fname, t)
+            #self.export_debug_ply(fname, t)
             self.export_separated_ply(t, save_dir=save_dir)
-            self.export_latent_colored_ply(f"{save_dir}/latent_step_{t}.ply", t)
-            self.export_kmeans_ply(f"{save_dir}/kmeans_{t}.ply", t)
+            #self.export_latent_colored_ply(f"{save_dir}/latent_step_{t}.ply", t)
+            #self.export_kmeans_ply(f"{save_dir}/kmeans_{t}.ply", t)
+
+
+            #self.visualize_latent_final_analysis(save_dir, t, n_samples=5000)
+            #self.generate_reliability_diagram(save_dir, t)
+
+
+            # Store current state of the whole grid
+            latent_history.append(self.vox.z_latent.detach())
+            coord_history.append(self.vox.voxel_centers().detach())
+
+            logits = self.vox.decode_occupancy(with_xyz_cond=False)
+            prob_history.append(torch.sigmoid(logits).detach())
+
+            # Align GT for this specific step
+            gt_logits = gt_seq[t].vals_st.clamp(-10.0, 10.0)
+            gt_p, _ = self.align_probs_to_keys_soft(gt_seq[t], torch.sigmoid(gt_logits*10), self.vox)
+            gt_history.append(gt_p.detach())
+
 
 
             torch.cuda.empty_cache()
 
+        #self.visualize_latent_history(save_dir, seq_id, latent_history, coord_history, prob_history, gt_history)
         # --- FINAL SUMMARY PRINT ---
-        # print("-" * 60)
-        # print(f"SEQUENCE REPORT: {seq_id}")
-        # print("-" * 60)
-        # print(f"  MODEL Metrics:")
-        # print(f"    IoU:                 {self.get_avg(metrics_buffer, 'occ_iou'):.4f}")
-        # print(f"    Recall:              {self.get_avg(metrics_buffer, 'occ_recall'):.4f}")
-        # print(f"    Precision:           {self.get_avg(metrics_buffer, 'occ_precision'):.4f}")
-        # print("-" * 60)
-        # print(f"  BASELINE Metrics:")
-        # print(f"    IoU:                 {self.get_avg(metrics_buffer, 'baseline_occ_iou'):.4f}")
-        # print(f"    Recall:              {self.get_avg(metrics_buffer, 'baseline_occ_recall'):.4f}")
-        # print(f"    Precision:           {self.get_avg(metrics_buffer, 'baseline_occ_precision'):.4f}")
-        # print("-" * 60)
-        # print(f"  Dynamic Metrics (Changes Only):")
-        # print(f"    Dynamic IoU:         {self.get_avg(metrics_buffer, 'dyn_iou'):.4f}")
-        # print(f"    Appearing Recall:    {self.get_avg(metrics_buffer, 'dyn_recall_appearing'):.4f}  (High = Fast reaction to new objects)")
-        # print(f"    Disappearing Recall: {self.get_avg(metrics_buffer, 'dyn_recall_disappearing'):.4f}  (High = Good cleanup)")
-        # print(f"    Ghost Rate:          {self.get_avg(metrics_buffer, 'dyn_ghost_rate'):.4f}  (High = Objects leave trails)")
-        # print("-" * 60)
-        # print("\n")
+        print("-" * 60)
+        print(f"SEQUENCE REPORT: {seq_id}")
+        print("-" * 60)
+        print(f"  MODEL Metrics:")
+        print(f"    IoU:                 {self.get_avg(metrics_buffer, 'occ_iou'):.4f}")
+        print(f"    Recall:              {self.get_avg(metrics_buffer, 'occ_recall'):.4f}")
+        print(f"    Precision:           {self.get_avg(metrics_buffer, 'occ_precision'):.4f}")
+        print("-" * 60)
+        print(f"  BASELINE Metrics:")
+        print(f"    IoU:                 {self.get_avg(metrics_buffer, 'baseline_occ_iou'):.4f}")
+        print(f"    Recall:              {self.get_avg(metrics_buffer, 'baseline_occ_recall'):.4f}")
+        print(f"    Precision:           {self.get_avg(metrics_buffer, 'baseline_occ_precision'):.4f}")
+        print("-" * 60)
+        print(f"  STATIC Metrics:")
+        print(f"    IoU:                 {self.get_avg(metrics_buffer, 'static_occ_iou'):.4f}")
+        print(f"    Recall:              {self.get_avg(metrics_buffer, 'static_occ_recall'):.4f}")
+        print(f"    Precision:           {self.get_avg(metrics_buffer, 'static_occ_precision'):.4f}")
+        print("-" * 60)
+        print(f"  Dynamic Metrics (Changes Only):")
+        print(f"    Dynamic IoU:         {self.get_avg(metrics_buffer, 'dyn_iou'):.4f}")
+        print(f"    Appearing Recall:    {self.get_avg(metrics_buffer, 'dyn_recall_appearing'):.4f}  (High = Fast reaction to new objects)")
+        print(f"    Disappearing Recall: {self.get_avg(metrics_buffer, 'dyn_recall_disappearing'):.4f}  (High = Good cleanup)")
+        print(f"    Ghost Rate:          {self.get_avg(metrics_buffer, 'dyn_ghost_rate'):.4f}  (High = Objects leave trails)")
+        print("-" * 60)
+        print(f"  Dynamic Metrics BASELINE (Changes Only):")
+        print(f"    Dynamic IoU:         {self.get_avg(metrics_buffer, 'baseline_dyn_iou'):.4f}")
+        print(f"    Appearing Recall:    {self.get_avg(metrics_buffer, 'baseline_dyn_recall_appearing'):.4f}  (High = Fast reaction to new objects)")
+        print(f"    Disappearing Recall: {self.get_avg(metrics_buffer, 'baseline_dyn_recall_disappearing'):.4f}  (High = Good cleanup)")
+        print(f"    Ghost Rate:          {self.get_avg(metrics_buffer, 'baseline_dyn_ghost_rate'):.4f}  (High = Objects leave trails)")
+        print("-" * 60)
+        print(f"  Dynamic Metrics STATIC (Changes Only):")
+        print(f"    Dynamic IoU:         {self.get_avg(metrics_buffer, 'static_dyn_iou'):.4f}")
+        print(f"    Appearing Recall:    {self.get_avg(metrics_buffer, 'static_dyn_recall_appearing'):.4f}  (High = Fast reaction to new objects)")
+        print(f"    Disappearing Recall: {self.get_avg(metrics_buffer, 'static_dyn_recall_disappearing'):.4f}  (High = Good cleanup)")
+        print(f"    Ghost Rate:          {self.get_avg(metrics_buffer, 'static_dyn_ghost_rate'):.4f}  (High = Objects leave trails)")
+        print("-" * 60)
+        print(f"    Chamfer Dist: {self.get_avg(metrics_buffer, 'chamfer_dist'):.4f}  (Lower = Better)")
+        print(f"    Baseline Chamfer Dist: {self.get_avg(metrics_buffer, 'baseline_chamfer_dist'):.4f}  (Lower = Better)")
+        print(f"    Static Chamfer Dist: {self.get_avg(metrics_buffer, 'static_chamfer_dist'):.4f}  (Lower = Better)")
+        print("-" * 60)
+        print("\n")
 
         return bevs, bevs_gt, bevs_baseline
 
@@ -2124,6 +2519,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
     
     
      
+
     def export_latent_colored_ply(self, filename, step_idx):
         """
         Exports occupancy colored by PCA of z_latent.
@@ -2187,6 +2583,250 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 f.write(f"{p[0]:.4f} {p[1]:.4f} {p[2]:.4f} {c[0]} {c[1]} {c[2]}\n")
 
         print(f"Saved polarized latent PLY: {filename}")
+
+
+    def visualize_latent_history(self, save_folder, seq_id, latent_history, coord_history, prob_history, gt_history, n_samples=8000):
+        """
+        Plots the cumulative history of all voxels across all timesteps.
+        """
+        os.makedirs(save_folder, exist_ok=True)
+
+        # 1. Flatten the history lists into single tensors
+        all_latents = torch.cat(latent_history, dim=0).float()   # (Total_Obs, D)
+        all_coords = torch.cat(coord_history, dim=0).float()     # (Total_Obs, 3)
+        all_probs = torch.cat(prob_history, dim=0).float()       # (Total_Obs,)
+        all_gt = torch.cat(gt_history, dim=0).float()             # (Total_Obs,)
+
+        # 2. Calculate Entropy for all points
+        eps = 1e-6
+        all_entropy = -(all_probs * torch.log(all_probs + eps) + (1 - all_probs) * torch.log(1 - all_probs + eps))
+
+        # 3. Subsample (History gets huge, so we sample to keep UMAP fast)
+        num_total = all_latents.shape[0]
+        idx = np.random.choice(num_total, min(n_samples, num_total), replace=False)
+
+        lat_sub = all_latents[idx].cpu().numpy()
+        prob_sub = all_probs[idx].cpu().numpy()
+        ent_sub = all_entropy[idx].cpu().numpy()
+        coords_sub = all_coords[idx].cpu().numpy()
+        gt_sub = all_gt[idx].cpu().numpy()
+
+        # 4. Run UMAP on the entire history
+        reducer = umap.UMAP(n_neighbors=15, min_dist=0.1, metric='cosine')
+        embedding = reducer.fit_transform(lat_sub)
+
+        # 5. Plotting (2x3 Grid)
+        fig, axes = plt.subplots(2, 3, figsize=(24, 14))
+
+        # Row 1: The "States" of voxels over time
+        axes[0, 0].scatter(embedding[:, 0], embedding[:, 1], c=prob_sub, cmap='coolwarm', s=5, alpha=0.4)
+        axes[0, 0].set_title("Occupancy Probability (All Steps)")
+
+        # Color by Error (TP, FP, FN, TN)
+        pred_bin = prob_sub > 0.5
+        gt_bin = gt_sub > 0.5
+        err_sub = np.zeros_like(pred_bin, dtype=int)
+        err_sub[pred_bin & gt_bin] = 1 # TP
+        err_sub[pred_bin & ~gt_bin] = 2 # FP
+        err_sub[~pred_bin & gt_bin] = 3 # FN
+
+        colors = ['#d3d3d3', '#2ca02c', '#d62728', '#1f77b4']
+        for i in range(4):
+            m = err_sub == i
+            axes[0, 1].scatter(embedding[m, 0], embedding[m, 1], c=colors[i], s=5, alpha=0.4)
+        axes[0, 1].set_title("Classification States (All Steps)")
+
+        axes[0, 2].scatter(embedding[:, 0], embedding[:, 1], c=ent_sub, cmap='magma', s=5, alpha=0.4)
+        axes[0, 2].set_title("Entropy / Uncertainty (All Steps)")
+
+        # Row 2: Proving Spatial Invariance across time
+        axes[1, 0].scatter(embedding[:, 0], embedding[:, 1], c=coords_sub[:, 0], cmap='RdYlBu_r', s=5, alpha=0.3)
+        axes[1, 0].set_title("X-Position")
+
+        axes[1, 1].scatter(embedding[:, 0], embedding[:, 1], c=coords_sub[:, 1], cmap='RdYlBu_r', s=5, alpha=0.3)
+        axes[1, 1].set_title("Y-Position")
+
+        axes[1, 2].scatter(embedding[:, 0], embedding[:, 1], c=coords_sub[:, 2], cmap='viridis', s=5, alpha=0.3)
+        axes[1, 2].set_title("Z-Position")
+
+        plt.savefig(f"{save_folder}/latent_history_{seq_id}.png", dpi=200)
+        plt.close()
+
+    def generate_reliability_diagram(self, save_folder, step_idx, n_bins=10):
+        """
+        Generates a Reliability Diagram (Calibration Curve) for voxel occupancy.
+        Calculates ECE (Expected Calibration Error).
+        """
+        os.makedirs(save_folder, exist_ok=True)
+
+        # 1. Extract Data and handle BFloat16 cast
+        logits = self.vox.decode_occupancy(with_xyz_cond=False)
+        probs = torch.sigmoid(logits).detach().float().cpu().numpy()
+
+        if probs.size == 0:
+            return
+
+        # 2. Align Ground Truth labels
+        gt_logits = self.vox_gt.vals_st.clamp(-10.0, 10.0)
+        gt_probs_raw = torch.sigmoid(gt_logits * 10.0) # Sharp GT
+
+        tgt_soft, valid = self.align_probs_to_keys_soft(
+            self.vox_gt, gt_probs_raw, self.vox, default=0.0
+        )
+        labels = (tgt_soft.detach().float().cpu().numpy() > 0.5).astype(int)
+
+        # Only evaluate voxels that have a corresponding GT
+        valid_mask = valid.cpu().numpy()
+        probs = probs[valid_mask]
+        labels = labels[valid_mask]
+
+        if probs.size == 0:
+            return
+
+        # 3. Binning logic
+        bin_boundaries = np.linspace(0, 1, n_bins + 1)
+        bin_lowers = bin_boundaries[:-1]
+        bin_uppers = bin_boundaries[1:]
+
+        bin_accs = []
+        bin_confs = []
+        bin_sizes = []
+        ece = 0.0
+
+        for lower, upper in zip(bin_lowers, bin_uppers):
+            # Calculated per bin
+            in_bin = (probs > lower) & (probs <= upper)
+            prop_in_bin = np.mean(in_bin)
+
+            if prop_in_bin > 0:
+                accuracy_in_bin = np.mean(labels[in_bin])
+                avg_confidence_in_bin = np.mean(probs[in_bin])
+
+                ece += np.abs(avg_confidence_in_bin - accuracy_in_bin) * prop_in_bin
+
+                bin_accs.append(accuracy_in_bin)
+                bin_confs.append(avg_confidence_in_bin)
+                bin_sizes.append(prop_in_bin)
+            else:
+                bin_accs.append(0)
+                bin_confs.append((lower + upper) / 2)
+                bin_sizes.append(0)
+
+        # 4. Plotting
+        plt.figure(figsize=(8, 8))
+
+        # The "Perfect Calibration" diagonal
+        plt.plot([0, 1], [0, 1], "--", color="gray", label="Perfectly Calibrated")
+
+        # The actual reliability curve
+        plt.bar(bin_lowers, bin_accs, width=1/n_bins, align='edge',
+                alpha=0.8, edgecolor='black', color='#1f77b4', label='Model')
+
+        # Formatting
+        plt.text(0.05, 0.9, f"ECE: {ece:.4f}", fontsize=14, fontweight='bold',
+                 bbox=dict(facecolor='white', alpha=0.8))
+
+        plt.xlabel("Confidence (Predicted Probability)")
+        plt.ylabel("Accuracy (GT Frequency)")
+        plt.title(f"Reliability Diagram - Step {step_idx}")
+        plt.legend(loc="lower right")
+        plt.grid(True, linestyle=':', alpha=0.6)
+
+        save_path = os.path.join(save_folder, f"reliability_step_{step_idx}.png")
+        plt.savefig(save_path, dpi=200, bbox_inches='tight')
+        plt.close()
+        print(f"Saved Reliability Diagram to: {save_path} (ECE: {ece:.4f})")
+
+    def visualize_latent_final_analysis(self, save_folder, step_idx, n_samples=5000):
+        """
+        Generates a 2x3 Comprehensive Analysis Figure:
+        Row 1: Predicted Occupancy, Classification Errors, Shannon Entropy
+        Row 2: X-Influence, Y-Influence, Z-Influence (Elevation)
+        """
+        os.makedirs(save_folder, exist_ok=True)
+
+        # 1. Extract Data and Cast to Float32 to avoid BFloat16 NumPy errors
+        logits = self.vox.decode_occupancy(with_xyz_cond=False)
+        probs = torch.sigmoid(logits).detach().float()
+        latents = self.vox.z_latent.detach().float()
+        centers = self.vox.voxel_centers().detach().float()
+
+        if latents.shape[0] < 10: return
+
+        # 2. Calculate Shannon Entropy
+        eps = 1e-6
+        entropy = -(probs * torch.log(probs + eps) + (1 - probs) * torch.log(1 - probs + eps))
+
+        # 3. Align Ground Truth for Error Plot
+        gt_logits = self.vox_gt.vals_st.clamp(-10.0, 10.0)
+        gt_probs = torch.sigmoid(gt_logits * 10.0)
+        tgt_soft, _ = self.align_probs_to_keys_soft(self.vox_gt, gt_probs, self.vox)
+
+        # 4. Subsample for Consistency across all 6 plots
+        idx = np.random.choice(latents.shape[0], min(n_samples, latents.shape[0]), replace=False)
+
+        lat_sub = latents[idx].cpu().numpy()
+        prob_sub = probs[idx].cpu().numpy()
+        ent_sub = entropy[idx].cpu().numpy()
+        x_sub, y_sub, z_sub = centers[idx, 0].cpu().numpy(), centers[idx, 1].cpu().numpy(), centers[idx, 2].cpu().numpy()
+
+        # Determine Error Labels (0:TN, 1:TP, 2:FP, 3:FN)
+        pred_bin = prob_sub > 0.5
+        gt_bin = tgt_soft[idx].cpu().numpy() > 0.5
+        err_sub = np.zeros_like(pred_bin, dtype=int)
+        err_sub[pred_bin & gt_bin] = 1
+        err_sub[pred_bin & ~gt_bin] = 2
+        err_sub[~pred_bin & gt_bin] = 3
+
+        # 5. Run UMAP (Once)
+        reducer = umap.UMAP(n_neighbors=15, min_dist=0.1, metric='cosine')
+        embedding = reducer.fit_transform(lat_sub)
+
+        # 6. Plotting 2 rows x 3 columns
+        fig, axes = plt.subplots(2, 3, figsize=(24, 14))
+        plt.subplots_adjust(wspace=0.3, hspace=0.3)
+
+        # --- ROW 1: PERFORMANCE & UNCERTAINTY ---
+        # Col 1: Predicted Occupancy
+        sc00 = axes[0, 0].scatter(embedding[:, 0], embedding[:, 1], c=prob_sub, cmap='coolwarm', s=8)
+        fig.colorbar(sc00, ax=axes[0, 0], label='Occupancy Probability')
+        axes[0, 0].set_title("Predicted Occupancy")
+
+        # Col 2: Classification Errors
+        colors = ['#d3d3d3', '#2ca02c', '#d62728', '#1f77b4']
+        names = ['True Negative', 'True Positive', 'False Positive', 'False Negative']
+        for i in range(4):
+            mask = err_sub == i
+            axes[0, 1].scatter(embedding[mask, 0], embedding[mask, 1], c=colors[i], label=names[i], s=10, alpha=0.6)
+        axes[0, 1].legend(loc='upper right', markerscale=2)
+        axes[0, 1].set_title("Classification Errors")
+
+        # Col 3: Shannon Entropy (Geometric Uncertainty)
+        sc02 = axes[0, 2].scatter(embedding[:, 0], embedding[:, 1], c=ent_sub, cmap='magma', s=8)
+        fig.colorbar(sc02, ax=axes[0, 2], label='H(p)')
+        axes[0, 2].set_title("Entropy (Uncertainty)")
+
+        # --- ROW 2: SPATIAL INVARIANCE ---
+        # Col 1: X-Coordinate Influence
+        sc10 = axes[1, 0].scatter(embedding[:, 0], embedding[:, 1], c=x_sub, cmap='RdYlBu_r', s=8)
+        fig.colorbar(sc10, ax=axes[1, 0], label='X (m)')
+        axes[1, 0].set_title("X-Position")
+
+        # Col 2: Y-Coordinate Influence
+        sc11 = axes[1, 1].scatter(embedding[:, 0], embedding[:, 1], c=y_sub, cmap='RdYlBu_r', s=8)
+        fig.colorbar(sc11, ax=axes[1, 1], label='Y (m)')
+        axes[1, 1].set_title("Y-Position")
+
+        # Col 3: Z-Coordinate (Elevation) Influence
+        sc12 = axes[1, 2].scatter(embedding[:, 0], embedding[:, 1], c=z_sub, cmap='viridis', s=8)
+        fig.colorbar(sc12, ax=axes[1, 2], label='Z (m)')
+        axes[1, 2].set_title("Z-Position")
+
+        # Final Save
+        save_path = os.path.join(save_folder, f"final_latent_analysis_step_{step_idx}.png")
+        plt.savefig(save_path, dpi=200, bbox_inches='tight')
+        plt.close()
+        print(f"Saved final multi-pane latent analysis to: {save_path}")
 
     def export_kmeans_ply(self, filename, step_idx, n_clusters=4):
         """
@@ -2278,6 +2918,24 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 centers_gt,
                 colors_gt
             )
+
+        # GT uses vals_st directly
+        mask_baseline = self.vox_baseline.occupied_mask()
+
+        if mask_baseline.any():
+            # Get centers of occupied GT voxels
+            centers_baseline = self.vox_baseline.voxel_centers()[mask_baseline].detach().cpu().numpy()
+
+            # Create Green colors (0, 255, 0)
+            colors_baseline = np.zeros_like(centers_baseline)
+            colors_baseline[:, 1] = 255
+
+            self._write_ply(
+                os.path.join(save_dir, f"step_{step_idx}_baseline.ply"),
+                centers_baseline,
+                colors_baseline
+            )
+
 
         # -----------------------------
         # 2. Export Prediction (Red)
@@ -2578,11 +3236,9 @@ class HabitatSeqDataset(Dataset):
                 continue
 
             
-            """
             if t > 120:
                 break
 
-            """
             imgs = self._load_timestep(td)
 
             if imgs:
@@ -2711,36 +3367,41 @@ def main():
     cfg = TrainConfig(
         # dataset_root="/Users/marvin/Documents/Thesis/repo/dataset_generation/habitat/",
         #dataset_root="/home/mpk40/Documents/data/",
-        dataset_root="/cluster/scratch/kochmar/renders/",
-        gt_voxels_file="gt_voxels_per_timestep_new",
-        precomputed_cache_file="precomputed_cache",
-        pose_file="gt_poses_new",
+        #dataset_root="/cluster/scratch/kochmar/renders/",
+        dataset_root="/cluster/scratch/kochmar/eval_train/",
+        #gt_voxels_file="gt_voxels_per_timestep_new",
+        gt_voxels_file="gt_voxels_per_timestep_new_3",
+        #precomputed_cache_file="precomputed_cache",
+        precomputed_cache_file="precomputed_cache_2",
+        #pose_file="gt_poses_new",
+        pose_file="gt_poses_new_3",
         seq_file="seq_manifest.json",
         voxel_size=0.2,
         radius_m=1,
         topk=8,
         temp=0.5,
-        #feature_dim=16,
-        feature_dim=32,
+        feature_dim=16,
+        #feature_dim=32,
 
         occ_decoder_hidden=64,
+        lr=3e-5,
         #lr=3e-4,
-        lr=3e-3,
+        #lr=3e-3,
         max_epochs=200,
         batch_size=1,
-        num_workers=2,
+        num_workers=0,
         precision="bf16",
         skip=True,
-        #weight_decay=0.05,
-        weight_decay=0.00,
+        weight_decay=0.05,
+        #weight_decay=0.00,
         lambda_occ= 1.0,
         lambda_temp = 0.05,      # temporal consistency weight
         #lambda_temp = 0.0,      # temporal consistency weight
 
-        #lambda_ent = 1e-2,      # routing entropy reg
-        lambda_ent = 0.0,      # routing entropy reg
-        #lambda_tv = 5e-4 ,      # (optional) spatial TV on occupancy
-        lambda_tv = 0.0,      # (optional) spatial TV on occupancy
+        lambda_ent = 5e-3,      # routing entropy reg
+        #lambda_ent = 0.0,      # routing entropy reg
+        lambda_tv = 5e-3 ,      # (optional) spatial TV on occupancy
+        #lambda_tv = 0.0,      # (optional) spatial TV on occupancy
     )
 
     dm = HabitatDataModule(
@@ -2765,7 +3426,7 @@ def main():
     #    cfg=cfg
     #)
     ckpt_cb = pl.callbacks.ModelCheckpoint(
-        dirpath="/cluster/scratch/kochmar/checkpoints/full9",       # Explicitly set a folder so you can find them
+        dirpath="/cluster/scratch/kochmar/checkpoints/full_finetune",       # Explicitly set a folder so you can find them
         monitor="val_loss_total",
         save_top_k=5,
         mode="min",
@@ -2788,6 +3449,7 @@ def main():
 
     # 2. Load the checkpoint file manually
     ckpt_path = "/cluster/scratch/kochmar/checkpoints/full7/voxup-epoch=05-val_loss_total=8.7155.ckpt"
+    ckpt_path = "/cluster/scratch/kochmar/checkpoints/full10/voxup-epoch=09-val_loss_total=7.6451.ckpt"
     checkpoint = torch.load(ckpt_path, map_location="cpu") # Load to CPU first to save GPU mem
     state_dict = checkpoint["state_dict"]
 
@@ -2817,7 +3479,7 @@ def main():
     for key in keys_to_remove:
         if key in state_dict:
             del state_dict[key]
-    #keys = sys.load_state_dict(checkpoint["state_dict"], strict=False)
+    keys = sys.load_state_dict(checkpoint["state_dict"], strict=False)
 
     trainer = pl.Trainer(
         max_epochs=cfg.max_epochs,
@@ -2837,13 +3499,14 @@ def main():
     #ckpt_path = "/cluster/scratch/kochmar/checkpoints/full7/voxup-epoch=05-val_loss_total=8.4459.ckpt"
 
     #ckpt_path = "/cluster/scratch/kochmar/checkpoints/full9/voxup-epoch=01-val_loss_total=7.5519.ckpt"
-    ckpt_path = "/cluster/scratch/kochmar/checkpoints/full9/voxup-epoch=03-val_loss_total=8.5959.ckpt"
+    #ckpt_path = "/cluster/scratch/kochmar/checkpoints/full9/voxup-epoch=03-val_loss_total=8.5959.ckpt"
+    #ckpt_path = "/cluster/scratch/kochmar/checkpoints/full10/voxup-epoch=03-val_loss_total=7.6833.ckpt"
+    ckpt_path = "/cluster/scratch/kochmar/checkpoints/full10/voxup-epoch=09-val_loss_total=7.6451.ckpt"
 
 
 
+    #trainer.fit(sys, dm, ckpt_path=ckpt_path)
 
-    trainer.fit(sys, dm, ckpt_path=ckpt_path)
-
-    #trainer.fit(sys, dm)
+    trainer.fit(sys, dm)
 if __name__ == "__main__":
     main()

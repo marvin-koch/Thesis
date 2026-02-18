@@ -681,7 +681,66 @@ class LatentVoxelGrid(nn.Module):
 
         return avg_neighbor_feat
 
-    def update_with_features(self,
+    def update_with_features(self, pts_world: torch.Tensor, f_pts: torch.Tensor, radius: float = 0.25, **kwargs):
+        if pts_world.numel() == 0 or self.keys.numel() == 0:
+            return
+
+        dev, dtype = self.device, self.z_latent.dtype
+        vox_sz = float(self.p.voxel_size)
+
+        # 1. COMPRESS: Map points to home voxels and max-pool first
+        # This turns 100k points into ~5k active source voxels
+        ijk_pts = self._world_to_ijk(pts_world)
+        keys_pts = self._hash_ijk(ijk_pts)
+        unique_src_keys, inv_indices = torch.unique(keys_pts, return_inverse=True)
+
+        f_src = torch.full((unique_src_keys.size(0), self.feature_dim), -1e9, device=dev, dtype=torch.float32)
+        f_src = torch.scatter_reduce(f_src, 0, inv_indices.unsqueeze(-1).expand(-1, self.feature_dim),
+                                     f_pts.float(), reduce="amax", include_self=True)
+        f_src = torch.where(f_src <= -1e8, torch.zeros_like(f_src), f_src)
+
+        # Get centers of these compressed source voxels
+        src_centers = (self.origin + (self._unhash_keys_static(unique_src_keys).float() + 0.5) * vox_sz).unsqueeze(0)
+
+        # 2. BALL QUERY: Only run on the small set of source centers
+        # This keeps your exact spatial logic but with 1/20th the input size
+        vox_xyz = self.voxel_centers().unsqueeze(0)
+        K_ball = min(self.keys.shape[0], 32) # Cap K for speed
+
+        res = ball_query(src_centers, vox_xyz, K=K_ball, radius=float(radius), return_nn=False)
+        idx_ball, dists_sq = res.idx.squeeze(0), res.dists.squeeze(0)
+
+        # 3. AGGREGATE: Standard Gaussian + Max Pool
+        valid = idx_ball >= 0
+        if not valid.any(): return
+
+        s_idx, g_idx = torch.where(valid)
+        grid_idx = idx_ball[s_idx, g_idx]
+
+        idx_upd = torch.unique(grid_idx)
+        comp = torch.full((self.keys.shape[0],), -1, device=dev, dtype=torch.long)
+        comp[idx_upd] = torch.arange(idx_upd.numel(), device=dev)
+
+        # Weighting and pooling
+        sigma = vox_sz * 3.0
+        #sigma = vox_sz * 2.0
+        #sigma = vox_sz * 1.0
+        w = torch.exp(-dists_sq[s_idx, g_idx] / (2 * (sigma**2))).unsqueeze(-1)
+        u = torch.full((idx_upd.numel(), self.feature_dim), -1e9, device=dev, dtype=torch.float32)
+        u = torch.scatter_reduce(u, 0, comp[grid_idx].unsqueeze(-1).expand(-1, self.feature_dim),
+                                 f_src[s_idx] * w, reduce="amax", include_self=True)
+
+        # 4. UPDATE: GRU with Dtype fixes
+        counts = torch.zeros((idx_upd.numel(),), device=dev)
+        counts.scatter_add_(0, comp[grid_idx], torch.ones_like(grid_idx, dtype=torch.float32))
+
+        z_sel = self.z_latent[idx_upd]
+        gru_in = self.fusion_mlp(torch.cat([u.to(dtype), torch.log1p(counts).unsqueeze(-1).to(dtype)], dim=-1))
+        z_new = self.gru_cell(gru_in, z_sel)
+
+        self.z_latent.index_copy_(0, idx_upd, torch.nan_to_num(z_new).to(dtype))
+
+    def update_with_featuresOG(self,
                             pts_world: torch.Tensor,  # (N,3)
                             f_pts: torch.Tensor,      # (N,D)
                             radius: float = 0.25,     # <--- Increase this! (e.g., 0.20 -> 0.40)
@@ -886,6 +945,8 @@ class LatentVoxelGrid(nn.Module):
         ones = torch.ones_like(inv, dtype=torch.float32)
         counts = torch.zeros((idx_upd.numel(),), device=dev)
         counts.scatter_add_(0, inv, ones)
+
+        self.hit_count.index_add_(0, idx_upd, counts.int())
 
         # 2. Log-Encode the Count
         # We use log1p because counts can vary wildly (1 vs 1000).

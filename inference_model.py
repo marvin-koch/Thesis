@@ -90,10 +90,36 @@ def main():
     ckpt_path = "/cluster/scratch/kochmar/checkpoints/full5/voxup-epoch=05-val_loss_total=9.1113.ckpt"
     ckpt_path = "/cluster/scratch/kochmar/checkpoints/full7/voxup-epoch=05-val_loss_total=8.7155.ckpt"
 
-    ckpt_path = "/cluster/scratch/kochmar/checkpoints/full7/voxup-epoch=08-val_loss_total=8.0448.ckpt"
+    #ckpt_path = "/cluster/scratch/kochmar/checkpoints/full7/voxup-epoch=08-val_loss_total=8.0448.ckpt"
     #ckpt_path = "/cluster/scratch/kochmar/checkpoints/full8/voxup-epoch=11-val_loss_total=8.2162.ckpt"
-    ckpt_path = "/cluster/scratch/kochmar/checkpoints/full9/voxup-epoch=03-val_loss_total=7.4241.ckpt"
+
+    #ckpt_path = "/cluster/scratch/kochmar/checkpoints/full9/voxup-epoch=03-val_loss_total=7.4241.ckpt"
     ckpt_path = "/cluster/scratch/kochmar/checkpoints/full9/voxup-epoch=05-val_loss_total=7.4378.ckpt"
+
+    #ckpt_path = "/cluster/scratch/kochmar/checkpoints/full10/voxup-epoch=05-val_loss_total=7.3701.ckpt"
+
+    #ckpt_path = "/cluster/scratch/kochmar/checkpoints/full10/voxup-epoch=09-val_loss_total=7.5282.ckpt"
+
+
+
+    #sigma 3
+    ckpt_path = "/cluster/scratch/kochmar/checkpoints/full10/voxup-epoch=09-val_loss_total=7.6451.ckpt"
+    #ckpt_path = "/cluster/scratch/kochmar/checkpoints/full_finetune/voxup-epoch=01-val_loss_total=7.9398.ckpt"
+
+    #sigam 2
+    #ckpt_path = "/cluster/scratch/kochmar/checkpoints/full10/voxup-epoch=07-val_loss_total=7.9987.ckpt"
+    #ckpt_path = "/cluster/scratch/kochmar/checkpoints/full10/voxup-epoch=03-val_loss_total=7.8870.ckpt"
+
+
+    #sigma 1
+    #ckpt_path = "/cluster/scratch/kochmar/checkpoints/full10/voxup-epoch=13-val_loss_total=8.0316.ckpt"
+
+
+
+    #ckpt_path = "/cluster/scratch/kochmar/checkpoints/full_finetune/voxup-epoch=01-val_loss_total=20.6306.ckpt"
+    #ckpt_path = "/cluster/scratch/kochmar/checkpoints/full_finetune/voxup-epoch=09-val_loss_total=21.1281.ckpt"
+
+
 
     out_dir = "/cluster/scratch/kochmar/predict_outputs_eval/"
     os.makedirs(out_dir, exist_ok=True)
@@ -102,19 +128,23 @@ def main():
 
     # IMPORTANT: cfg must match what the checkpoint expects (feature_dim, voxel_size, etc.)
     cfg = TrainConfig(
-        #dataset_root="/cluster/scratch/kochmar/renders3/",
-        dataset_root="/cluster/scratch/kochmar/eval/",
+        dataset_root="/cluster/scratch/kochmar/renders3/",
+        #dataset_root="/cluster/scratch/kochmar/eval/",
 
-        gt_voxels_file="gt_voxels_per_timestep_new_50",
+        #gt_voxels_file="gt_voxels_per_timestep_new_3",
+        gt_voxels_file="gt_voxels_per_timestep_new_2",
         precomputed_cache_file="precomputed_cache",
-        pose_file="gt_poses_new_50",
+        #precomputed_cache_file="precomputed_cache_2",
+        #pose_file="gt_poses_new_3",
+        pose_file="gt_poses_new_2",
         seq_file="seq_manifest.json",
         voxel_size=0.2,
         #voxel_size=0.01,
         radius_m=1,
         topk=8,
         temp=0.5,
-        feature_dim=32,
+        #feature_dim=32,
+        feature_dim=16,
         occ_decoder_hidden=64,
         lr=3e-4,
         max_epochs=200,
