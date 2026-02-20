@@ -1754,6 +1754,44 @@ class VoxelUpdaterSystem(pl.LightningModule):
     
 
     def predict_step(self, batch: Dict, batch_idx: int, dataloader_idx: int = 0, step=1):
+        def build_voxel_from_gt_direct(sim_data, voxel_size=0.05, device="cuda"):
+            """
+            Build GT voxel grid directly from Habitat depth — no filtering,
+            no confidence thresholds, no subsampling.
+            """
+            pts = sim_data["world_points"].to(device, dtype=torch.float32)   # (S, H, W, 3)
+            extr = sim_data["extrinsic"].to(device, dtype=torch.float32)     # (S, 4, 4)
+
+            S, H, W, _ = pts.shape
+            cam_centers = extr[:, :3, 3]  # (S, 3)
+
+            # Flatten and filter only NaN/inf (from invalid depth)
+            pts_flat = pts.reshape(-1, 3)
+            # Repeat each camera center for H*W points
+            cams_flat = cam_centers[:, None, None, :].expand(S, H, W, 3).reshape(-1, 3)
+
+            valid = torch.isfinite(pts_flat).all(dim=-1)
+            pts_valid = pts_flat[valid]
+            cams_valid = cams_flat[valid]
+
+            vox = TorchSparseVoxelGrid(
+                origin_xyz=[0, 0, 0],
+                params=VoxelParams(voxel_size=voxel_size, promote_hits=1),
+                device=device,
+            )
+
+            vox.integrate_points_with_cameras(
+                pts_valid,
+                cams_valid,
+                carve_free=True,
+                max_range=20.0,
+                z_clip=None,
+                samples_per_voxel=1.5,
+                ray_stride=1,
+                max_free_rays=500_000,
+            )
+
+            return vox
         def build_voxel_from_sim_data(sim_data, voxel_size=0.2, device="cuda"):
             """
             Converts loaded sim 'tensors.pt' data into a TorchSparseVoxelGrid.
@@ -1796,7 +1834,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
             cam_centers_scaled = cam_centers_m * scale_factor
             """
 
-            z_clip_map = (-3.0, 3.0)
+            z_clip_map = None
 
             renders_map, cam_centers_map, conf_map, images_map, _, (S, H, W), frame_ids = \
                 build_frames_and_centers_vectorized_torch(
@@ -1837,8 +1875,10 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 z_clip_vox=(-np.inf, np.inf),
                 z_band_bev=(0.02, 0.5),
                 samples_per_voxel=2.0,
-                ray_stride=4,          # Speed up integration
-                max_free_rays=10000,
+                ray_stride=1,
+                max_free_rays=500_000,  # was 10,000
+                #ray_stride=4,          # Speed up integration
+                #max_free_rays=10000,
                 frame_ids=frame_ids
             )
 
@@ -1991,6 +2031,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
 
             "chamfer_dist": [],
+            "gt_chamfer_dist": [],
             "static_chamfer_dist": [],
             "baseline_chamfer_dist": [],
         }
@@ -2224,7 +2265,86 @@ class VoxelUpdaterSystem(pl.LightningModule):
             
             t_end_pre.record()
 
+            if self.cfg.real_gt_voxels_file:
+                with torch.cuda.amp.autocast(enabled=False):
+                    gt_pts = real_gt["world_points"].to(self.device)   # (S, H, W, 3)
+                    gt_ex = real_gt["extrinsic"].to(self.device)
+                    gt_cams = gt_ex[:, :3, 3]
 
+                    pred_pts = predictions["world_points"]  # already strided (S, H', W', 3)
+
+                    if t == 0:
+                        # Match stride to predictions
+                        _, pH, pW, _ = pred_pts.shape
+                        _, gH, gW, _ = gt_pts.shape
+
+                        # Downsample GT to match prediction resolution
+                        gt_pts_strided = gt_pts[:, ::max(1, gH//pH), ::max(1, gW//pW), :]
+                        # Ensure exact shape match
+                        gt_pts_strided = gt_pts_strided[:, :pH, :pW, :]
+
+                        # Corresponding points for Kabsch
+                        gt_flat = gt_pts_strided.reshape(-1, 3)
+                        pred_flat = pred_pts.reshape(-1, 3)
+
+                        both_valid = torch.isfinite(gt_flat).all(-1) & torch.isfinite(pred_flat).all(-1)
+
+                        gt_corr = gt_flat[both_valid]
+                        pred_corr = pred_flat[both_valid]
+
+                        n = min(50000, gt_corr.shape[0])
+                        idx = torch.randperm(gt_corr.shape[0], device=self.device)[:n]
+
+                        R_k, t_k, s_k = kabsch_umeyama_sim3(gt_corr[idx], pred_corr[idx])
+
+                    # Apply to FULL resolution GT (not strided)
+                    aligned_pts = s_k * (gt_pts @ R_k.T) + t_k
+                    aligned_cams = s_k * (gt_cams @ R_k.T) + t_k
+
+                    real_gt["world_points"] = aligned_pts
+                    new_ex = gt_ex.clone()
+                    new_ex[:, :3, 3] = aligned_cams
+                    real_gt["extrinsic"] = new_ex
+
+                    if real_gt["images"].dim() == 4 and real_gt["images"].shape[1] == 3:
+                        real_gt["images"] = real_gt["images"].permute(0, 2, 3, 1)
+
+                    self.prev_vox_real_gt = copy.deepcopy(self.vox_real_gt)
+                    self.vox_real_gt = build_voxel_from_gt_direct(
+                        real_gt, voxel_size=self.cfg.voxel_size, device=self.device
+                    )
+            """
+            if self.cfg.real_gt_voxels_file:
+                with torch.cuda.amp.autocast(enabled=False):
+                    # Apply the SAME transforms as predictions
+                    gt_pts = real_gt["world_points"]  # (S, H, W, 3)
+                    gt_pts = rotate_points(gt_pts, R_w2m, t_w2m)
+                    gt_pts = rotate_points(gt_pts, Rmw, tmw)
+                    gt_pts = gt_pts * scale_factor
+                    real_gt["world_points"] = gt_pts
+
+                    # Transform camera centers the same way
+                    gt_cams = real_gt["extrinsic"][:, :3, 3]  # (S, 3)
+                    gt_cams = (gt_cams @ R_w2m.T + t_w2m)
+                    gt_cams = (gt_cams @ Rmw.T + tmw)
+                    gt_cams = gt_cams * scale_factor
+
+                    new_ex = real_gt["extrinsic"].clone()
+                    new_ex[:, :3, :3] = Rmw @ R_w2m @ real_gt["extrinsic"][:, :3, :3]
+                    new_ex[:, :3, 3] = gt_cams
+                    real_gt["extrinsic"] = new_ex
+
+                    # Images permute if needed
+                    if real_gt["images"].dim() == 4 and real_gt["images"].shape[1] == 3:
+                        real_gt["images"] = real_gt["images"].permute(0, 2, 3, 1)
+
+                    self.prev_vox_real_gt = copy.deepcopy(self.vox_real_gt)
+                    #self.vox_real_gt = build_voxel_from_sim_data(
+                    #    real_gt, voxel_size=self.cfg.voxel_size, device=self.device
+                    #)
+                    self.vox_real_gt = build_voxel_from_gt_direct(real_gt, voxel_size=self.cfg.voxel_size, device=self.device)
+            """
+            """
             if self.cfg.real_gt_voxels_file:
                 with torch.cuda.amp.autocast(enabled=False):
                     if t == 0:
@@ -2253,6 +2373,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
                 real_gt["world_points"] = aligned_gt_pts
 
+            """
+            """
                 pts = real_gt["world_points"].flatten()
 
                 # 2. Calculate how many (x,y,z) triplets we have per frame (S)
@@ -2264,33 +2386,6 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 H = H_init
                 W = triplets_per_frame // H_init
 
-                # 4. CRITICAL: Trim the tensor so it fits S * H * W * 3 EXACTLY
-
-                # Your current size (7848276) is not divisible by 30, so we must drop the extra
-                """
-                clean_size = S_init * H * W * 3
-                pts_trimmed = pts[:clean_size]
-
-
-                try:
-                    real_gt["world_points"] = pts_trimmed.view(S_init, H, W, 3)
-
-                    # Do the same for confidence (assuming it's also flattened/needs same shape)
-                    conf = real_gt["world_points_conf"].flatten()[:(S_init * H * W)] # usually conf is 1 value per point
-                    real_gt["world_points_conf"] = conf.view(S_init, H, W)
-
-                    # Note: Images are usually (S, 3, H, W)
-                    img_flat = real_gt["images"].flatten()[:(S_init * 3 * H * W)]
-                    real_gt["images"] = img_flat.view(S_init, 3, H, W)
-
-                except RuntimeError as e:
-                    print(f"Shape Mismatch: real_gt has {real_gt['world_points'].numel()//3} points, "
-                          f"but predictions expects {S*H*W} points.")
-                    raise e
-
-
-
-                """
                 # 1. Calculate the target number of points for the (S, H, W) grid
                 target_n = S_init * H * W
 
@@ -2328,8 +2423,16 @@ class VoxelUpdaterSystem(pl.LightningModule):
                     print(f"Sampling failed: Expected {target_n} points but indices produced an invalid shape.")
                     raise e
 
+            """
+            """
+                # Images: convert (S, 3, H, W) -> (S, H, W, 3) if needed
+                if real_gt["images"].dim() == 4 and real_gt["images"].shape[1] == 3:
+                    real_gt["images"] = real_gt["images"].permute(0, 2, 3, 1)
+
+
                 self.prev_vox_real_gt = copy.deepcopy(self.vox_real_gt)
                 self.vox_real_gt = build_voxel_from_sim_data(real_gt, voxel_size=self.cfg.voxel_size, device=self.device)
+            """
 
 
 
@@ -2381,6 +2484,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
             if self.cfg.real_gt_voxels_file:
                 metrics_buffer["chamfer_dist"].append(compute_chamfer_dist(self.vox, self.vox_real_gt).item())
+                metrics_buffer["gt_chamfer_dist"].append(compute_chamfer_dist(self.vox_gt, self.vox_real_gt).item())
                 metrics_buffer["baseline_chamfer_dist"].append(compute_chamfer_dist(self.vox_baseline, self.vox_real_gt).item())
                 metrics_buffer["static_chamfer_dist"].append(compute_chamfer_dist(static_baseline_vox, self.vox_real_gt).item())
             else:
@@ -2398,6 +2502,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
                 logit_pred_before = self.vox_gt.vals_st.clamp(-10.0, 10.0)
                 logit_pred_before = torch.sigmoid(logit_pred_before * 10.0) # Sharp GT
+                logit_pred_before = self.vox_gt._display_vals().clamp(-10.0, 10.0)
+
 
 
 
@@ -2413,6 +2519,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
                     # 1. Prepare Ground Truth
                     logit_gt = self.vox_real_gt.vals_st.clamp(-10.0, 10.0)
                     p_occ_tgt = torch.sigmoid(logit_gt * 10.0) # Sharp GT
+                    p_occ_tgt = (self.vox_real_gt.hit_count > 0).float()
+                    p_occ_tgt = (self.vox_real_gt.vals_st > 0).float()
 
 
                     p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys_soft(
@@ -2512,6 +2620,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 # 1. Prepare Ground Truth
                 logit_gt = self.vox_real_gt.vals_st.clamp(-10.0, 10.0)
                 p_occ_tgt = torch.sigmoid(logit_gt * 10.0) # Sharp GT
+                p_occ_tgt = (self.vox_real_gt.hit_count > 0).float()
+                p_occ_tgt = (self.vox_real_gt.vals_st > 0).float()
 
 
                 p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys_soft(
@@ -2621,6 +2731,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 # 1. Prepare Ground Truth
                 logit_gt = self.vox_real_gt.vals_st.clamp(-10.0, 10.0)
                 p_occ_tgt = torch.sigmoid(logit_gt * 10.0) # Sharp GT
+                p_occ_tgt = (self.vox_real_gt.hit_count > 0).float()
+                p_occ_tgt = (self.vox_real_gt.vals_st > 0).float()
 
 
                 p_occ_tgt_base_aligned, valid_mask_base = self.align_probs_to_keys_soft(
@@ -2746,6 +2858,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 logit_gt = self.vox_real_gt.vals_st.clamp(-10.0, 10.0)
                 p_occ_tgt = torch.sigmoid(logit_gt * 10.0) # Sharp GT
 
+                p_occ_tgt = (self.vox_real_gt.hit_count > 0).float()
+                p_occ_tgt = (self.vox_real_gt.vals_st > 0).float()
 
                 static_p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys_soft(
                     self.vox_real_gt, p_occ_tgt, static_baseline_vox, default=0.0
@@ -2953,6 +3067,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
         print(f"    Ghost Rate:          {self.get_avg(metrics_buffer, 'static_dyn_ghost_rate'):.4f}  (High = Objects leave trails)")
         print("-" * 60)
         print(f"    Chamfer Dist: {self.get_avg(metrics_buffer, 'chamfer_dist'):.4f}  (Lower = Better)")
+        if self.cfg.real_gt_voxels_file:                   
+            print(f"    GT Chamfer Dist: {self.get_avg(metrics_buffer, 'gt_chamfer_dist'):.4f}  (Lower = Better)")
         print(f"    Baseline Chamfer Dist: {self.get_avg(metrics_buffer, 'baseline_chamfer_dist'):.4f}  (Lower = Better)")
         print(f"    Static Chamfer Dist: {self.get_avg(metrics_buffer, 'static_chamfer_dist'):.4f}  (Lower = Better)")
         print("-" * 60)
@@ -3748,8 +3864,8 @@ class HabitatSeqDataset(Dataset):
                 continue
 
             
-            if t > 10:
-            #if t > 120:
+            #if t > 10:
+            if t > 120:
                 break
 
             imgs = self._load_timestep(td)
