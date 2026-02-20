@@ -2600,7 +2600,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
 
                     p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys_soft(
-                        self.vox_real_gt, p_occ_tgt, self.vox_gt, default=0.0, rvox=1
+                        self.vox_real_gt, p_occ_tgt, self.vox_gt, default=0.0, r_vox=1
                     )
 
 
@@ -2644,7 +2644,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                             torch.sigmoid(vox_gt_prev.vals_st * 10.0),
                             self.vox_gt,
                             default=0.0, 
-                            rvox=1
+                            r_vox=1
                         )
 
                     # Define Masks
@@ -2702,7 +2702,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
 
                 p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys_soft(
-                    self.vox_real_gt, p_occ_tgt, self.vox, default=0.0, rvox=1
+                    self.vox_real_gt, p_occ_tgt, self.vox, default=0.0, r_vox=1
                 )
             else:
 
@@ -2711,7 +2711,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 p_occ_tgt = torch.sigmoid(logit_gt * 10.0) # Sharp GT
 
                 p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys_soft(
-                    self.vox_gt, p_occ_tgt, self.vox, default=0.0, rvox=1
+                    self.vox_gt, p_occ_tgt, self.vox, default=0.0, r_vox=1
                 )
 
             # 4. Standard IoU Calculation
@@ -2752,7 +2752,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                         torch.sigmoid(vox_gt_prev.vals_st * 10.0),
                         self.vox,
                         default=0.0, 
-                        rvox=1
+                        r_vox=1
                     )
                 else:
                     vox_gt_prev = gt_seq[t-1]
@@ -2763,7 +2763,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                         torch.sigmoid(vox_gt_prev.vals_st * 10.0),
                         self.vox,
                         default=0.0, 
-                        rvox=1
+                        r_vox=1
                     )
 
                 # Define Masks
@@ -2815,7 +2815,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
 
                 p_occ_tgt_base_aligned, valid_mask_base = self.align_probs_to_keys_soft(
-                    self.vox_real_gt, p_occ_tgt, self.vox_baseline, default=0.0, rvox=1
+                    self.vox_real_gt, p_occ_tgt, self.vox_baseline, default=0.0, r_vox=1
                 )
             else:
 
@@ -2824,7 +2824,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 p_occ_tgt = torch.sigmoid(logit_gt * 10.0) # Sharp GT
 
                 p_occ_tgt_base_aligned, valid_mask_base = self.align_probs_to_keys_soft(
-                    self.vox_gt, p_occ_tgt, self.vox_baseline, default=0.0, rvox=1
+                    self.vox_gt, p_occ_tgt, self.vox_baseline, default=0.0, r_vox=1
                 )
 
  
@@ -2870,7 +2870,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                         torch.sigmoid(vox_gt_prev.vals_st * 10.0),
                         self.vox_baseline,
                         default=0.0, 
-                        rvox=1
+                        r_vox=1
                     )
                 else:
                     vox_gt_prev = gt_seq[t-1]
@@ -2881,7 +2881,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                         torch.sigmoid(vox_gt_prev.vals_st * 10.0),
                         self.vox_baseline,
                         default=0.0, 
-                        rvox=1
+                        r_vox=1
                     )
 
 
@@ -2943,7 +2943,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 #p_occ_tgt = (self.vox_real_gt.vals_st > 0).float()
 
                 static_p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys_soft(
-                    self.vox_real_gt, p_occ_tgt, static_baseline_vox, default=0.0, rvox=1
+                    self.vox_real_gt, p_occ_tgt, static_baseline_vox, default=0.0, r_vox=1
                 )
 
             else:
@@ -2953,7 +2953,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 p_occ_tgt = torch.sigmoid(logit_gt * 10.0) # Sharp GT
 
                 static_p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys_soft(
-                    self.vox_gt, p_occ_tgt, static_baseline_vox, default=0.0, rvox=1
+                    self.vox_gt, p_occ_tgt, static_baseline_vox, default=0.0, r_vox=1
                 )
 
  
@@ -3001,7 +3001,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                         torch.sigmoid(vox_gt_prev.vals_st * 10.0),
                         static_baseline_vox,
                         default=0.0,
-                        rvox=1
+                        r_vox=1
                     )
                 else:
                     vox_gt_prev = gt_seq[t-1]
@@ -3012,7 +3012,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                         torch.sigmoid(vox_gt_prev.vals_st * 10.0),
                         static_baseline_vox,
                         default=0.0,
-                        rvox=1
+                        r_vox=1
                     )
 
                 # Define Masks
