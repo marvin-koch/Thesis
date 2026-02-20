@@ -1754,7 +1754,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
     
 
     def predict_step(self, batch: Dict, batch_idx: int, dataloader_idx: int = 0, step=1):
-        def build_voxel_from_gt_direct(sim_data, voxel_size=0.05, device="cuda"):
+        def build_voxel_from_gt_direct(sim_data, voxel_size=0.2, device="cuda", scale_factor=1.0):
             """
             Build GT voxel grid directly from Habitat depth — no filtering,
             no confidence thresholds, no subsampling.
@@ -1786,13 +1786,16 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 carve_free=True,
                 max_range=20.0,
                 z_clip=None,
-                samples_per_voxel=1.5,
-                ray_stride=1,
-                max_free_rays=500_000,
+                #samples_per_voxel=1.5,
+                #ray_stride=1,
+                #max_free_rays=500_000,
+                samples_per_voxel=0.7, #0.7,
+                ray_stride=4,
+                max_free_rays=10000,
             )
 
             return vox
-        def build_voxel_from_sim_data(sim_data, voxel_size=0.2, device="cuda"):
+        def build_voxel_from_sim_data(sim_data, voxel_size=0.2, device="cuda", scale_factor=1.0):
             """
             Converts loaded sim 'tensors.pt' data into a TorchSparseVoxelGrid.
 
@@ -1834,7 +1837,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
             cam_centers_scaled = cam_centers_m * scale_factor
             """
 
-            z_clip_map = None
+            z_clip_map = (scale_factor * z_clip_map[0], scale_factor * z_clip_map[1])
+
 
             renders_map, cam_centers_map, conf_map, images_map, _, (S, H, W), frame_ids = \
                 build_frames_and_centers_vectorized_torch(
@@ -1922,6 +1926,57 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
             return R, translation, scale
 
+        def icp_sim3(src, dst, init_R, init_t, init_s, max_iters=20, tolerance=1e-5):
+            """
+            Iterative Closest Point with Sim(3) transformation.
+            Uses PyTorch3D knn_points to find true spatial neighbors instead of array indices.
+            """
+            # Apply initial Kabsch alignment
+            src_curr = init_s * (src @ init_R.T) + init_t
+
+            # Accumulators for the total transformation
+            R_acc = init_R.clone()
+            t_acc = init_t.clone()
+            s_acc = init_s.clone()
+
+            prev_loss = float('inf')
+
+            for i in range(max_iters):
+                # 1. Find true nearest neighbors in 3D space
+                # knn_points expects batched tensors: (1, N, 3)
+                res = knn_points(src_curr.unsqueeze(0), dst.unsqueeze(0), K=1)
+
+                # Squeeze out the batch dimension
+                idx = res.idx.squeeze(0).squeeze(-1)      # (N,)
+                dists = res.dists.squeeze(0).squeeze(-1)  # (N,)
+
+                # 2. Filter Outliers (Crucial for Dust3R noise!)
+                # Only keep the 85% closest points so floating artifacts don't warp the room
+                q85 = torch.quantile(dists, 0.85)
+                valid = dists < q85
+
+                src_matched = src_curr[valid]
+                dst_matched = dst[idx[valid]]
+
+                # 3. Estimate new transformation on the matched pairs
+                R, t, s = kabsch_umeyama_sim3(src_matched, dst_matched)
+
+                # 4. Apply transformation for the next iteration
+                src_curr = s * (src_curr @ R.T) + t
+
+                # 5. Update global accumulators
+                # (Sim3 Composition: S2 * R2 * (S1 * R1 * X + T1) + T2)
+                t_acc = s * (R @ t_acc) + t
+                R_acc = R @ R_acc
+                s_acc = s * s_acc
+
+                # Check for convergence
+                mean_dist = dists[valid].mean().item()
+                if abs(prev_loss - mean_dist) < tolerance:
+                    break
+                prev_loss = mean_dist
+
+            return R_acc, t_acc, s_acc
         def compute_chamfer_dist(vox_pred, vox_gt):
 
             """
@@ -2296,6 +2351,14 @@ class VoxelUpdaterSystem(pl.LightningModule):
                         idx = torch.randperm(gt_corr.shape[0], device=self.device)[:n]
 
                         R_k, t_k, s_k = kabsch_umeyama_sim3(gt_corr[idx], pred_corr[idx])
+                        R_k, t_k, s_k = icp_sim3(
+                            gt_corr[idx],
+                            pred_corr[idx],
+                            init_R=R_k,
+                            init_t=t_k,
+                            init_s=s_k,
+                            max_iters=50
+                        )
 
                     # Apply to FULL resolution GT (not strided)
                     aligned_pts = s_k * (gt_pts @ R_k.T) + t_k
@@ -2311,7 +2374,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
                     self.prev_vox_real_gt = copy.deepcopy(self.vox_real_gt)
                     self.vox_real_gt = build_voxel_from_gt_direct(
-                        real_gt, voxel_size=self.cfg.voxel_size, device=self.device
+                        real_gt, voxel_size=self.cfg.voxel_size, device=self.device, scale_factor=scale_factor
                     )
             """
             if self.cfg.real_gt_voxels_file:
@@ -2500,8 +2563,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 # METRICS CALCULATION GT
                 # ---------------------------------------------------------
 
-                logit_pred_before = self.vox_gt.vals_st.clamp(-10.0, 10.0)
-                logit_pred_before = torch.sigmoid(logit_pred_before * 10.0) # Sharp GT
+                #logit_pred_before = self.vox_gt.vals_st.clamp(-10.0, 10.0)
+                #logit_pred_before = torch.sigmoid(logit_pred_before * 10.0) # Sharp GT
                 logit_pred_before = self.vox_gt._display_vals().clamp(-10.0, 10.0)
 
 
@@ -2519,12 +2582,12 @@ class VoxelUpdaterSystem(pl.LightningModule):
                     # 1. Prepare Ground Truth
                     logit_gt = self.vox_real_gt.vals_st.clamp(-10.0, 10.0)
                     p_occ_tgt = torch.sigmoid(logit_gt * 10.0) # Sharp GT
-                    p_occ_tgt = (self.vox_real_gt.hit_count > 0).float()
-                    p_occ_tgt = (self.vox_real_gt.vals_st > 0).float()
+                    #p_occ_tgt = (self.vox_real_gt.hit_count > 0).float()
+                    #p_occ_tgt = (self.vox_real_gt.vals_st > 0).float()
 
 
-                    p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys_soft(
-                        self.vox_real_gt, p_occ_tgt, self.vox_gt, default=0.0
+                    p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys(
+                        self.vox_real_gt.keys, p_occ_tgt, self.vox_gt.keys, default=0.0
                     )
 
 
@@ -2554,7 +2617,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 metrics_buffer["gt_occ_precision_inter"].append(occ_precision_inter.item())
 
                 # ---------------------------------------------------------
-                # DYNAMIC METRICS (Model)
+                # DYNAMIC METRICS (GT)
                 # ---------------------------------------------------------
                 # Compare Current GT (t) vs Previous GT (t-1)
                 if t > 0 and gt_seq[t-1] is not None:
@@ -2563,10 +2626,10 @@ class VoxelUpdaterSystem(pl.LightningModule):
                         
 
                         # Align Prev GT to Current Keys
-                        p_occ_prev_aligned, _ = self.align_probs_to_keys_soft(
-                            vox_gt_prev,
+                        p_occ_prev_aligned, _ = self.align_probs_to_keys(
+                            vox_gt_prev.keys,
                             torch.sigmoid(vox_gt_prev.vals_st * 10.0),
-                            self.vox_gt,
+                            self.vox_gt.keys,
                             default=0.0
                         )
 
@@ -2620,12 +2683,12 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 # 1. Prepare Ground Truth
                 logit_gt = self.vox_real_gt.vals_st.clamp(-10.0, 10.0)
                 p_occ_tgt = torch.sigmoid(logit_gt * 10.0) # Sharp GT
-                p_occ_tgt = (self.vox_real_gt.hit_count > 0).float()
-                p_occ_tgt = (self.vox_real_gt.vals_st > 0).float()
+                #p_occ_tgt = (self.vox_real_gt.hit_count > 0).float()
+                #p_occ_tgt = (self.vox_real_gt.vals_st > 0).float()
 
 
-                p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys_soft(
-                    self.vox_real_gt, p_occ_tgt, self.vox, default=0.0
+                p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys(
+                    self.vox_real_gt.keys, p_occ_tgt, self.vox.keys, default=0.0
                 )
             else:
 
@@ -2633,8 +2696,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 logit_gt = self.vox_gt.vals_st.clamp(-10.0, 10.0)
                 p_occ_tgt = torch.sigmoid(logit_gt * 10.0) # Sharp GT
 
-                p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys_soft(
-                    self.vox_gt, p_occ_tgt, self.vox, default=0.0
+                p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys(
+                    self.vox_gt.keys, p_occ_tgt, self.vox.keys, default=0.0
                 )
 
             # 4. Standard IoU Calculation
@@ -2670,20 +2733,20 @@ class VoxelUpdaterSystem(pl.LightningModule):
                     vox_gt_prev = self.prev_vox_real_gt
 
                     # Align Prev GT to Current Keys
-                    p_occ_prev_aligned, _ = self.align_probs_to_keys_soft(
-                        vox_gt_prev,
+                    p_occ_prev_aligned, _ = self.align_probs_to_keys(
+                        vox_gt_prev.keys,
                         torch.sigmoid(vox_gt_prev.vals_st * 10.0),
-                        self.vox,
+                        self.vox.keys,
                         default=0.0
                     )
                 else:
                     vox_gt_prev = gt_seq[t-1]
 
                     # Align Prev GT to Current Keys
-                    p_occ_prev_aligned, _ = self.align_probs_to_keys_soft(
-                        vox_gt_prev,
+                    p_occ_prev_aligned, _ = self.align_probs_to_keys(
+                        vox_gt_prev.keys,
                         torch.sigmoid(vox_gt_prev.vals_st * 10.0),
-                        self.vox,
+                        self.vox.keys,
                         default=0.0
                     )
 
@@ -2731,12 +2794,12 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 # 1. Prepare Ground Truth
                 logit_gt = self.vox_real_gt.vals_st.clamp(-10.0, 10.0)
                 p_occ_tgt = torch.sigmoid(logit_gt * 10.0) # Sharp GT
-                p_occ_tgt = (self.vox_real_gt.hit_count > 0).float()
-                p_occ_tgt = (self.vox_real_gt.vals_st > 0).float()
+                #p_occ_tgt = (self.vox_real_gt.hit_count > 0).float()
+                #p_occ_tgt = (self.vox_real_gt.vals_st > 0).float()
 
 
-                p_occ_tgt_base_aligned, valid_mask_base = self.align_probs_to_keys_soft(
-                    self.vox_real_gt, p_occ_tgt, self.vox_baseline, default=0.0
+                p_occ_tgt_base_aligned, valid_mask_base = self.align_probs_to_keys(
+                    self.vox_real_gt.keys, p_occ_tgt, self.vox_baseline.keys, default=0.0
                 )
             else:
 
@@ -2744,8 +2807,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 logit_gt = self.vox_gt.vals_st.clamp(-10.0, 10.0)
                 p_occ_tgt = torch.sigmoid(logit_gt * 10.0) # Sharp GT
 
-                p_occ_tgt_base_aligned, valid_mask_base = self.align_probs_to_keys_soft(
-                    self.vox_gt, p_occ_tgt, self.vox_baseline, default=0.0
+                p_occ_tgt_base_aligned, valid_mask_base = self.align_probs_to_keys(
+                    self.vox_gt.keys, p_occ_tgt, self.vox_baseline.keys, default=0.0
                 )
 
  
@@ -2786,20 +2849,20 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
 
                     # Align Prev GT to Current Keys
-                    p_occ_prev_base_aligned, _ = self.align_probs_to_keys_soft(
-                        vox_gt_prev,
+                    p_occ_prev_base_aligned, _ = self.align_probs_to_keys(
+                        vox_gt_prev.keys,
                         torch.sigmoid(vox_gt_prev.vals_st * 10.0),
-                        self.vox_baseline,
+                        self.vox_baseline.keys,
                         default=0.0
                     )
                 else:
                     vox_gt_prev = gt_seq[t-1]
 
                     # Align Prev GT to Current Keys
-                    p_occ_prev_base_aligned, _ = self.align_probs_to_keys_soft(
-                        vox_gt_prev,
+                    p_occ_prev_base_aligned, _ = self.align_probs_to_keys(
+                        vox_gt_prev.keys,
                         torch.sigmoid(vox_gt_prev.vals_st * 10.0),
-                        self.vox_baseline,
+                        self.vox_baseline.keys,
                         default=0.0
                     )
 
@@ -2858,11 +2921,11 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 logit_gt = self.vox_real_gt.vals_st.clamp(-10.0, 10.0)
                 p_occ_tgt = torch.sigmoid(logit_gt * 10.0) # Sharp GT
 
-                p_occ_tgt = (self.vox_real_gt.hit_count > 0).float()
-                p_occ_tgt = (self.vox_real_gt.vals_st > 0).float()
+                #p_occ_tgt = (self.vox_real_gt.hit_count > 0).float()
+                #p_occ_tgt = (self.vox_real_gt.vals_st > 0).float()
 
-                static_p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys_soft(
-                    self.vox_real_gt, p_occ_tgt, static_baseline_vox, default=0.0
+                static_p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys(
+                    self.vox_real_gt.keys, p_occ_tgt, static_baseline_vox.keys, default=0.0
                 )
 
             else:
@@ -2871,8 +2934,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 logit_gt = self.vox_gt.vals_st.clamp(-10.0, 10.0)
                 p_occ_tgt = torch.sigmoid(logit_gt * 10.0) # Sharp GT
 
-                static_p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys_soft(
-                    self.vox_gt, p_occ_tgt, static_baseline_vox, default=0.0
+                static_p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys(
+                    self.vox_gt.keys, p_occ_tgt, static_baseline_vox.keys, default=0.0
                 )
 
  
@@ -2919,7 +2982,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
                         vox_gt_prev,
                         torch.sigmoid(vox_gt_prev.vals_st * 10.0),
                         static_baseline_vox,
-                        default=0.0
+                        default=0.0,
+                        rvox=1
                     )
                 else:
                     vox_gt_prev = gt_seq[t-1]
@@ -2928,9 +2992,11 @@ class VoxelUpdaterSystem(pl.LightningModule):
                     p_occ_prev_aligned, _ = self.align_probs_to_keys_soft(
                         vox_gt_prev,
                         torch.sigmoid(vox_gt_prev.vals_st * 10.0),
-                        static_baseline_vox,
-                        default=0.0
+                        static_baseline_vox.keys,
+                        default=0.0,
+                        rvox=1
                     )
+
                 # Define Masks
                 gt_curr = (tgt_intersect > 0.5)
                 # Note: We align Previous GT to Current Keys, so we use valid_mask of current keys
@@ -3066,9 +3132,9 @@ class VoxelUpdaterSystem(pl.LightningModule):
         print(f"    Disappearing Recall: {self.get_avg(metrics_buffer, 'static_dyn_recall_disappearing'):.4f}  (High = Good cleanup)")
         print(f"    Ghost Rate:          {self.get_avg(metrics_buffer, 'static_dyn_ghost_rate'):.4f}  (High = Objects leave trails)")
         print("-" * 60)
-        print(f"    Chamfer Dist: {self.get_avg(metrics_buffer, 'chamfer_dist'):.4f}  (Lower = Better)")
         if self.cfg.real_gt_voxels_file:                   
             print(f"    GT Chamfer Dist: {self.get_avg(metrics_buffer, 'gt_chamfer_dist'):.4f}  (Lower = Better)")
+        print(f"    Chamfer Dist: {self.get_avg(metrics_buffer, 'chamfer_dist'):.4f}  (Lower = Better)")
         print(f"    Baseline Chamfer Dist: {self.get_avg(metrics_buffer, 'baseline_chamfer_dist'):.4f}  (Lower = Better)")
         print(f"    Static Chamfer Dist: {self.get_avg(metrics_buffer, 'static_chamfer_dist'):.4f}  (Lower = Better)")
         print("-" * 60)

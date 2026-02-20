@@ -128,15 +128,24 @@ def main():
 
     # IMPORTANT: cfg must match what the checkpoint expects (feature_dim, voxel_size, etc.)
     cfg = TrainConfig(
-        dataset_root="/cluster/scratch/kochmar/renders3/",
+        #dataset_root="/cluster/scratch/kochmar/renders3/",
         #dataset_root="/cluster/scratch/kochmar/eval/",
+        dataset_root="/cluster/scratch/kochmar/hm3d_gt/",
+
+        real_gt_voxels_file="hm3d_voxels",
 
         #gt_voxels_file="gt_voxels_per_timestep_new_3",
-        gt_voxels_file="gt_voxels_per_timestep_new_2",
+        #gt_voxels_file="gt_voxels_per_timestep_new_2",
+        gt_voxels_file="gt_voxels_per_timestep_new",
+
+
         precomputed_cache_file="precomputed_cache",
         #precomputed_cache_file="precomputed_cache_2",
+
         #pose_file="gt_poses_new_3",
-        pose_file="gt_poses_new_2",
+        #pose_file="gt_poses_new_2",
+        pose_file="gt_poses_new",
+
         seq_file="seq_manifest.json",
         voxel_size=0.2,
         #voxel_size=0.01,
