@@ -2089,6 +2089,10 @@ class VoxelUpdaterSystem(pl.LightningModule):
             "gt_chamfer_dist": [],
             "static_chamfer_dist": [],
             "baseline_chamfer_dist": [],
+
+            "tfs_model": [],
+            "tfs_baseline": [],
+            "tfs_gt": [],
         }
 
         T = batch["timesteps"]
@@ -2225,6 +2229,15 @@ class VoxelUpdaterSystem(pl.LightningModule):
         latent_history, coord_history, prob_history, gt_history = [], [], [], []
 
         static_baseline_vox = None
+
+        # --- TFS tracking: previous frame state ---
+        prev_model_keys = None
+        prev_model_binary = None
+        prev_baseline_keys = None
+        prev_baseline_binary = None
+        prev_gt_keys = None
+        prev_gt_binary = None
+
         for t in range(T):
             # print(f"Step {t}...")
 
@@ -2586,8 +2599,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
                     #p_occ_tgt = (self.vox_real_gt.vals_st > 0).float()
 
 
-                    p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys(
-                        self.vox_real_gt.keys, p_occ_tgt, self.vox_gt.keys, default=0.0
+                    p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys_soft(
+                        self.vox_real_gt, p_occ_tgt, self.vox_gt, default=0.0, rvox=1
                     )
 
 
@@ -2626,11 +2639,12 @@ class VoxelUpdaterSystem(pl.LightningModule):
                         
 
                         # Align Prev GT to Current Keys
-                        p_occ_prev_aligned, _ = self.align_probs_to_keys(
-                            vox_gt_prev.keys,
+                        p_occ_prev_aligned, _ = self.align_probs_to_keys_soft(
+                            vox_gt_prev,
                             torch.sigmoid(vox_gt_prev.vals_st * 10.0),
-                            self.vox_gt.keys,
-                            default=0.0
+                            self.vox_gt,
+                            default=0.0, 
+                            rvox=1
                         )
 
                     # Define Masks
@@ -2687,8 +2701,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 #p_occ_tgt = (self.vox_real_gt.vals_st > 0).float()
 
 
-                p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys(
-                    self.vox_real_gt.keys, p_occ_tgt, self.vox.keys, default=0.0
+                p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys_soft(
+                    self.vox_real_gt, p_occ_tgt, self.vox, default=0.0, rvox=1
                 )
             else:
 
@@ -2696,8 +2710,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 logit_gt = self.vox_gt.vals_st.clamp(-10.0, 10.0)
                 p_occ_tgt = torch.sigmoid(logit_gt * 10.0) # Sharp GT
 
-                p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys(
-                    self.vox_gt.keys, p_occ_tgt, self.vox.keys, default=0.0
+                p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys_soft(
+                    self.vox_gt, p_occ_tgt, self.vox, default=0.0, rvox=1
                 )
 
             # 4. Standard IoU Calculation
@@ -2733,21 +2747,23 @@ class VoxelUpdaterSystem(pl.LightningModule):
                     vox_gt_prev = self.prev_vox_real_gt
 
                     # Align Prev GT to Current Keys
-                    p_occ_prev_aligned, _ = self.align_probs_to_keys(
-                        vox_gt_prev.keys,
+                    p_occ_prev_aligned, _ = self.align_probs_to_keys_soft(
+                        vox_gt_prev,
                         torch.sigmoid(vox_gt_prev.vals_st * 10.0),
-                        self.vox.keys,
-                        default=0.0
+                        self.vox,
+                        default=0.0, 
+                        rvox=1
                     )
                 else:
                     vox_gt_prev = gt_seq[t-1]
 
                     # Align Prev GT to Current Keys
-                    p_occ_prev_aligned, _ = self.align_probs_to_keys(
-                        vox_gt_prev.keys,
+                    p_occ_prev_aligned, _ = self.align_probs_to_keys_soft(
+                        vox_gt_prev,
                         torch.sigmoid(vox_gt_prev.vals_st * 10.0),
-                        self.vox.keys,
-                        default=0.0
+                        self.vox,
+                        default=0.0, 
+                        rvox=1
                     )
 
                 # Define Masks
@@ -2798,8 +2814,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 #p_occ_tgt = (self.vox_real_gt.vals_st > 0).float()
 
 
-                p_occ_tgt_base_aligned, valid_mask_base = self.align_probs_to_keys(
-                    self.vox_real_gt.keys, p_occ_tgt, self.vox_baseline.keys, default=0.0
+                p_occ_tgt_base_aligned, valid_mask_base = self.align_probs_to_keys_soft(
+                    self.vox_real_gt, p_occ_tgt, self.vox_baseline, default=0.0, rvox=1
                 )
             else:
 
@@ -2807,8 +2823,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 logit_gt = self.vox_gt.vals_st.clamp(-10.0, 10.0)
                 p_occ_tgt = torch.sigmoid(logit_gt * 10.0) # Sharp GT
 
-                p_occ_tgt_base_aligned, valid_mask_base = self.align_probs_to_keys(
-                    self.vox_gt.keys, p_occ_tgt, self.vox_baseline.keys, default=0.0
+                p_occ_tgt_base_aligned, valid_mask_base = self.align_probs_to_keys_soft(
+                    self.vox_gt, p_occ_tgt, self.vox_baseline, default=0.0, rvox=1
                 )
 
  
@@ -2849,21 +2865,23 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
 
                     # Align Prev GT to Current Keys
-                    p_occ_prev_base_aligned, _ = self.align_probs_to_keys(
-                        vox_gt_prev.keys,
+                    p_occ_prev_base_aligned, _ = self.align_probs_to_keys_soft(
+                        vox_gt_prev,
                         torch.sigmoid(vox_gt_prev.vals_st * 10.0),
-                        self.vox_baseline.keys,
-                        default=0.0
+                        self.vox_baseline,
+                        default=0.0, 
+                        rvox=1
                     )
                 else:
                     vox_gt_prev = gt_seq[t-1]
 
                     # Align Prev GT to Current Keys
-                    p_occ_prev_base_aligned, _ = self.align_probs_to_keys(
-                        vox_gt_prev.keys,
+                    p_occ_prev_base_aligned, _ = self.align_probs_to_keys_soft(
+                        vox_gt_prev,
                         torch.sigmoid(vox_gt_prev.vals_st * 10.0),
-                        self.vox_baseline.keys,
-                        default=0.0
+                        self.vox_baseline,
+                        default=0.0, 
+                        rvox=1
                     )
 
 
@@ -2924,8 +2942,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 #p_occ_tgt = (self.vox_real_gt.hit_count > 0).float()
                 #p_occ_tgt = (self.vox_real_gt.vals_st > 0).float()
 
-                static_p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys(
-                    self.vox_real_gt.keys, p_occ_tgt, static_baseline_vox.keys, default=0.0
+                static_p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys_soft(
+                    self.vox_real_gt, p_occ_tgt, static_baseline_vox, default=0.0, rvox=1
                 )
 
             else:
@@ -2934,8 +2952,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 logit_gt = self.vox_gt.vals_st.clamp(-10.0, 10.0)
                 p_occ_tgt = torch.sigmoid(logit_gt * 10.0) # Sharp GT
 
-                static_p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys(
-                    self.vox_gt.keys, p_occ_tgt, static_baseline_vox.keys, default=0.0
+                static_p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys_soft(
+                    self.vox_gt, p_occ_tgt, static_baseline_vox, default=0.0, rvox=1
                 )
 
  
@@ -2992,7 +3010,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                     p_occ_prev_aligned, _ = self.align_probs_to_keys_soft(
                         vox_gt_prev,
                         torch.sigmoid(vox_gt_prev.vals_st * 10.0),
-                        static_baseline_vox.keys,
+                        static_baseline_vox,
                         default=0.0,
                         rvox=1
                     )
@@ -3031,6 +3049,44 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
             # ---------------------------------------------------------
             # END METRICS
+            # ---------------------------------------------------------
+
+            # ---------------------------------------------------------
+            # TEMPORAL FLICKER SCORE (TFS)
+            # ---------------------------------------------------------
+            # Model TFS
+            curr_model_binary = (self.vox.decode_occupancy(with_xyz_cond=False) > 0.0)
+            tfs_model = self.compute_tfs(
+                prev_model_keys, prev_model_binary,
+                self.vox.keys.clone(), curr_model_binary,
+            )
+            if tfs_model is not None:
+                metrics_buffer["tfs_model"].append(tfs_model)
+            prev_model_keys = self.vox.keys.clone()
+            prev_model_binary = curr_model_binary.detach().clone()
+
+            # Baseline TFS
+            curr_baseline_binary = (self.vox_baseline._display_vals().clamp(-10.0, 10.0) > self.vox_baseline.p.occ_thresh)
+            tfs_baseline = self.compute_tfs(
+                prev_baseline_keys, prev_baseline_binary,
+                self.vox_baseline.keys.clone(), curr_baseline_binary,
+            )
+            if tfs_baseline is not None:
+                metrics_buffer["tfs_baseline"].append(tfs_baseline)
+            prev_baseline_keys = self.vox_baseline.keys.clone()
+            prev_baseline_binary = curr_baseline_binary.detach().clone()
+
+            # GT TFS
+            curr_gt_binary = (self.vox_gt._display_vals().clamp(-10.0, 10.0) > 0.0)
+            tfs_gt = self.compute_tfs(
+                prev_gt_keys, prev_gt_binary,
+                self.vox_gt.keys.clone(), curr_gt_binary,
+            )
+            if tfs_gt is not None:
+                metrics_buffer["tfs_gt"].append(tfs_gt)
+            prev_gt_keys = self.vox_gt.keys.clone()
+            prev_gt_binary = curr_gt_binary.detach().clone()
+
             # ---------------------------------------------------------
 
             bev_spec = BevSpec(
@@ -3138,9 +3194,14 @@ class VoxelUpdaterSystem(pl.LightningModule):
         print(f"    Baseline Chamfer Dist: {self.get_avg(metrics_buffer, 'baseline_chamfer_dist'):.4f}  (Lower = Better)")
         print(f"    Static Chamfer Dist: {self.get_avg(metrics_buffer, 'static_chamfer_dist'):.4f}  (Lower = Better)")
         print("-" * 60)
+        print(f"  Temporal Flicker Score (Lower = More Stable):")
+        print(f"    GT TFS:              {self.get_avg(metrics_buffer, 'tfs_gt'):.4f}")
+        print(f"    Model TFS:           {self.get_avg(metrics_buffer, 'tfs_model'):.4f}")
+        print(f"    Baseline TFS:        {self.get_avg(metrics_buffer, 'tfs_baseline'):.4f}")
+        print("-" * 60)
         print("\n")
 
-        return bevs, bevs_gt, bevs_baseline
+        return bevs, bevs_gt, bevs_baseline, metrics_buffer
 
 
     def on_load_checkpoint(self, checkpoint):
@@ -3190,8 +3251,38 @@ class VoxelUpdaterSystem(pl.LightningModule):
     def get_avg(self, metrics_buffer, name):
         vals = metrics_buffer[name]
         return sum(vals) / len(vals) if len(vals) > 0 else 0.0
-    
-    
+
+    @staticmethod
+    def compute_tfs(prev_keys, prev_binary, curr_keys, curr_binary):
+        """
+        Temporal Flicker Score: fraction of shared voxels that flip occupancy state
+        between consecutive frames. Lower = more temporally stable.
+        """
+        if prev_keys is None or curr_keys is None:
+            return None
+        # Hash keys to 1D for fast set intersection
+        M = 1000003
+        prev_hash = prev_keys[:, 0].long() * M * M + prev_keys[:, 1].long() * M + prev_keys[:, 2].long()
+        curr_hash = curr_keys[:, 0].long() * M * M + curr_keys[:, 1].long() * M + curr_keys[:, 2].long()
+
+        # Find voxels present in both frames
+        common_mask_prev = torch.isin(prev_hash, curr_hash)
+        common_mask_curr = torch.isin(curr_hash, prev_hash)
+
+        n_common = common_mask_prev.sum().item()
+        if n_common == 0:
+            return None
+
+        # Sort by hash so corresponding voxels align
+        prev_common_hash, prev_sort = prev_hash[common_mask_prev].sort()
+        curr_common_hash, curr_sort = curr_hash[common_mask_curr].sort()
+
+        prev_occ = prev_binary[common_mask_prev][prev_sort]
+        curr_occ = curr_binary[common_mask_curr][curr_sort]
+
+        flips = (prev_occ != curr_occ).float().mean()
+        return flips.item()
+
      
 
     def export_latent_colored_ply(self, filename, step_idx):

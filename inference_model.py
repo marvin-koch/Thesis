@@ -200,14 +200,23 @@ def main():
     # Use val_dataloader() or train_dataloader() depending on what you want to run on
     outputs = trainer.predict(model, dataloaders=dm.val_dataloader())
 
+    # --- Aggregate metrics across all sequences ---
+    all_metrics = {}   # key -> list of all per-step values across dataset
 
     meta = {}
-    # outputs is a list: one entry per sequence (batch). Your predict_step returns (bev, bev_gt).
+    # outputs is a list: one entry per sequence (batch). Your predict_step returns (bev, bev_gt, bev_baseline, metrics_buffer).
     for i, out in enumerate(outputs):
         if out is None:
             print("out is None")
             continue
-        bevs, bevs_gt, bevs_baseline = out
+        bevs, bevs_gt, bevs_baseline, seq_metrics = out
+
+        # Accumulate per-step values into global buffer
+        for key, vals in seq_metrics.items():
+            if key not in all_metrics:
+                all_metrics[key] = []
+            all_metrics[key].extend(vals)
+
         for j, (bev, bev_gt, bev_baseline) in enumerate(zip(bevs, bevs_gt, bevs_baseline)):
             print(j)
             #save_bev(bev, meta, out_dir + f"bev_{i}_{j}.png", out_dir + f"bev_{i}_{j}_np.npy", out_dir + f"bev_{i}_{j}_meta.json")
@@ -222,6 +231,76 @@ def main():
                 meta, 
                 path=f"{out_dir}compare_step_{i}_{j}.png"
             )
+
+    # --- Print dataset-wide average metrics ---
+    def avg(vals):
+        return sum(vals) / len(vals) if len(vals) > 0 else 0.0
+
+    print("\n" + "=" * 70)
+    print("DATASET-WIDE AVERAGE METRICS (across all sequences)")
+    print("=" * 70)
+
+    if "gt_occ_iou" in all_metrics and len(all_metrics["gt_occ_iou"]) > 0:
+        print(f"  GT Metrics:")
+        print(f"    IoU:                 {avg(all_metrics['gt_occ_iou']):.4f}")
+        print(f"    Recall:              {avg(all_metrics['gt_occ_recall']):.4f}")
+        print(f"    Precision:           {avg(all_metrics['gt_occ_precision']):.4f}")
+        print("-" * 70)
+
+    print(f"  MODEL Metrics:")
+    print(f"    IoU:                 {avg(all_metrics.get('occ_iou', [])):.4f}")
+    print(f"    Recall:              {avg(all_metrics.get('occ_recall', [])):.4f}")
+    print(f"    Precision:           {avg(all_metrics.get('occ_precision', [])):.4f}")
+    print("-" * 70)
+    print(f"  BASELINE Metrics:")
+    print(f"    IoU:                 {avg(all_metrics.get('baseline_occ_iou', [])):.4f}")
+    print(f"    Recall:              {avg(all_metrics.get('baseline_occ_recall', [])):.4f}")
+    print(f"    Precision:           {avg(all_metrics.get('baseline_occ_precision', [])):.4f}")
+    print("-" * 70)
+    print(f"  STATIC Metrics:")
+    print(f"    IoU:                 {avg(all_metrics.get('static_occ_iou', [])):.4f}")
+    print(f"    Recall:              {avg(all_metrics.get('static_occ_recall', [])):.4f}")
+    print(f"    Precision:           {avg(all_metrics.get('static_occ_precision', [])):.4f}")
+    print("-" * 70)
+
+    if "gt_dyn_iou" in all_metrics and len(all_metrics["gt_dyn_iou"]) > 0:
+        print(f"  Dynamic Metrics GT (Changes Only):")
+        print(f"    Dynamic IoU:         {avg(all_metrics['gt_dyn_iou']):.4f}")
+        print(f"    Appearing Recall:    {avg(all_metrics.get('gt_dyn_recall_appearing', [])):.4f}")
+        print(f"    Disappearing Recall: {avg(all_metrics.get('gt_dyn_recall_disappearing', [])):.4f}")
+        print(f"    Ghost Rate:          {avg(all_metrics.get('gt_dyn_ghost_rate', [])):.4f}")
+        print("-" * 70)
+
+    print(f"  Dynamic Metrics MODEL (Changes Only):")
+    print(f"    Dynamic IoU:         {avg(all_metrics.get('dyn_iou', [])):.4f}")
+    print(f"    Appearing Recall:    {avg(all_metrics.get('dyn_recall_appearing', [])):.4f}")
+    print(f"    Disappearing Recall: {avg(all_metrics.get('dyn_recall_disappearing', [])):.4f}")
+    print(f"    Ghost Rate:          {avg(all_metrics.get('dyn_ghost_rate', [])):.4f}")
+    print("-" * 70)
+    print(f"  Dynamic Metrics BASELINE (Changes Only):")
+    print(f"    Dynamic IoU:         {avg(all_metrics.get('baseline_dyn_iou', [])):.4f}")
+    print(f"    Appearing Recall:    {avg(all_metrics.get('baseline_dyn_recall_appearing', [])):.4f}")
+    print(f"    Disappearing Recall: {avg(all_metrics.get('baseline_dyn_recall_disappearing', [])):.4f}")
+    print(f"    Ghost Rate:          {avg(all_metrics.get('baseline_dyn_ghost_rate', [])):.4f}")
+    print("-" * 70)
+    print(f"  Dynamic Metrics STATIC (Changes Only):")
+    print(f"    Dynamic IoU:         {avg(all_metrics.get('static_dyn_iou', [])):.4f}")
+    print(f"    Appearing Recall:    {avg(all_metrics.get('static_dyn_recall_appearing', [])):.4f}")
+    print(f"    Disappearing Recall: {avg(all_metrics.get('static_dyn_recall_disappearing', [])):.4f}")
+    print(f"    Ghost Rate:          {avg(all_metrics.get('static_dyn_ghost_rate', [])):.4f}")
+    print("-" * 70)
+
+    if "gt_chamfer_dist" in all_metrics and len(all_metrics["gt_chamfer_dist"]) > 0:
+        print(f"    GT Chamfer Dist:       {avg(all_metrics['gt_chamfer_dist']):.4f}")
+    print(f"    Chamfer Dist:          {avg(all_metrics.get('chamfer_dist', [])):.4f}")
+    print(f"    Baseline Chamfer Dist: {avg(all_metrics.get('baseline_chamfer_dist', [])):.4f}")
+    print(f"    Static Chamfer Dist:   {avg(all_metrics.get('static_chamfer_dist', [])):.4f}")
+    print("-" * 70)
+    print(f"  Temporal Flicker Score (Lower = More Stable):")
+    print(f"    GT TFS:              {avg(all_metrics.get('tfs_gt', [])):.4f}")
+    print(f"    Model TFS:           {avg(all_metrics.get('tfs_model', [])):.4f}")
+    print(f"    Baseline TFS:        {avg(all_metrics.get('tfs_baseline', [])):.4f}")
+    print("=" * 70)
       
 
 
