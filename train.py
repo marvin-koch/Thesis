@@ -64,10 +64,9 @@ from sklearn.manifold import TSNE
 from pytorch3d.ops import knn_points
 from voxel.utils import build_maps_from_points_and_centers_torch, rotate_points
 
-
 from baselines import (
     TSDFFusion, EMAFusion, LastFrameFusion, ConfWeightedFusion,
-    extract_pts_cams_conf, compute_extra_baseline_metrics,
+    SimpleLogOdds, compute_extra_baseline_metrics,
 )
 
 
