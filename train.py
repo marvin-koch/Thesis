@@ -682,7 +682,13 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
         self.vox_baseline.next_epoch()
 
-        return bev, meta
+        # Return flat extracted data so extra baselines can reuse it
+        # frames_map[0] = (N,3) points, cam_centers_map[0] = (S,3) per-view cams,
+        # conf_map[0] = (N,) conf, frame_ids = (N,) view index per point
+        eb_pts  = frames_map[0]               # (N, 3)
+        eb_cams = cam_centers_map[0][frame_ids]  # (N, 3) expanded per-point
+        eb_conf = conf_map[0]                 # (N,)
+        return bev, meta, (eb_pts, eb_cams, eb_conf)
   
 
 
@@ -2129,14 +2135,23 @@ class VoxelUpdaterSystem(pl.LightningModule):
         predictions["view_feats"] = projected_feats_map
         del projected_feats_map
 
+        # with torch.no_grad():
+        #      bev_base, meta_base = self.run_baseline_inference(
+        #          predictions,
+        #          Rmw,
+        #          tmw_scaled,
+        #          scale_factor,
+        #          threshold=threshold # Or use config threshold
+        #      )
+             
         with torch.no_grad():
-             bev_base, meta_base = self.run_baseline_inference(
-                 predictions,
-                 Rmw,
-                 tmw_scaled,
-                 scale_factor,
-                 threshold=threshold # Or use config threshold
-             )
+            bev_base, meta_base, _eb_data = self.run_baseline_inference(
+                predictions,
+                Rmw,
+                tmw_scaled,
+                scale_factor,
+                threshold=threshold
+            )
 
 
         # Initialize CUDA events for high-precision timing
@@ -2341,8 +2356,17 @@ class VoxelUpdaterSystem(pl.LightningModule):
                    
             t_start_base.record()
             
+            # with torch.no_grad():
+            #      bev_base, meta_base = self.run_baseline_inference(
+            #          predictions,
+            #          Rmw,
+            #          tmw_scaled,
+            #          scale_factor,
+            #          threshold=threshold
+            #      )
+                 
             with torch.no_grad():
-                 bev_base, meta_base = self.run_baseline_inference(
+                 bev_base, meta_base, _eb_data = self.run_baseline_inference(
                      predictions,
                      Rmw,
                      tmw_scaled,
@@ -2353,15 +2377,11 @@ class VoxelUpdaterSystem(pl.LightningModule):
             t_end_base.record()           
             torch.cuda.synchronize()
             
-            # --- Extra baselines: feed same predictions ---
-            with torch.no_grad():
-                eb_pts, eb_cams, eb_conf = extract_pts_cams_conf(
-                    predictions, device=self.device,
-                    conf_threshold_pct=threshold,
-                )
-                for bname, bobj in extra_baselines.items():
-                    bobj.integrate(eb_pts, eb_cams, conf=eb_conf,
-                                   max_range=20.0)
+            # Feed same data to extra baselines
+            eb_pts, eb_cams, eb_conf = _eb_data
+            for bname, bobj in extra_baselines.items():
+                bobj.integrate(eb_pts, eb_cams, conf=eb_conf,
+                            max_range=20.0)
             
             # Calculate durations in milliseconds
             ms_pre  = t_start_pre.elapsed_time(t_end_pre)

@@ -14,22 +14,21 @@ and the metrics loop in predict_step:
     .voxel_centers()    : (M,3) float
     .occupied_mask()    : (M,) bool
 
-Baselines implemented:
+Baselines:
     1. TSDFFusion         — Curless & Levoy (1996) running weighted average
     2. EMAFusion          — Exponential moving average of occupancy evidence
-    3. LastFrameFusion    — No temporal memory; current frame replaces the map
+    3. LastFrameFusion    — No temporal memory; current frame replaces map
     4. ConfWeightedFusion — DUSt3R confidence-weighted hit counting
+    5. SimpleLogOdds      — Plain Bayesian log-odds (no ST/LT guarding)
 """
 from __future__ import annotations
 
-import math
 import torch
-import numpy as np
 from dataclasses import dataclass
 
 
 # ─────────────────────────────────────────────────────────────────
-# Shared param stub — metric code reads .p.occ_thresh / .p.voxel_size
+# Param stub — metric code reads .p.occ_thresh / .p.voxel_size
 # ─────────────────────────────────────────────────────────────────
 @dataclass
 class _BaselineParams:
@@ -51,7 +50,6 @@ class _SparseBaselineGrid:
                                        voxel_size=voxel_size)
         self.origin = torch.zeros(3, dtype=self.dtype, device=self.device)
 
-        # sparse state — aligned to self.keys
         self.keys    = torch.empty(0, dtype=torch.int64, device=self.device)
         self.vals_st = torch.empty(0, dtype=self.dtype,  device=self.device)
 
@@ -77,7 +75,6 @@ class _SparseBaselineGrid:
 
     # ── grow sparse state ────────────────────────────────────────
     def _grow_keys(self, new_keys: torch.Tensor):
-        """Merge new_keys into self.keys; grow value buffers."""
         if new_keys.numel() == 0:
             return
         merged = torch.cat([self.keys, new_keys])
@@ -100,10 +97,9 @@ class _SparseBaselineGrid:
         self._grow_extra(uk, idx_old)
 
     def _grow_extra(self, uk, idx_old):
-        """Override to grow additional per-voxel buffers."""
         pass
 
-    # ── queries (used by metrics code) ──────────────────────────
+    # ── queries ──────────────────────────────────────────────────
     def voxel_centers(self) -> torch.Tensor:
         if self.keys.numel() == 0:
             return torch.empty((0, 3), device=self.device, dtype=self.dtype)
@@ -121,7 +117,7 @@ class _SparseBaselineGrid:
     def next_epoch(self):
         pass
 
-    # ── point sanitisation ──────────────────────────────────────
+    # ── shared helpers ───────────────────────────────────────────
     def _sanitise(self, pts, cams, conf=None, max_range=20.0):
         dev = self.device
         pts  = pts.to(dev, torch.float32)
@@ -141,11 +137,10 @@ class _SparseBaselineGrid:
                 conf = conf[keep]
         return (pts, cams, conf) if conf is not None else (pts, cams)
 
-    # ── free-space ray marching (shared logic) ──────────────────
     def _march_free_keys(self, pts, cams, unique_surf_keys,
                          ray_stride=4, max_free_rays=10_000,
                          samples_per_voxel=0.7):
-        """Return unique hashed keys of free-space voxels (excluding surface)."""
+        """Unique hashed keys of free-space voxels (excluding surface)."""
         dev = self.device
         vs  = self.p.voxel_size
 
@@ -183,7 +178,7 @@ class _SparseBaselineGrid:
 class TSDFFusion(_SparseBaselineGrid):
     """
     Running weighted-average TSDF along each camera ray within a
-    truncation band around the observed surface.  Occupancy ≈ TSDF < 0.
+    truncation band around the observed surface.  Occupancy ~ TSDF < 0.
     """
 
     def __init__(self, voxel_size=0.2, device="cuda",
@@ -197,8 +192,7 @@ class TSDFFusion(_SparseBaselineGrid):
     def _grow_extra(self, uk, idx_old):
         def g(src):
             out = torch.zeros(uk.shape[0], dtype=src.dtype, device=src.device)
-            if src.numel() > 0:
-                out[idx_old] = src
+            if src.numel() > 0: out[idx_old] = src
             return out
         self._tsdf    = g(self._tsdf)
         self._weights = g(self._weights)
@@ -214,29 +208,22 @@ class TSDFFusion(_SparseBaselineGrid):
         if pts.numel() == 0:
             return
 
-        dev = self.device
+        dev   = self.device
         trunc = self.trunc_dist
-        vs = self.p.voxel_size
+        vs    = self.p.voxel_size
 
-        # ray direction (normalised)
-        ray = pts - cams
+        ray     = pts - cams
         ray_len = ray.norm(dim=1, keepdim=True).clamp(min=1e-8)
-        ray_n = ray / ray_len
+        ray_n   = ray / ray_len
 
-        # sample along truncation band [-trunc, +trunc] around surface
-        n_band = max(2, int(2 * trunc / vs) + 1)
+        n_band  = max(2, int(2 * trunc / vs) + 1)
         offsets = torch.linspace(-trunc, trunc, n_band, device=dev)
 
-        # (N, B, 3) sample positions along the ray
         sample_pts = pts[:, None, :] + ray_n[:, None, :] * offsets[None, :, None]
-        # signed distance: positive = in front of surface, negative = behind
-        sdf_vals = -offsets[None, :].expand(pts.shape[0], -1)
-        tsdf_vals = (sdf_vals / trunc).clamp(-1.0, 1.0)
-
-        # weight: higher near surface, modulated by confidence
+        sdf_vals   = -offsets[None, :].expand(pts.shape[0], -1)
+        tsdf_vals  = (sdf_vals / trunc).clamp(-1.0, 1.0)
         w = conf[:, None] * (1.0 - (offsets.abs() / trunc).clamp(0, 1))[None, :]
 
-        # flatten & hash
         flat_pts  = sample_pts.reshape(-1, 3)
         flat_tsdf = tsdf_vals.reshape(-1)
         flat_w    = w.reshape(-1)
@@ -244,19 +231,16 @@ class TSDFFusion(_SparseBaselineGrid):
         keys = self._hash_ijk(self._world_to_ijk(flat_pts))
         self._grow_keys(torch.unique(keys))
 
-        idx = torch.searchsorted(self.keys, keys)
-        idx = idx.clamp(max=self.keys.shape[0] - 1)
+        idx = torch.searchsorted(self.keys, keys).clamp(max=self.keys.shape[0] - 1)
         valid = (self.keys[idx] == keys)
         idx_v, tsdf_v, w_v = idx[valid], flat_tsdf[valid], flat_w[valid]
 
-        # running weighted average per voxel
         old_w = self._weights[idx_v]
         old_t = self._tsdf[idx_v]
         new_w = old_w + w_v
         self._tsdf[idx_v]    = (old_w * old_t + w_v * tsdf_v) / new_w.clamp(min=1e-8)
         self._weights[idx_v] = new_w
 
-        # TSDF → occupancy logit: negative TSDF = behind surface = occupied
         observed = self._weights > 0.5
         self.vals_st = -self._tsdf * observed.float()
 
@@ -266,8 +250,7 @@ class TSDFFusion(_SparseBaselineGrid):
 # ═════════════════════════════════════════════════════════════════
 class EMAFusion(_SparseBaselineGrid):
     """
-    p_v ← (1-α) p_v + α · evidence,   evidence ∈ {0, 1}.
-    Simpler than ST/LT log-odds; tests whether a basic smoother suffices.
+    p_v <- (1-alpha) p_v + alpha * evidence,  evidence in {0, 1}.
     """
 
     def __init__(self, voxel_size=0.2, device="cuda",
@@ -280,13 +263,11 @@ class EMAFusion(_SparseBaselineGrid):
 
     def _grow_extra(self, uk, idx_old):
         def gf(src, fill=0.0):
-            out = torch.full((uk.shape[0],), fill, dtype=torch.float32,
-                             device=src.device)
+            out = torch.full((uk.shape[0],), fill, dtype=torch.float32, device=src.device)
             if src.numel() > 0: out[idx_old] = src
             return out
         def gb(src, fill=False):
-            out = torch.full((uk.shape[0],), fill, dtype=torch.bool,
-                             device=src.device)
+            out = torch.full((uk.shape[0],), fill, dtype=torch.bool, device=src.device)
             if src.numel() > 0: out[idx_old] = src
             return out
         self._prob = gf(self._prob, 0.0)
@@ -299,43 +280,36 @@ class EMAFusion(_SparseBaselineGrid):
         if pts.numel() == 0:
             return
 
-        dev, α = self.device, self.alpha
-
-        # surface keys
+        dev, a = self.device, self.alpha
         keys_surf = self._hash_ijk(self._world_to_ijk(pts))
-        u_surf = torch.unique(keys_surf)
+        u_surf    = torch.unique(keys_surf)
 
-        # free-space keys
-        keys_free = self._march_free_keys(pts, cams, u_surf,
-                                           ray_stride, max_free_rays) \
+        keys_free = self._march_free_keys(pts, cams, u_surf, ray_stride, max_free_rays) \
                     if carve_free else torch.zeros(0, dtype=torch.int64, device=dev)
 
         self._grow_keys(torch.cat([u_surf, keys_free]))
 
-        # EMA surface (evidence = 1)
+        # surface (evidence = 1)
         idx_s = torch.searchsorted(self.keys, u_surf).clamp(max=self.keys.shape[0]-1)
-        hit_s = self.keys[idx_s] == u_surf
-        idx_s = idx_s[hit_s]
+        hit_s = self.keys[idx_s] == u_surf;  idx_s = idx_s[hit_s]
         new_s = ~self._seen[idx_s]
         self._prob[idx_s[new_s]] = 1.0
         self._seen[idx_s] = True
         old_s = ~new_s
         if old_s.any():
-            self._prob[idx_s[old_s]] = (1 - α) * self._prob[idx_s[old_s]] + α
+            self._prob[idx_s[old_s]] = (1 - a) * self._prob[idx_s[old_s]] + a
 
-        # EMA free (evidence = 0)
+        # free (evidence = 0)
         if keys_free.numel() > 0:
             idx_f = torch.searchsorted(self.keys, keys_free).clamp(max=self.keys.shape[0]-1)
-            hit_f = self.keys[idx_f] == keys_free
-            idx_f = idx_f[hit_f]
+            hit_f = self.keys[idx_f] == keys_free;  idx_f = idx_f[hit_f]
             new_f = ~self._seen[idx_f]
             self._prob[idx_f[new_f]] = 0.0
             self._seen[idx_f] = True
             old_f = ~new_f
             if old_f.any():
-                self._prob[idx_f[old_f]] *= (1 - α)
+                self._prob[idx_f[old_f]] *= (1 - a)
 
-        # prob → logit
         p = self._prob.clamp(1e-6, 1 - 1e-6)
         self.vals_st = torch.log(p / (1 - p))
 
@@ -344,10 +318,7 @@ class EMAFusion(_SparseBaselineGrid):
 # 3. Last-Frame Snapshot  (no temporal memory)
 # ═════════════════════════════════════════════════════════════════
 class LastFrameFusion(_SparseBaselineGrid):
-    """
-    Completely replaces the map each timestep.  Quantifies the value
-    of ANY temporal integration (expected: decent IoU, terrible TFS).
-    """
+    """Completely replaces the map each timestep."""
 
     @torch.no_grad()
     def integrate(self, pts, cams, conf=None, max_range=20.0,
@@ -358,21 +329,17 @@ class LastFrameFusion(_SparseBaselineGrid):
 
         dev = self.device
         keys_surf = self._hash_ijk(self._world_to_ijk(pts))
-        u_surf = torch.unique(keys_surf)
+        u_surf    = torch.unique(keys_surf)
 
-        keys_free = self._march_free_keys(pts, cams, u_surf,
-                                           ray_stride, max_free_rays) \
+        keys_free = self._march_free_keys(pts, cams, u_surf, ray_stride, max_free_rays) \
                     if carve_free else torch.zeros(0, dtype=torch.int64, device=dev)
 
-        # REPLACE entire map
         all_keys = torch.unique(torch.cat([u_surf, keys_free]), sorted=True)
         self.keys    = all_keys
         self.vals_st = torch.zeros(all_keys.shape[0], dtype=self.dtype, device=dev)
 
-        # surface = +1 logit, free = -1 logit
         idx_s = torch.searchsorted(self.keys, u_surf)
         self.vals_st[idx_s] = 1.0
-
         if keys_free.numel() > 0:
             idx_f = torch.searchsorted(self.keys, keys_free)
             self.vals_st[idx_f] = -1.0
@@ -385,23 +352,17 @@ class ConfWeightedFusion(_SparseBaselineGrid):
     """
     score[v] += mean_conf_in_voxel  (surface)
     score[v] -= free_penalty        (free-space)
-
-    Tests whether DUSt3R confidence alone, without learned features
-    or a GRU, is sufficient for temporal fusion.
     """
 
     def __init__(self, voxel_size=0.2, device="cuda",
                  free_penalty: float = 0.15, occ_thresh: float = 0.0):
-        super().__init__(voxel_size=voxel_size, device=device,
-                         occ_thresh=occ_thresh)
+        super().__init__(voxel_size=voxel_size, device=device, occ_thresh=occ_thresh)
         self.free_penalty = free_penalty
         self._score = torch.empty(0, dtype=self.dtype, device=self.device)
 
     def _grow_extra(self, uk, idx_old):
-        out = torch.zeros(uk.shape[0], dtype=self._score.dtype,
-                          device=self._score.device)
-        if self._score.numel() > 0:
-            out[idx_old] = self._score
+        out = torch.zeros(uk.shape[0], dtype=self._score.dtype, device=self._score.device)
+        if self._score.numel() > 0: out[idx_old] = self._score
         self._score = out
 
     @torch.no_grad()
@@ -417,16 +378,14 @@ class ConfWeightedFusion(_SparseBaselineGrid):
 
         dev = self.device
         keys_surf = self._hash_ijk(self._world_to_ijk(pts))
-        u_surf = torch.unique(keys_surf)
+        u_surf    = torch.unique(keys_surf)
 
-        keys_free = self._march_free_keys(pts, cams, u_surf,
-                                           ray_stride, max_free_rays) \
+        keys_free = self._march_free_keys(pts, cams, u_surf, ray_stride, max_free_rays) \
                     if carve_free else torch.zeros(0, dtype=torch.int64, device=dev)
 
         self._grow_keys(torch.cat([u_surf, keys_free]))
 
-        # accumulate mean conf into surface voxels
-        idx_pts = torch.searchsorted(self.keys, keys_surf).clamp(max=self.keys.shape[0]-1)
+        idx_pts  = torch.searchsorted(self.keys, keys_surf).clamp(max=self.keys.shape[0]-1)
         conf_sum = torch.zeros(self.keys.shape[0], device=dev)
         cnt      = torch.zeros(self.keys.shape[0], device=dev)
         conf_sum.scatter_add_(0, idx_pts, conf)
@@ -434,7 +393,6 @@ class ConfWeightedFusion(_SparseBaselineGrid):
         has = cnt > 0
         self._score[has] += conf_sum[has] / cnt[has]
 
-        # subtract penalty from free voxels
         if keys_free.numel() > 0:
             idx_f = torch.searchsorted(self.keys, keys_free).clamp(max=self.keys.shape[0]-1)
             hit_f = self.keys[idx_f] == keys_free
@@ -444,89 +402,86 @@ class ConfWeightedFusion(_SparseBaselineGrid):
 
 
 # ═════════════════════════════════════════════════════════════════
-# Helper: extract flat pts / cams / conf from predictions dict
+# 5. Simple Log-Odds  (plain Bayesian, no ST/LT, no guarding)
 # ═════════════════════════════════════════════════════════════════
-
-def extract_pts_cams_conf(predictions, device, conf_threshold_pct=50.0):
+class SimpleLogOdds(_SparseBaselineGrid):
     """
-    From the already-transformed predictions dict (after rotation,
-    scaling, striding in predict_step), extract flat tensors.
+    Standard Bayesian log-odds occupancy [Elfes 1989, Thrun 2005].
+    NO heuristic hardening: no ST/LT split, no epoch-based promotion,
+    no guarded carving, no demotion.
 
-    Mirrors build_frames_and_centers_vectorized_torch so baselines
-    receive identical input to the existing geometric baseline.
+    Isolates the value of the ST/LT engineering in your Sec 3.4.
+    Expected: brittle under misalignment — aggressive clearing of
+    valid walls and ghost trails from moving objects.
     """
-    dev = torch.device(device)
-    pts  = predictions["world_points"].to(dev, torch.float32)      # (S,H,W,3)
 
-    extr = predictions["extrinsic"]
-    if isinstance(extr, list):
-        extr = torch.stack(extr)
-    extr = extr.to(dev, torch.float32)
+    def __init__(self, voxel_size=0.2, device="cuda",
+                 occ_inc: float = 0.5, free_inc: float = -0.3,
+                 l_min: float = -3.0, l_max: float = 3.5,
+                 occ_thresh: float = 0.0):
+        super().__init__(voxel_size=voxel_size, device=device, occ_thresh=occ_thresh)
+        self.occ_inc  = occ_inc
+        self.free_inc = free_inc
+        self.l_min    = l_min
+        self.l_max    = l_max
 
-    S, H, W, _ = pts.shape
-    cam_c = extr[:, :3, 3]                                          # (S,3)
+    @torch.no_grad()
+    def integrate(self, pts, cams, conf=None, max_range=20.0,
+                  carve_free=True, ray_stride=4, max_free_rays=10_000):
+        pts, cams = self._sanitise(pts, cams, max_range=max_range)
+        if pts.numel() == 0:
+            return
 
-    pts_flat  = pts.reshape(-1, 3)
-    cams_flat = cam_c[:, None, None, :].expand(S, H, W, 3).reshape(-1, 3)
+        dev = self.device
+        keys_surf = self._hash_ijk(self._world_to_ijk(pts))
+        u_surf    = torch.unique(keys_surf)
 
-    # confidence
-    if "world_points_conf" in predictions and predictions["world_points_conf"] is not None:
-        c = predictions["world_points_conf"].to(dev, torch.float32)
-        if c.ndim == 4 and c.shape[-1] == 1:
-            c = c.squeeze(-1)
-        conf_flat = c.reshape(-1)
-    else:
-        conf_flat = torch.ones(pts_flat.shape[0], device=dev)
+        keys_free = self._march_free_keys(pts, cams, u_surf, ray_stride, max_free_rays) \
+                    if carve_free else torch.zeros(0, dtype=torch.int64, device=dev)
 
-    # filter valid
-    ok = (torch.isfinite(pts_flat).all(1) &
-          torch.isfinite(cams_flat).all(1) &
-          torch.isfinite(conf_flat))
-    pts_flat, cams_flat, conf_flat = pts_flat[ok], cams_flat[ok], conf_flat[ok]
+        self._grow_keys(torch.cat([u_surf, keys_free]))
 
-    # confidence threshold (percentile)
-    if conf_threshold_pct > 0 and conf_flat.numel() > 0:
-        n_samp = min(1_000_000, conf_flat.numel())
-        samp = conf_flat[torch.randperm(conf_flat.numel(), device=dev)[:n_samp]]
-        samp = samp[torch.isfinite(samp)]
-        if samp.numel() > 0:
-            ct = torch.quantile(samp, conf_threshold_pct / 100.0).item()
-            keep = conf_flat >= ct
-            pts_flat, cams_flat, conf_flat = (pts_flat[keep],
-                                              cams_flat[keep],
-                                              conf_flat[keep])
+        # occupied: +occ_inc per unique hit
+        idx_s = torch.searchsorted(self.keys, u_surf).clamp(max=self.keys.shape[0]-1)
+        hit_s = self.keys[idx_s] == u_surf
+        self.vals_st[idx_s[hit_s]] += self.occ_inc
 
-    return pts_flat, cams_flat, conf_flat
+        # free: +free_inc (negative) per unique hit
+        if keys_free.numel() > 0:
+            idx_f = torch.searchsorted(self.keys, keys_free).clamp(max=self.keys.shape[0]-1)
+            hit_f = self.keys[idx_f] == keys_free
+            self.vals_st[idx_f[hit_f]] += self.free_inc
+
+        self.vals_st.clamp_(self.l_min, self.l_max)
 
 
 # ═════════════════════════════════════════════════════════════════
-# Helper: compute all metrics for extra baselines (one timestep)
+# Metric helper: compute IoU / dynamic / TFS for all extra baselines
 # ═════════════════════════════════════════════════════════════════
 
 def compute_extra_baseline_metrics(
-    system,             # VoxelUpdaterSystem instance (for align_probs_to_keys_soft)
+    system,             # VoxelUpdaterSystem (for align_probs_to_keys_soft)
     extra_baselines,    # dict {name: baseline_obj}
     metrics_buffer,     # the global metrics_buffer dict
     vox_gt,             # GT voxel grid for timestep t
-    gt_seq,             # list of all GT grids (for t-1 lookups)
+    gt_seq,             # list of all GT grids
     t,                  # current timestep index
-    prev_extra_keys,    # dict {name: tensor | None}  — mutated in place
-    prev_extra_binary,  # dict {name: tensor | None}  — mutated in place
-    compute_tfs_fn,     # VoxelUpdaterSystem.compute_tfs (static method)
+    prev_extra_keys,    # dict {name: tensor|None} — mutated
+    prev_extra_binary,  # dict {name: tensor|None} — mutated
+    compute_tfs_fn,     # VoxelUpdaterSystem.compute_tfs
     use_real_gt=False,
     vox_real_gt=None,
     prev_vox_real_gt=None,
 ):
     """
     Compute IoU, dynamic metrics, and TFS for every extra baseline.
-    Uses the exact same logic as the existing baseline metrics block.
+    Mirrors the existing baseline metrics block exactly.
     """
     if vox_gt is None:
         return
 
     ref_vox = vox_real_gt if (use_real_gt and vox_real_gt is not None) else vox_gt
 
-    # prepare GT probs once
     logit_gt  = ref_vox.vals_st.clamp(-10, 10)
     p_occ_tgt = torch.sigmoid(logit_gt * 10.0)
 
@@ -534,12 +489,11 @@ def compute_extra_baseline_metrics(
         if bobj.keys.numel() == 0:
             continue
 
-        # ── align GT to baseline keys ──
+        # align GT → baseline keys
         tgt_aligned, valid = system.align_probs_to_keys_soft(
             ref_vox, p_occ_tgt, bobj, default=0.0, r_vox=2)
 
-        logit_b = bobj._display_vals().clamp(-10, 10)
-
+        logit_b  = bobj._display_vals().clamp(-10, 10)
         pred_int = logit_b[valid]
         tgt_int  = tgt_aligned[valid]
         pred_fp  = logit_b[~valid]
@@ -560,13 +514,15 @@ def compute_extra_baseline_metrics(
         metrics_buffer[f"{bname}_occ_precision"].append(
             (tp / (tp + total_fp + 1e-8)).item())
 
-        # ── dynamic metrics ──
+        # dynamic metrics
         if t > 0:
-            prev_ref = (prev_vox_real_gt if (use_real_gt and prev_vox_real_gt is not None)
+            prev_ref = (prev_vox_real_gt
+                        if (use_real_gt and prev_vox_real_gt is not None)
                         else (gt_seq[t-1] if t-1 < len(gt_seq) else None))
             if prev_ref is not None and prev_ref.keys.numel() > 0:
                 p_prev_al, vp = system.align_probs_to_keys_soft(
-                    prev_ref, torch.sigmoid(prev_ref.vals_st.clamp(-10,10)*10),
+                    prev_ref,
+                    torch.sigmoid(prev_ref.vals_st.clamp(-10, 10) * 10),
                     bobj, default=0.0, r_vox=2)
                 both = valid & vp
                 bi   = both[valid]
@@ -594,7 +550,7 @@ def compute_extra_baseline_metrics(
                         metrics_buffer[f"{bname}_dyn_iou"].append(
                             ((pd & gd).sum() / ((pd | gd).sum() + 1e-8)).item())
 
-        # ── TFS ──
+        # TFS
         curr_keys   = bobj.keys.clone()
         curr_binary = (bobj._display_vals() > bobj.p.occ_thresh).clone()
 
