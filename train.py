@@ -65,6 +65,12 @@ from pytorch3d.ops import knn_points
 from voxel.utils import build_maps_from_points_and_centers_torch, rotate_points
 
 
+from baselines import (
+    TSDFFusion, EMAFusion, LastFrameFusion, ConfWeightedFusion,
+    extract_pts_cams_conf, compute_extra_baseline_metrics,
+)
+
+
 try:
     import umap
     HAS_UMAP = True
@@ -2145,6 +2151,23 @@ class VoxelUpdaterSystem(pl.LightningModule):
         latent_history, coord_history, prob_history, gt_history = [], [], [], []
 
         static_baseline_vox = None
+        
+        # --- Extra baselines ---
+        extra_baselines = {
+            "tsdf":      TSDFFusion(voxel_size=self.cfg.voxel_size, device=device),
+            "ema":       EMAFusion(voxel_size=self.cfg.voxel_size, device=device, alpha=0.3),
+            "lastframe": LastFrameFusion(voxel_size=self.cfg.voxel_size, device=device),
+            "confwt":    ConfWeightedFusion(voxel_size=self.cfg.voxel_size, device=device, free_penalty=0.15),
+        }
+        for bname in extra_baselines:
+            for mkey in ["occ_iou", "occ_recall", "occ_precision",
+                         "dyn_iou", "dyn_recall_appearing",
+                         "dyn_recall_disappearing", "dyn_ghost_rate",
+                         "tfs"]:
+                metrics_buffer[f"{bname}_{mkey}"] = []
+
+        prev_extra_keys   = {b: None for b in extra_baselines}
+        prev_extra_binary = {b: None for b in extra_baselines}
 
         # --- TFS tracking: previous frame state ---
         prev_model_keys = None
@@ -2329,6 +2352,16 @@ class VoxelUpdaterSystem(pl.LightningModule):
                  
             t_end_base.record()           
             torch.cuda.synchronize()
+            
+            # --- Extra baselines: feed same predictions ---
+            with torch.no_grad():
+                eb_pts, eb_cams, eb_conf = extract_pts_cams_conf(
+                    predictions, device=self.device,
+                    conf_threshold_pct=threshold,
+                )
+                for bname, bobj in extra_baselines.items():
+                    bobj.integrate(eb_pts, eb_cams, conf=eb_conf,
+                                   max_range=20.0)
             
             # Calculate durations in milliseconds
             ms_pre  = t_start_pre.elapsed_time(t_end_pre)
@@ -2868,6 +2901,24 @@ class VoxelUpdaterSystem(pl.LightningModule):
             # ---------------------------------------------------------
             # END METRICS
             # ---------------------------------------------------------
+            
+            # ---------------------------------------------------------
+            # METRICS: EXTRA BASELINES  (TSDF, EMA, LastFrame, ConfWt)
+            # ---------------------------------------------------------
+            compute_extra_baseline_metrics(
+                system=self,
+                extra_baselines=extra_baselines,
+                metrics_buffer=metrics_buffer,
+                vox_gt=self.vox_gt,
+                gt_seq=gt_seq,
+                t=t,
+                prev_extra_keys=prev_extra_keys,
+                prev_extra_binary=prev_extra_binary,
+                compute_tfs_fn=self.compute_tfs,
+                use_real_gt=bool(self.cfg.real_gt_voxels_file),
+                vox_real_gt=getattr(self, 'vox_real_gt', None),
+                prev_vox_real_gt=getattr(self, 'prev_vox_real_gt', None),
+            )
 
             # ---------------------------------------------------------
             # TEMPORAL FLICKER SCORE (TFS)
