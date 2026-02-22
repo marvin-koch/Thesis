@@ -1169,9 +1169,13 @@ class VoxelUpdaterSystem(pl.LightningModule):
               
                 if self.vox_gt_prev is not None:
                     # 1. Align Past to Present
-                    p_occ_tgt_gt_aligned_prev, _ = self.align_probs_to_keys_soft(
+                    p_occ_tgt_gt_aligned_prev, valid_prev = self.align_probs_to_keys_soft(
                         self.vox_gt_prev, self.tgt_prev, self.vox, default=0.0
                     )
+                    # BUG FIX: Only mark transitions where BOTH timesteps have valid coverage.
+                    # Voxels only in current (not in prev) get default=0.0, which falsely
+                    # triggers "appearing". Mask those out.
+                    both_valid_mask = valid_prev[valid_mask]  # (num_valid,) bool
                     tgt_intersect_prev = p_occ_tgt_gt_aligned_prev[valid_mask]
 
                     # 2. Identify the specific types of change
@@ -1180,11 +1184,11 @@ class VoxelUpdaterSystem(pl.LightningModule):
                     curr_bool = (tgt_intersect > 0.5)
                     prev_bool = (tgt_intersect_prev > 0.5)
 
-                    # Case A: Object Jumped IN (Air -> Wall)
-                    appearing_mask = curr_bool & (~prev_bool)
+                    # Case A: Object Jumped IN (Air -> Wall) — only where both valid
+                    appearing_mask = curr_bool & (~prev_bool) & both_valid_mask
 
-                    # Case B: Object Jumped OUT (Wall -> Air) -> THIS CAUSES GHOSTING
-                    disappearing_mask = (~curr_bool) & prev_bool
+                    # Case B: Object Jumped OUT (Wall -> Air) — only where both valid
+                    disappearing_mask = (~curr_bool) & prev_bool & both_valid_mask
 
                     # 3. Apply the Weights
                     weights = torch.ones_like(tgt_intersect)
@@ -2651,7 +2655,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                         
 
                         # Align Prev GT to Current Keys
-                        p_occ_prev_aligned, _ = self.align_probs_to_keys_soft(
+                        p_occ_prev_aligned, valid_prev_gt = self.align_probs_to_keys_soft(
                             vox_gt_prev,
                             torch.sigmoid(vox_gt_prev.vals_st * 10.0),
                             self.vox_gt,
@@ -2659,29 +2663,38 @@ class VoxelUpdaterSystem(pl.LightningModule):
                             r_vox=1
                         )
 
+                    # BUG FIX: Only evaluate dynamics where BOTH timesteps have valid coverage.
+                    # Without this, voxels missing from the previous alignment get default=0.0,
+                    # which falsely registers as "appearing" or "disappearing" transitions.
+                    both_valid_gt = valid_mask & valid_prev_gt
+                    # Index into the both_valid subset
+                    both_in_valid = both_valid_gt[valid_mask]  # which of the valid_mask entries are also in valid_prev_gt
+
                     # Define Masks
-                    gt_curr = (tgt_intersect > 0.5)
-                    # Note: We align Previous GT to Current Keys, so we use valid_mask of current keys
-                    gt_prev = (p_occ_prev_aligned[valid_mask] > 0.5)
+                    gt_curr = (tgt_intersect[both_in_valid] > 0.5)
+                    gt_prev = (p_occ_prev_aligned[both_valid_gt] > 0.5)
 
                     mask_appearing    = (~gt_prev & gt_curr)  # Empty -> Occupied
                     mask_disappearing = (gt_prev & ~gt_curr)  # Occupied -> Empty
                     mask_dynamic      = (gt_prev != gt_curr)
 
+                    # For pred, also restrict to both_valid subset
+                    pred_both_valid = pred_intersect[both_in_valid]
+
                     # A. Appearing Recall (Do we see new objects?)
                     if mask_appearing.sum() > 0:
-                        pred_appearing = (pred_intersect[mask_appearing] > 0.0)
+                        pred_appearing = (pred_both_valid[mask_appearing] > 0.0)
                         metrics_buffer["gt_dyn_recall_appearing"].append(pred_appearing.float().mean().item())
 
                     # B. Disappearing / Ghosting (Do we clear old objects?)
                     if mask_disappearing.sum() > 0:
-                        pred_ghosts = (pred_intersect[mask_disappearing] > 0.0)
+                        pred_ghosts = (pred_both_valid[mask_disappearing] > 0.0)
                         metrics_buffer["gt_dyn_ghost_rate"].append(pred_ghosts.float().mean().item())
                         metrics_buffer["gt_dyn_recall_disappearing"].append((~pred_ghosts).float().mean().item())
 
                     # C. Dynamic IoU
                     if mask_dynamic.sum() > 0:
-                        pred_dyn = (pred_intersect[mask_dynamic] > 0.0)
+                        pred_dyn = (pred_both_valid[mask_dynamic] > 0.0)
                         gt_dyn   = gt_curr[mask_dynamic]
                         intersection = (pred_dyn & gt_dyn).sum()
                         union        = (pred_dyn | gt_dyn).sum()
@@ -2759,7 +2772,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                     vox_gt_prev = self.prev_vox_real_gt
 
                     # Align Prev GT to Current Keys
-                    p_occ_prev_aligned, _ = self.align_probs_to_keys_soft(
+                    p_occ_prev_aligned, valid_prev_model = self.align_probs_to_keys_soft(
                         vox_gt_prev,
                         torch.sigmoid(vox_gt_prev.vals_st * 10.0),
                         self.vox,
@@ -2770,7 +2783,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                     vox_gt_prev = gt_seq[t-1]
 
                     # Align Prev GT to Current Keys
-                    p_occ_prev_aligned, _ = self.align_probs_to_keys_soft(
+                    p_occ_prev_aligned, valid_prev_model = self.align_probs_to_keys_soft(
                         vox_gt_prev,
                         torch.sigmoid(vox_gt_prev.vals_st * 10.0),
                         self.vox,
@@ -2778,29 +2791,35 @@ class VoxelUpdaterSystem(pl.LightningModule):
                         r_vox=1
                     )
 
+                # BUG FIX: Only evaluate dynamics where BOTH timesteps have valid coverage.
+                both_valid_model = valid_mask & valid_prev_model
+                both_in_valid_model = both_valid_model[valid_mask]  # subset of valid_mask entries
+
                 # Define Masks
-                gt_curr = (tgt_intersect > 0.5)
-                # Note: We align Previous GT to Current Keys, so we use valid_mask of current keys
-                gt_prev = (p_occ_prev_aligned[valid_mask] > 0.5)
+                gt_curr = (tgt_intersect[both_in_valid_model] > 0.5)
+                gt_prev = (p_occ_prev_aligned[both_valid_model] > 0.5)
 
                 mask_appearing    = (~gt_prev & gt_curr)  # Empty -> Occupied
                 mask_disappearing = (gt_prev & ~gt_curr)  # Occupied -> Empty
                 mask_dynamic      = (gt_prev != gt_curr)
 
+                # Restrict pred to same subset
+                pred_both_valid_model = pred_intersect[both_in_valid_model]
+
                 # A. Appearing Recall (Do we see new objects?)
                 if mask_appearing.sum() > 0:
-                    pred_appearing = (pred_intersect[mask_appearing] > 0.0)
+                    pred_appearing = (pred_both_valid_model[mask_appearing] > 0.0)
                     metrics_buffer["dyn_recall_appearing"].append(pred_appearing.float().mean().item())
 
                 # B. Disappearing / Ghosting (Do we clear old objects?)
                 if mask_disappearing.sum() > 0:
-                    pred_ghosts = (pred_intersect[mask_disappearing] > 0.0)
+                    pred_ghosts = (pred_both_valid_model[mask_disappearing] > 0.0)
                     metrics_buffer["dyn_ghost_rate"].append(pred_ghosts.float().mean().item())
                     metrics_buffer["dyn_recall_disappearing"].append((~pred_ghosts).float().mean().item())
 
                 # C. Dynamic IoU
                 if mask_dynamic.sum() > 0:
-                    pred_dyn = (pred_intersect[mask_dynamic] > 0.0)
+                    pred_dyn = (pred_both_valid_model[mask_dynamic] > 0.0)
                     gt_dyn   = gt_curr[mask_dynamic]
                     intersection = (pred_dyn & gt_dyn).sum()
                     union        = (pred_dyn | gt_dyn).sum()
@@ -2877,7 +2896,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
 
                     # Align Prev GT to Current Keys
-                    p_occ_prev_base_aligned, _ = self.align_probs_to_keys_soft(
+                    p_occ_prev_base_aligned, valid_prev_base = self.align_probs_to_keys_soft(
                         vox_gt_prev,
                         torch.sigmoid(vox_gt_prev.vals_st * 10.0),
                         self.vox_baseline,
@@ -2888,7 +2907,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                     vox_gt_prev = gt_seq[t-1]
 
                     # Align Prev GT to Current Keys
-                    p_occ_prev_base_aligned, _ = self.align_probs_to_keys_soft(
+                    p_occ_prev_base_aligned, valid_prev_base = self.align_probs_to_keys_soft(
                         vox_gt_prev,
                         torch.sigmoid(vox_gt_prev.vals_st * 10.0),
                         self.vox_baseline,
@@ -2896,30 +2915,35 @@ class VoxelUpdaterSystem(pl.LightningModule):
                         r_vox=1
                     )
 
+                # BUG FIX: Only evaluate dynamics where BOTH timesteps have valid coverage.
+                both_valid_base = valid_mask_base & valid_prev_base
+                both_in_valid_base = both_valid_base[valid_mask_base]
 
                 # 2. Define Dynamic Masks for Baseline spatial context
-                # Use the aligned current GT from the baseline intersection logic above
-                gt_curr_base = (tgt_intersect_base > 0.5)
-                gt_prev_base = (p_occ_prev_base_aligned[valid_mask_base] > 0.5)
+                gt_curr_base = (tgt_intersect_base[both_in_valid_base] > 0.5)
+                gt_prev_base = (p_occ_prev_base_aligned[both_valid_base] > 0.5)
 
                 mask_app_base  = (~gt_prev_base & gt_curr_base)
                 mask_dis_base  = (gt_prev_base & ~gt_curr_base)
                 mask_dyn_base  = (gt_prev_base != gt_curr_base)
 
+                # Restrict baseline pred to same subset
+                base_both_valid = base_intersect[both_in_valid_base]
+
                 # 3. Baseline Appearing Recall (New objects)
                 if mask_app_base.sum() > 0:
-                    base_app_pred = (base_intersect[mask_app_base] > self.vox_baseline.p.occ_thresh)
+                    base_app_pred = (base_both_valid[mask_app_base] > self.vox_baseline.p.occ_thresh)
                     metrics_buffer["baseline_dyn_recall_appearing"].append(base_app_pred.float().mean().item())
 
                 # 4. Baseline Ghosting / Disappearing (Clearing old objects)
                 if mask_dis_base.sum() > 0:
-                    base_ghosts = (base_intersect[mask_dis_base] > self.vox_baseline.p.occ_thresh)
+                    base_ghosts = (base_both_valid[mask_dis_base] > self.vox_baseline.p.occ_thresh)
                     metrics_buffer["baseline_dyn_ghost_rate"].append(base_ghosts.float().mean().item())
                     metrics_buffer["baseline_dyn_recall_disappearing"].append((~base_ghosts).float().mean().item())
 
                 # 5. Baseline Dynamic IoU
                 if mask_dyn_base.sum() > 0:
-                    base_dyn_pred = (base_intersect[mask_dyn_base] > self.vox_baseline.p.occ_thresh)
+                    base_dyn_pred = (base_both_valid[mask_dyn_base] > self.vox_baseline.p.occ_thresh)
                     gt_dyn_base   = gt_curr_base[mask_dyn_base]
                     
                     int_dyn_base = (base_dyn_pred & gt_dyn_base).sum()
@@ -3008,7 +3032,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
 
                     # Align Prev GT to Current Keys
-                    p_occ_prev_aligned, _ = self.align_probs_to_keys_soft(
+                    p_occ_prev_aligned, valid_prev_static = self.align_probs_to_keys_soft(
                         vox_gt_prev,
                         torch.sigmoid(vox_gt_prev.vals_st * 10.0),
                         static_baseline_vox,
@@ -3019,7 +3043,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                     vox_gt_prev = gt_seq[t-1]
 
                     # Align Prev GT to Current Keys
-                    p_occ_prev_aligned, _ = self.align_probs_to_keys_soft(
+                    p_occ_prev_aligned, valid_prev_static = self.align_probs_to_keys_soft(
                         vox_gt_prev,
                         torch.sigmoid(vox_gt_prev.vals_st * 10.0),
                         static_baseline_vox,
@@ -3027,29 +3051,35 @@ class VoxelUpdaterSystem(pl.LightningModule):
                         r_vox=1
                     )
 
+                # BUG FIX: Only evaluate dynamics where BOTH timesteps have valid coverage.
+                both_valid_static = valid_mask & valid_prev_static
+                both_in_valid_static = both_valid_static[valid_mask]
+
                 # Define Masks
-                gt_curr = (tgt_intersect > 0.5)
-                # Note: We align Previous GT to Current Keys, so we use valid_mask of current keys
-                gt_prev = (p_occ_prev_aligned[valid_mask] > 0.5)
+                gt_curr = (tgt_intersect[both_in_valid_static] > 0.5)
+                gt_prev = (p_occ_prev_aligned[both_valid_static] > 0.5)
 
                 mask_appearing    = (~gt_prev & gt_curr)  # Empty -> Occupied
                 mask_disappearing = (gt_prev & ~gt_curr)  # Occupied -> Empty
                 mask_dynamic      = (gt_prev != gt_curr)
 
+                # Restrict pred to same subset
+                pred_both_valid_static = pred_intersect[both_in_valid_static]
+
                 # A. Appearing Recall (Do we see new objects?)
                 if mask_appearing.sum() > 0:
-                    pred_appearing = (pred_intersect[mask_appearing] > 0.0)
+                    pred_appearing = (pred_both_valid_static[mask_appearing] > 0.0)
                     metrics_buffer["static_dyn_recall_appearing"].append(pred_appearing.float().mean().item())
 
                 # B. Disappearing / Ghosting (Do we clear old objects?)
                 if mask_disappearing.sum() > 0:
-                    pred_ghosts = (pred_intersect[mask_disappearing] > 0.0)
+                    pred_ghosts = (pred_both_valid_static[mask_disappearing] > 0.0)
                     metrics_buffer["static_dyn_ghost_rate"].append(pred_ghosts.float().mean().item())
                     metrics_buffer["static_dyn_recall_disappearing"].append((~pred_ghosts).float().mean().item())
 
                 # C. Dynamic IoU
                 if mask_dynamic.sum() > 0:
-                    pred_dyn = (pred_intersect[mask_dynamic] > 0.0)
+                    pred_dyn = (pred_both_valid_static[mask_dynamic] > 0.0)
                     gt_dyn   = gt_curr[mask_dynamic]
                     intersection = (pred_dyn & gt_dyn).sum()
                     union        = (pred_dyn | gt_dyn).sum()
