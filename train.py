@@ -72,7 +72,7 @@ except ImportError:
     HAS_UMAP = False
 
 
-STEP = 1
+STEP = 20
 
 def load_sparse_voxel_grid(path, device):
     data = np.load(path)
@@ -280,7 +280,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
         return proj
     
 
-    def inference(self, i, imgs, mst, Rmw=None, tmw=None, predictions=None, scale_factor=None, threshold=1.0):
+    def inference(self, i, imgs, mst, Rmw=None, tmw=None, predictions=None, scale_factor=None, threshold=1.0, flip=True):
         # --- GPU Timer Setup ---
         def get_event():
             return torch.cuda.Event(enable_timing=True)
@@ -294,7 +294,10 @@ class VoxelUpdaterSystem(pl.LightningModule):
         CONF = "world_points_conf"
         z_clip_map = (-3.0, 3.0)
 
-        R_w2m = np.array([[0, 0, -1], [-1, 0, 0], [0, -1, 0]], dtype=np.float32)
+        if flip:
+            R_w2m = np.array([[0, 0, -1], [-1, 0, 0], [0, -1, 0]], dtype=np.float32)
+        else:
+            R_w2m = np.array([[0, 0, -1], [1, 0, 0], [0, -1, 0]], dtype=np.float32)
         t_w2m = np.zeros(3, dtype=np.float32)
         R_w2m = to_torch(R_w2m, device=self.device)
         t_w2m = to_torch(t_w2m, device=self.device)
@@ -420,7 +423,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
         z_clip_map = (-3.0, 3.0)  
 
         R_w2m = np.array([[0, 0, -1],
-                        [-1, 0, 0],
+                        [1, 0, 0],
                         [0, -1, 0]], dtype=np.float32)
 
         t_w2m = np.zeros(3, dtype=np.float32)
@@ -954,6 +957,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
 
 
+        flip = True
         for t in range(T):
             #print(t)
             imgs = batch["imgs_t"][t]
@@ -981,11 +985,10 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
 
 
-            
-            R_w2m = np.array([[0, 0, -1],
-                            [1, 0, 0],
-                            [0, -1, 0]], dtype=np.float32)
-
+            if flip:
+                R_w2m = np.array([[0, 0, -1], [-1, 0, 0], [0, -1, 0]], dtype=np.float32)
+            else:
+                R_w2m = np.array([[0, 0, -1], [1, 0, 0], [0, -1, 0]], dtype=np.float32)
             t_w2m = np.zeros(3, dtype=np.float32)
 
             R_w2m = to_torch(R_w2m, device=self.device)
@@ -1072,11 +1075,11 @@ class VoxelUpdaterSystem(pl.LightningModule):
             predictions["view_feats"] = projected_feats_map
             del projected_feats_map
         
-            threshold = 50.0
+            threshold = 1.0
             if not mst and t != 0:
-                bev, mst, _, _ = self.inference(1, imgs, mst, Rmw, tmw_scaled, predictions, scale_factor, threshold=threshold)
+                bev, mst, _, _ = self.inference(1, imgs, mst, Rmw, tmw_scaled, predictions, scale_factor, threshold=threshold,flip=flip)
             else:
-                bev, mst, _, _ = self.inference(t, imgs, mst, Rmw, tmw_scaled, predictions, scale_factor, threshold=threshold)
+                bev, mst, _, _ = self.inference(t, imgs, mst, Rmw, tmw_scaled, predictions, scale_factor, threshold=threshold,flip=flip)
 
         
             #with autocast(enabled=False):
@@ -1194,14 +1197,16 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
                     # Boost "Appearing" slightly more to ensure we catch the jump
                     #weights[appearing_mask] *= 20.0
-                    weights[appearing_mask] = 20.0
+
+                    #weights[appearing_mask] = 20.0
 
                     # (Total weight = pos_weight * 5.0 = 250ish)
 
                     # Boost "Disappearing" MASSIVELY to fix Precision/Ghosting
                     # Since the base weight was 1.0, we need to multiply it by pos_weight * 5
                     # to match the importance of the appearing objects.
-                    weights[disappearing_mask] = 20.0
+
+                    #weights[disappearing_mask] = 20.0
                     # (Total weight = 250ish)
 
                     # 4. Calculate Loss
@@ -1464,6 +1469,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
         for t in range(T):
             if self.cfg.skip:
                 t = t * STEP
+            p = t * STEP
             gt_path = os.path.join(gt_root, f"{seq_id}_t{t:04d}_gt.npz")
             if os.path.exists(gt_path):
                 vox_gt_t = load_sparse_voxel_grid(gt_path, device)
@@ -1486,6 +1492,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
 
         mst = False
+        flip = True
         for t in range(T):
             # print("Val ", t)
             # #print(f"== Val Step {t} ==")
@@ -1513,10 +1520,10 @@ class VoxelUpdaterSystem(pl.LightningModule):
             """
 
 
-            R_w2m = np.array([[0, 0, -1],
-                            [1, 0, 0],
-                            [0, -1, 0]], dtype=np.float32)
-
+            if flip:
+                R_w2m = np.array([[0, 0, -1], [-1, 0, 0], [0, -1, 0]], dtype=np.float32)
+            else:
+                R_w2m = np.array([[0, 0, -1], [1, 0, 0], [0, -1, 0]], dtype=np.float32)
             t_w2m = np.zeros(3, dtype=np.float32)
 
             R_w2m = to_torch(R_w2m, device=self.device)
@@ -1595,12 +1602,12 @@ class VoxelUpdaterSystem(pl.LightningModule):
             
 
 
-            threshold = 50.0
+            threshold = 1.0
             with torch.enable_grad(): # (Keep grad enabled for inference/update parts if needed by model)
                 if not mst and t != 0:
-                    bev, mst, _, _ = self.inference(1, imgs, mst, Rmw, tmw_scaled, predictions, scale_factor, threshold=threshold)
+                    bev, mst, _, _ = self.inference(1, imgs, mst, Rmw, tmw_scaled, predictions, scale_factor, threshold=threshold,flip=flip)
                 else:
-                    bev, mst, _, _ = self.inference(t, imgs, mst, Rmw, tmw_scaled, predictions, scale_factor, threshold=threshold)
+                    bev, mst, _, _ = self.inference(t, imgs, mst, Rmw, tmw_scaled, predictions, scale_factor, threshold=threshold,flip=flip)
 
         
             # Validation Loss Calculation (No Autocast needed strictly, but good for consistency)
@@ -2036,7 +2043,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
         self._prev_keys = None
         self._prev_probs = None
 
-        threshold = 1.0
+        threshold = 25.0
 
         # --- METRICS BUFFER ---
         # Initialize all keys so get_avg doesn't crash if a sequence has no dynamic events
@@ -2121,7 +2128,12 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 vox_gt_t = None
             gt_seq.append(vox_gt_t)
 
-        d = np.load(os.path.join(pose_root, f"{seq_id}_t0000_align.npz"), allow_pickle=True)
+        pose_path = os.path.join(pose_root, f"{seq_id}_t0000_align.npz")
+        if os.path.exists(pose_path):
+            d = np.load(pose_path, allow_pickle=True)
+        else:
+            print("pose doesn't exist")
+            return None
 
         Rmw = d["Rmw"]   # (3,3) float32
         tmw = d["tmw"]   # (3,)  float32
@@ -2518,9 +2530,9 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
             with torch.enable_grad():
                 if not mst and t != 0:
-                    bev, mst, _, _ = self.inference(1, imgs, mst, Rmw, tmw_scaled, predictions, scale_factor, threshold=threshold)
+                    bev, mst, _, _ = self.inference(1, imgs, mst, Rmw, tmw_scaled, predictions, scale_factor, threshold=threshold, flip=False)
                 else:
-                    bev, mst, _, _ = self.inference(t, imgs, mst, Rmw, tmw_scaled, predictions, scale_factor, threshold=threshold)
+                    bev, mst, _, _ = self.inference(t, imgs, mst, Rmw, tmw_scaled, predictions, scale_factor, threshold=threshold, flip=False)
             
             t_end_inf.record()     
                    
@@ -4027,10 +4039,11 @@ class HabitatSeqDataset(Dataset):
                 continue
 
             
-            #if t > 10:
+            """
             if t > 120:
                 break
 
+            """
             imgs = self._load_timestep(td)
 
             if imgs:
@@ -4044,6 +4057,7 @@ class HabitatSeqDataset(Dataset):
         basis = basis.replace(".basis", "") # "kfPV7w3FaU5" 
         final = os.path.basename(p) # "0" 
         seq_id = f"{basis}_{final}"
+
 
         return {
             "seq_id": seq_id,
@@ -4159,15 +4173,15 @@ def main():
     cfg = TrainConfig(
         # dataset_root="/Users/marvin/Documents/Thesis/repo/dataset_generation/habitat/",
         #dataset_root="/home/mpk40/Documents/data/",
-        #dataset_root="/cluster/scratch/kochmar/renders/",
+        dataset_root="/cluster/scratch/kochmar/renders/",
         #dataset_root="/cluster/scratch/kochmar/eval_train/",
-        dataset_root="/cluster/scratch/kochmar/hm3d_gt_2/",
+        #dataset_root="/cluster/scratch/kochmar/hm3d_gt_2/",
 
-        real_gt_voxels_file="hm3d_voxels_2",
+        #real_gt_voxels_file="hm3d_voxels_2",
 
-        #gt_voxels_file="gt_voxels_per_timestep_new",
-        #gt_voxels_file="gt_voxels_per_timestep_new_3",
         gt_voxels_file="gt_voxels_per_timestep_new",
+        #gt_voxels_file="gt_voxels_per_timestep_new_3",
+        #gt_voxels_file="gt_voxels_per_timestep_new",
 
         #precomputed_cache_file="precomputed_cache",
         #precomputed_cache_file="precomputed_cache_2",
@@ -4186,16 +4200,16 @@ def main():
         #feature_dim=32,
 
         occ_decoder_hidden=64,
-        lr=3e-5,
+        #lr=3e-5,
         #lr=3e-4,
-        #lr=3e-3,
+        lr=3e-3,
         max_epochs=200,
         batch_size=1,
         num_workers=0,
         precision="bf16",
         skip=True,
-        weight_decay=0.05,
-        #weight_decay=0.00,
+        #weight_decay=0.05,
+        weight_decay=0.00,
         lambda_occ= 1.0,
         lambda_temp = 0.05,      # temporal consistency weight
         #lambda_temp = 0.0,      # temporal consistency weight
@@ -4216,7 +4230,7 @@ def main():
         train_val_split=0.2,  # or whatever you want
         skip=True,
         seq_list=os.path.join(cfg.dataset_root, cfg.seq_file),
-        step=STEP
+        step=1
         
     )
 
@@ -4228,7 +4242,7 @@ def main():
     #    cfg=cfg
     #)
     ckpt_cb = pl.callbacks.ModelCheckpoint(
-        dirpath="/cluster/scratch/kochmar/checkpoints/full_finetune",       # Explicitly set a folder so you can find them
+        dirpath="/cluster/scratch/kochmar/checkpoints/full_ablation",       # Explicitly set a folder so you can find them
         monitor="val_loss_total",
         save_top_k=5,
         mode="min",
@@ -4281,7 +4295,7 @@ def main():
     for key in keys_to_remove:
         if key in state_dict:
             del state_dict[key]
-    keys = sys.load_state_dict(checkpoint["state_dict"], strict=False)
+    #keys = sys.load_state_dict(checkpoint["state_dict"], strict=False)
 
     trainer = pl.Trainer(
         max_epochs=cfg.max_epochs,
