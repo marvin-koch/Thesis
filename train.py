@@ -118,11 +118,11 @@ class TrainConfig:
     # data
     dataset_root: str
     voxel_size: float = 0.10
-    real_gt_voxels_file: str = None,
-    gt_voxels_file: str = "gt_voxels_per_timestep_005_v2",
-    precomputed_cache_file: str ="precomputed_cache",
-    pose_file: str ="gt_pose",
-    seq_file: str ="seq_manifest.json",
+    real_gt_voxels_file: str = None
+    gt_voxels_file: str = "gt_voxels_per_timestep_005_v2"
+    precomputed_cache_file: str ="precomputed_cache"
+    pose_file: str ="gt_pose"
+    seq_file: str ="seq_manifest.json"
     radius_m: float = 0.25
     topk: int = 8
     temp: float = 0.5
@@ -682,7 +682,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
     def align_probs_to_keys_soft(self, vox_gt, gt_probs, vox_pred, r_vox=3, default=0.0):
         """
-        r_vox=1 -> 27 neighbors. r_vox=2 -> 125 neighbors.
+        r_vox=2 -> 27 neighbors. r_vox=2 -> 125 neighbors.
         Returns:
           tgt_soft: (M_pred,) float
           valid:    (M_pred,) bool
@@ -1202,7 +1202,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                     # Boost "Appearing" slightly more to ensure we catch the jump
                     #weights[appearing_mask] *= 20.0
 
-                    #weights[appearing_mask] = 20.0
+                    weights[appearing_mask] = 20.0
 
                     # (Total weight = pos_weight * 5.0 = 250ish)
 
@@ -1210,7 +1210,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                     # Since the base weight was 1.0, we need to multiply it by pos_weight * 5
                     # to match the importance of the appearing objects.
 
-                    #weights[disappearing_mask] = 20.0
+                    weights[disappearing_mask] = 20.0
                     # (Total weight = 250ish)
 
                     # 4. Calculate Loss
@@ -1763,13 +1763,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
         
         return val_loss_total
     
-
     def predict_step(self, batch: Dict, batch_idx: int, dataloader_idx: int = 0, step=1):
         def build_voxel_from_gt_direct(sim_data, voxel_size=0.2, device="cuda", scale_factor=1.0):
-            """
-            Build GT voxel grid directly from Habitat depth — no filtering,
-            no confidence thresholds, no subsampling.
-            """
             pts = sim_data["world_points"].to(device, dtype=torch.float32)   # (S, H, W, 3)
             extr = sim_data["extrinsic"].to(device, dtype=torch.float32)     # (S, 4, 4)
 
@@ -1806,106 +1801,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
             )
 
             return vox
-        def build_voxel_from_sim_data(sim_data, voxel_size=0.2, device="cuda", scale_factor=1.0):
-            """
-            Converts loaded sim 'tensors.pt' data into a TorchSparseVoxelGrid.
-
-            Args:
-                sim_data: Dict loaded via torch.load("tensors.pt")
-                voxel_size: Size of voxel side in meters
-            """
-            # 1. Coordinate Setup (Matches generate_gt.py)
-            # Rotation to map Habitat world -> your model's metric frame
-            R_w2m = torch.tensor([[0, 0, -1],
-                                  [1, 0, 0],
-                                  [0, -1, 0]], dtype=torch.float32, device=device)
-            t_w2m = torch.zeros(3, device=device)
-
-            # 2. Extract and Move Data to Device
-            pts = sim_data["world_points"].to(device)
-            conf = sim_data["world_points_conf"].to(device)
-            # Extrinsics are (N, 4, 4) [R | t] where t is camera position
-            extrinsics = sim_data["extrinsic"].to(device)
-
-            """
-            # 3. Apply Frame Alignment
-            # Rotate raw points into the metric frame
-            pts_m = rotate_points(pts, R_w2m, t_w2m)
-
-            # 4. Apply Scaling Logic (Matches your 5.0m target size logic)
-            valid_mask = torch.isfinite(pts_m).all(dim=-1)
-            centroid = pts_m[valid_mask].median(dim=0).values
-            centered_pts = pts_m - centroid
-            current_size = torch.median(torch.norm(centered_pts[valid_mask], dim=1))
-
-            target_size = 5.0
-            scale_factor = (target_size / (current_size + 1e-6)).item()
-
-            # Scale points and camera positions
-            pts_scaled = pts_m * scale_factor
-            cam_centers_world = extrinsics[:, :3, 3] # (N, 3)
-            cam_centers_m = (cam_centers_world @ R_w2m.T) + t_w2m
-            cam_centers_scaled = cam_centers_m * scale_factor
-            """
-
-            z_clip_map = (scale_factor * z_clip_map[0], scale_factor * z_clip_map[1])
-
-
-            renders_map, cam_centers_map, conf_map, images_map, _, (S, H, W), frame_ids = \
-                build_frames_and_centers_vectorized_torch(
-                    sim_data,
-                    POINTS="world_points",
-                    CONF="world_points_conf",
-                    threshold=1.0,      # Matches your generate_gt.py logic
-                    Rmw=None,        # Your aligned Rotation
-                    tmw=None,        # Your aligned Translation
-                    z_clip_map=z_clip_map,
-                    return_flat=True,
-                )
-            # 5. Prepare for Voxelization
-            # We need to treat the points as coming from different "renders" (cameras)
-            # If sim_data saved points as one big cloud, we must split them or
-            # assign them to the nearest camera for ray-casting.
-            # (Assuming world_points is already the concatenated cloud from N cameras)
-
-
-            # Create fresh grid
-            vox_real = TorchSparseVoxelGrid(
-                origin_xyz=np.zeros(3, dtype=np.float32),
-                params=VoxelParams(voxel_size=voxel_size, promote_hits=2),
-                device=device,
-            )
-
-            # Note: build_maps_from_points_and_centers_torch expects lists of tensors per view
-            # Since this is GT, we can pass them as single-item lists
-            vox_real, bev, meta = build_maps_from_points_and_centers_torch(
-                renders_map,          # List of point tensors
-                cam_centers_map,
-                conf_map,
-                vox_real,
-                align_to_voxel=False,
-                voxel_size=voxel_size,
-                bev_window_m=(5.0, 5.0),
-                bev_origin_xy=(-2.0, -2.0),
-                z_clip_vox=(-np.inf, np.inf),
-                z_band_bev=(0.02, 0.5),
-                samples_per_voxel=2.0,
-                ray_stride=1,
-                max_free_rays=500_000,  # was 10,000
-                #ray_stride=4,          # Speed up integration
-                #max_free_rays=10000,
-                frame_ids=frame_ids
-            )
-
-            return vox_real
-
         def kabsch_umeyama_sim3(src, dst):
-            """
-            Computes the optimal Sim(3) transform that aligns src to dst.
-            src, dst: (N, 3) tensors
-            Returns: R (3,3), t (3,), s (float)
-            Equation: dst = s * (src @ R.T) + t
-            """
+
             # 1. Centroid subtraction
             mu_src = src.mean(dim=0)
             mu_dst = dst.mean(dim=0)
@@ -1938,10 +1835,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
             return R, translation, scale
 
         def icp_sim3(src, dst, init_R, init_t, init_s, max_iters=20, tolerance=1e-5):
-            """
-            Iterative Closest Point with Sim(3) transformation.
-            Uses PyTorch3D knn_points to find true spatial neighbors instead of array indices.
-            """
+
             # Apply initial Kabsch alignment
             src_curr = init_s * (src @ init_R.T) + init_t
 
@@ -1989,13 +1883,18 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
             return R_acc, t_acc, s_acc
         def compute_chamfer_dist(vox_pred, vox_gt):
+            # Use method-appropriate occupancy masks
+            if hasattr(vox_pred, 'decode_occupancy'):
+                # LatentVoxelGrid: use learned decoder
+                mask_p = (vox_pred.decode_occupancy(with_xyz_cond=False) > 0.0)
+            else:
+                mask_p = vox_pred.occupied_mask()
 
-            """
-            Measures the average distance (in meters) between occupied voxels.
-            """
-            # 1. Get centers of occupied voxels
-            mask_p = vox_pred.occupied_mask()
-            mask_g = vox_gt.occupied_mask()
+            if hasattr(vox_gt, 'decode_occupancy'):
+                mask_g = (vox_gt.decode_occupancy(with_xyz_cond=False) > 0.0)
+            else:
+                mask_g = vox_gt.occupied_mask()
+
 
             if not mask_p.any() or not mask_g.any():
                 return torch.tensor(0.0, device=vox_pred.device)
@@ -2047,7 +1946,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
         self._prev_keys = None
         self._prev_probs = None
 
-        threshold = 25.0
+        threshold = 50.0
 
         # --- METRICS BUFFER ---
         # Initialize all keys so get_avg doesn't crash if a sequence has no dynamic events
@@ -2109,6 +2008,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
         T = batch["timesteps"]
         seq_id = batch["seq_id"]
 
+        print(self.cfg.dataset_root, self.cfg.real_gt_voxels_file)
         if self.cfg.real_gt_voxels_file:
             real_gt_root = os.path.join(self.cfg.dataset_root, self.cfg.real_gt_voxels_file)
 
@@ -2405,131 +2305,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                     self.vox_real_gt = build_voxel_from_gt_direct(
                         real_gt, voxel_size=self.cfg.voxel_size, device=self.device, scale_factor=scale_factor
                     )
-            """
-            if self.cfg.real_gt_voxels_file:
-                with torch.cuda.amp.autocast(enabled=False):
-                    # Apply the SAME transforms as predictions
-                    gt_pts = real_gt["world_points"]  # (S, H, W, 3)
-                    gt_pts = rotate_points(gt_pts, R_w2m, t_w2m)
-                    gt_pts = rotate_points(gt_pts, Rmw, tmw)
-                    gt_pts = gt_pts * scale_factor
-                    real_gt["world_points"] = gt_pts
-
-                    # Transform camera centers the same way
-                    gt_cams = real_gt["extrinsic"][:, :3, 3]  # (S, 3)
-                    gt_cams = (gt_cams @ R_w2m.T + t_w2m)
-                    gt_cams = (gt_cams @ Rmw.T + tmw)
-                    gt_cams = gt_cams * scale_factor
-
-                    new_ex = real_gt["extrinsic"].clone()
-                    new_ex[:, :3, :3] = Rmw @ R_w2m @ real_gt["extrinsic"][:, :3, :3]
-                    new_ex[:, :3, 3] = gt_cams
-                    real_gt["extrinsic"] = new_ex
-
-                    # Images permute if needed
-                    if real_gt["images"].dim() == 4 and real_gt["images"].shape[1] == 3:
-                        real_gt["images"] = real_gt["images"].permute(0, 2, 3, 1)
-
-                    self.prev_vox_real_gt = copy.deepcopy(self.vox_real_gt)
-                    #self.vox_real_gt = build_voxel_from_sim_data(
-                    #    real_gt, voxel_size=self.cfg.voxel_size, device=self.device
-                    #)
-                    self.vox_real_gt = build_voxel_from_gt_direct(real_gt, voxel_size=self.cfg.voxel_size, device=self.device)
-            """
-            """
-            if self.cfg.real_gt_voxels_file:
-                with torch.cuda.amp.autocast(enabled=False):
-                    if t == 0:
-                        gt_cams = real_gt["extrinsic"][:, :3, 3]
-                        pred_cams = predictions["extrinsic"][:, :3, 3]
-                        R_kabsch, t_kabsch, s_kabsch = kabsch_umeyama_sim3(gt_cams, pred_cams)
-                        S_init, H_init, W_init, _ = predictions["world_points"].shape
-
-                gt_pts = real_gt["world_points"]
-                aligned_gt_pts = s_kabsch * (gt_pts @ R_kabsch.T) + t_kabsch
-
-                old_ex = real_gt["extrinsic"]
-                new_ex = old_ex.clone()
-
-                # Update Rotation: R_new = R_sim3 @ R_old
-                # This rotates the camera's orientation to match the new world frame
-                new_ex[:, :3, :3] = torch.matmul(R_kabsch, old_ex[:, :3, :3])
-
-                # Update Translation: Camera Centers
-                # This is exactly the same transformation as the points
-                # (Using the aligned centers we calculated earlier)
-                new_ex[:, :3, 3] = s_kabsch * (gt_cams @ R_kabsch.T) + t_kabsch
-
-                # Save it back to the dictionary
-                real_gt["extrinsic"] = new_ex
-
-                real_gt["world_points"] = aligned_gt_pts
-
-            """
-            """
-                pts = real_gt["world_points"].flatten()
-
-                # 2. Calculate how many (x,y,z) triplets we have per frame (S)
-                # We use // to make sure it's an integer
-                total_triplets = pts.numel() // 3
-                triplets_per_frame = total_triplets // S_init
-
-                # 3. Determine H and W (making them as square as possible)
-                H = H_init
-                W = triplets_per_frame // H_init
-
-                # 1. Calculate the target number of points for the (S, H, W) grid
-                target_n = S_init * H * W
-
-                # 2. Flatten current data for sampling (keeping XYZ and RGB triplets together)
-                pts_flat = real_gt["world_points"].reshape(-1, 3)
-                conf_flat = real_gt["world_points_conf"].reshape(-1)
-
-                # Ensure images are in (S, H, W, 3) format so they align with the points
-                # utils.py expects channels at the end during its internal reshape
-                if real_gt["images"].dim() == 4 and real_gt["images"].shape[1] == 3:
-                    # Convert (S, 3, H, W) -> (S, H, W, 3) before flattening
-                    img_flat = real_gt["images"].permute(0, 2, 3, 1).reshape(-1, 3)
-                else:
-                    img_flat = real_gt["images"].reshape(-1, 3)
-
-                current_n = pts_flat.shape[0]
-
-                # 3. Synchronized Random Sampling
-                # We generate indices ONCE and apply them to all three tensors to keep them synced
-                indices = torch.randint(0, current_n, (target_n,), device=pts_flat.device)
-
-                # 4. View back to the required 4D shapes
-                try:
-                    # Update Points
-                    real_gt["world_points"] = pts_flat[indices].view(S_init, H, W, 3)
-                    
-                    # Update Confidence (1 value per point)
-                    real_gt["world_points_conf"] = conf_flat[indices].view(S_init, H, W)
-                    
-                    # Update Images (3 values per point)
-                    # Reshaping to (S, H, W, 3) ensures the colors match the points in the voxel grid
-                    real_gt["images"] = img_flat[indices].view(S_init, H, W, 3)
-
-                except RuntimeError as e:
-                    print(f"Sampling failed: Expected {target_n} points but indices produced an invalid shape.")
-                    raise e
-
-            """
-            """
-                # Images: convert (S, 3, H, W) -> (S, H, W, 3) if needed
-                if real_gt["images"].dim() == 4 and real_gt["images"].shape[1] == 3:
-                    real_gt["images"] = real_gt["images"].permute(0, 2, 3, 1)
-
-
-                self.prev_vox_real_gt = copy.deepcopy(self.vox_real_gt)
-                self.vox_real_gt = build_voxel_from_sim_data(real_gt, voxel_size=self.cfg.voxel_size, device=self.device)
-            """
-
-
-
-
-            
+           
             t_start_inf.record()
 
             with torch.enable_grad():
@@ -2616,7 +2392,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
 
                     p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys_soft(
-                        self.vox_real_gt, p_occ_tgt, self.vox_gt, default=0.0, r_vox=1
+                        self.vox_real_gt, p_occ_tgt, self.vox_gt, default=0.0, r_vox=2
                     )
 
 
@@ -2660,7 +2436,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                             torch.sigmoid(vox_gt_prev.vals_st * 10.0),
                             self.vox_gt,
                             default=0.0, 
-                            r_vox=1
+                            r_vox=2
                         )
 
                     # BUG FIX: Only evaluate dynamics where BOTH timesteps have valid coverage.
@@ -2727,7 +2503,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
 
                 p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys_soft(
-                    self.vox_real_gt, p_occ_tgt, self.vox, default=0.0, r_vox=1
+                    self.vox_real_gt, p_occ_tgt, self.vox, default=0.0, r_vox=2
                 )
             else:
 
@@ -2736,7 +2512,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 p_occ_tgt = torch.sigmoid(logit_gt * 10.0) # Sharp GT
 
                 p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys_soft(
-                    self.vox_gt, p_occ_tgt, self.vox, default=0.0, r_vox=1
+                    self.vox_gt, p_occ_tgt, self.vox, default=0.0, r_vox=2
                 )
 
             # 4. Standard IoU Calculation
@@ -2777,7 +2553,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                         torch.sigmoid(vox_gt_prev.vals_st * 10.0),
                         self.vox,
                         default=0.0, 
-                        r_vox=1
+                        r_vox=2
                     )
                 else:
                     vox_gt_prev = gt_seq[t-1]
@@ -2788,7 +2564,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                         torch.sigmoid(vox_gt_prev.vals_st * 10.0),
                         self.vox,
                         default=0.0, 
-                        r_vox=1
+                        r_vox=2
                     )
 
                 # BUG FIX: Only evaluate dynamics where BOTH timesteps have valid coverage.
@@ -2846,7 +2622,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
 
                 p_occ_tgt_base_aligned, valid_mask_base = self.align_probs_to_keys_soft(
-                    self.vox_real_gt, p_occ_tgt, self.vox_baseline, default=0.0, r_vox=1
+                    self.vox_real_gt, p_occ_tgt, self.vox_baseline, default=0.0, r_vox=2
                 )
             else:
 
@@ -2855,7 +2631,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 p_occ_tgt = torch.sigmoid(logit_gt * 10.0) # Sharp GT
 
                 p_occ_tgt_base_aligned, valid_mask_base = self.align_probs_to_keys_soft(
-                    self.vox_gt, p_occ_tgt, self.vox_baseline, default=0.0, r_vox=1
+                    self.vox_gt, p_occ_tgt, self.vox_baseline, default=0.0, r_vox=2
                 )
 
  
@@ -2901,7 +2677,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                         torch.sigmoid(vox_gt_prev.vals_st * 10.0),
                         self.vox_baseline,
                         default=0.0, 
-                        r_vox=1
+                        r_vox=2
                     )
                 else:
                     vox_gt_prev = gt_seq[t-1]
@@ -2912,7 +2688,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                         torch.sigmoid(vox_gt_prev.vals_st * 10.0),
                         self.vox_baseline,
                         default=0.0, 
-                        r_vox=1
+                        r_vox=2
                     )
 
                 # BUG FIX: Only evaluate dynamics where BOTH timesteps have valid coverage.
@@ -2966,7 +2742,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
             #NEW
             #logit_pred_before = (logit_pred_before / 0.75) - 1.0
 
-            if not torch.isfinite(logit_pred_before).all():
+            if not torch.isfinite(static_logit_pred_before).all():
                 static_logit_pred_before = torch.nan_to_num(static_logit_pred_before, nan=0.001)
 
             # 3. Align GT keys to Prediction keys
@@ -2979,7 +2755,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 #p_occ_tgt = (self.vox_real_gt.vals_st > 0).float()
 
                 static_p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys_soft(
-                    self.vox_real_gt, p_occ_tgt, static_baseline_vox, default=0.0, r_vox=1
+                    self.vox_real_gt, p_occ_tgt, static_baseline_vox, default=0.0, r_vox=2
                 )
 
             else:
@@ -2989,7 +2765,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 p_occ_tgt = torch.sigmoid(logit_gt * 10.0) # Sharp GT
 
                 static_p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys_soft(
-                    self.vox_gt, p_occ_tgt, static_baseline_vox, default=0.0, r_vox=1
+                    self.vox_gt, p_occ_tgt, static_baseline_vox, default=0.0, r_vox=2
                 )
 
  
@@ -3037,7 +2813,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                         torch.sigmoid(vox_gt_prev.vals_st * 10.0),
                         static_baseline_vox,
                         default=0.0,
-                        r_vox=1
+                        r_vox=2
                     )
                 else:
                     vox_gt_prev = gt_seq[t-1]
@@ -3048,7 +2824,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                         torch.sigmoid(vox_gt_prev.vals_st * 10.0),
                         static_baseline_vox,
                         default=0.0,
-                        r_vox=1
+                        r_vox=2
                     )
 
                 # BUG FIX: Only evaluate dynamics where BOTH timesteps have valid coverage.
