@@ -2447,6 +2447,13 @@ class VoxelUpdaterSystem(pl.LightningModule):
                         self.vox_real_gt, p_occ_tgt, self.vox_gt, default=0.0, r_vox=2
                     )
 
+                    # Reverse: align pred to GT keys to find uncovered GT voxels
+                    pred_probs_for_rev = torch.sigmoid(logit_pred_before)
+                    _, gt_has_pred_coverage = self.align_probs_to_keys_soft(
+                        self.vox_gt, pred_probs_for_rev, self.vox_real_gt, default=0.0, r_vox=2
+                    )
+                    fn_uncovered = ((p_occ_tgt > 0.5) & ~gt_has_pred_coverage).sum()
+
 
                 # 4. Standard IoU Calculation
                 pred_intersect = logit_pred_before[valid_mask]
@@ -2458,7 +2465,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
                 tp = (pred_bin_int & tgt_bin_int).sum()
                 fp_int = (pred_bin_int & ~tgt_bin_int).sum()
-                fn = (~pred_bin_int & tgt_bin_int).sum()
+                fn = (~pred_bin_int & tgt_bin_int).sum() + fn_uncovered
 
                 fp_hallucination = (pred_fp > 0.0).sum()
                 total_fp = fp_int + fp_hallucination
@@ -2557,6 +2564,13 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys_soft(
                     self.vox_real_gt, p_occ_tgt, self.vox, default=0.0, r_vox=2
                 )
+
+                # Reverse: align pred to GT keys to find uncovered GT voxels
+                pred_probs_for_rev = torch.sigmoid(logit_pred_before)
+                _, gt_has_pred_coverage = self.align_probs_to_keys_soft(
+                    self.vox, pred_probs_for_rev, self.vox_real_gt, default=0.0, r_vox=2
+                )
+                fn_uncovered = ((p_occ_tgt > 0.5) & ~gt_has_pred_coverage).sum()
             else:
 
                 # 1. Prepare Ground Truth
@@ -2566,6 +2580,13 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys_soft(
                     self.vox_gt, p_occ_tgt, self.vox, default=0.0, r_vox=2
                 )
+
+                # Reverse: align pred to GT keys to find uncovered GT voxels
+                pred_probs_for_rev = torch.sigmoid(logit_pred_before)
+                _, gt_has_pred_coverage = self.align_probs_to_keys_soft(
+                    self.vox, pred_probs_for_rev, self.vox_gt, default=0.0, r_vox=2
+                )
+                fn_uncovered = ((p_occ_tgt > 0.5) & ~gt_has_pred_coverage).sum()
 
             # 4. Standard IoU Calculation
             pred_intersect = logit_pred_before[valid_mask]
@@ -2577,7 +2598,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
             tp = (pred_bin_int & tgt_bin_int).sum()
             fp_int = (pred_bin_int & ~tgt_bin_int).sum()
-            fn = (~pred_bin_int & tgt_bin_int).sum()
+            fn = (~pred_bin_int & tgt_bin_int).sum() + fn_uncovered
 
             fp_hallucination = (pred_fp > 0.0).sum()
             total_fp = fp_int + fp_hallucination
@@ -2676,6 +2697,13 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 p_occ_tgt_base_aligned, valid_mask_base = self.align_probs_to_keys_soft(
                     self.vox_real_gt, p_occ_tgt, self.vox_baseline, default=0.0, r_vox=2
                 )
+
+                # Reverse: align baseline pred to GT keys to find uncovered GT voxels
+                base_probs_for_rev = torch.sigmoid(logit_base)
+                _, gt_has_base_coverage = self.align_probs_to_keys_soft(
+                    self.vox_baseline, base_probs_for_rev, self.vox_real_gt, default=0.0, r_vox=2
+                )
+                fn_uncovered_base = ((p_occ_tgt > 0.5) & ~gt_has_base_coverage).sum()
             else:
 
                 # 1. Prepare Ground Truth
@@ -2685,6 +2713,13 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 p_occ_tgt_base_aligned, valid_mask_base = self.align_probs_to_keys_soft(
                     self.vox_gt, p_occ_tgt, self.vox_baseline, default=0.0, r_vox=2
                 )
+
+                # Reverse: align baseline pred to GT keys to find uncovered GT voxels
+                base_probs_for_rev = torch.sigmoid(logit_base)
+                _, gt_has_base_coverage = self.align_probs_to_keys_soft(
+                    self.vox_baseline, base_probs_for_rev, self.vox_gt, default=0.0, r_vox=2
+                )
+                fn_uncovered_base = ((p_occ_tgt > 0.5) & ~gt_has_base_coverage).sum()
 
  
             
@@ -2699,7 +2734,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
             
             tp_base = (base_bin_int & tgt_bin_base).sum()
             fp_int_base = (base_bin_int & ~tgt_bin_base).sum()
-            fn_base = (~base_bin_int & tgt_bin_base).sum()
+            fn_base = (~base_bin_int & tgt_bin_base).sum() + fn_uncovered_base
             
             fp_hallucination_base = (base_fp > self.vox_baseline.p.occ_thresh).sum()
             total_fp_base = fp_int_base + fp_hallucination_base
@@ -2810,6 +2845,13 @@ class VoxelUpdaterSystem(pl.LightningModule):
                     self.vox_real_gt, p_occ_tgt, static_baseline_vox, default=0.0, r_vox=2
                 )
 
+                # Reverse: align static pred to GT keys to find uncovered GT voxels
+                static_probs_for_rev = torch.sigmoid(static_logit_pred_before)
+                _, gt_has_static_coverage = self.align_probs_to_keys_soft(
+                    static_baseline_vox, static_probs_for_rev, self.vox_real_gt, default=0.0, r_vox=2
+                )
+                fn_uncovered_static = ((p_occ_tgt > 0.5) & ~gt_has_static_coverage).sum()
+
             else:
 
                 # 1. Prepare Ground Truth
@@ -2819,6 +2861,13 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 static_p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys_soft(
                     self.vox_gt, p_occ_tgt, static_baseline_vox, default=0.0, r_vox=2
                 )
+
+                # Reverse: align static pred to GT keys to find uncovered GT voxels
+                static_probs_for_rev = torch.sigmoid(static_logit_pred_before)
+                _, gt_has_static_coverage = self.align_probs_to_keys_soft(
+                    static_baseline_vox, static_probs_for_rev, self.vox_gt, default=0.0, r_vox=2
+                )
+                fn_uncovered_static = ((p_occ_tgt > 0.5) & ~gt_has_static_coverage).sum()
 
  
             
@@ -2834,7 +2883,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
             tp = (pred_bin_int & tgt_bin_int).sum()
             fp_int = (pred_bin_int & ~tgt_bin_int).sum()
-            fn = (~pred_bin_int & tgt_bin_int).sum()
+            fn = (~pred_bin_int & tgt_bin_int).sum() + fn_uncovered_static
 
             fp_hallucination = (pred_fp > 0.0).sum()
             total_fp = fp_int + fp_hallucination
@@ -4201,4 +4250,4 @@ def main():
 
     trainer.fit(sys, dm)
 if __name__ == "__main__":
-    main()
+    main()g
