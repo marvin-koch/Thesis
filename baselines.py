@@ -491,13 +491,13 @@ def compute_extra_baseline_metrics(
 
         # align GT → baseline keys
         tgt_aligned, valid = system.align_probs_to_keys_soft(
-            ref_vox, p_occ_tgt, bobj, default=0.0, r_vox=2)
+            ref_vox, p_occ_tgt, bobj, default=0.0, r_vox=1)
 
         # Reverse: align baseline pred to GT keys to find uncovered GT voxels
         logit_b  = bobj._display_vals().clamp(-10, 10)
         b_probs_for_rev = torch.sigmoid(logit_b)
         _, gt_has_b_coverage = system.align_probs_to_keys_soft(
-            bobj, b_probs_for_rev, ref_vox, default=0.0, r_vox=2)
+            bobj, b_probs_for_rev, ref_vox, default=0.0, r_vox=1)
         fn_uncovered = ((p_occ_tgt > 0.5) & ~gt_has_b_coverage).sum()
 
         pred_int = logit_b[valid]
@@ -529,7 +529,7 @@ def compute_extra_baseline_metrics(
                 p_prev_al, vp = system.align_probs_to_keys_soft(
                     prev_ref,
                     torch.sigmoid(prev_ref.vals_st.clamp(-10, 10) * 10),
-                    bobj, default=0.0, r_vox=2)
+                    bobj, default=0.0, r_vox=1)
                 both = valid & vp
                 bi   = both[valid]
                 if bi.any():
