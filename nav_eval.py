@@ -681,6 +681,58 @@ def main():
                 real_gt_path = os.path.join(real_gt_root, f"{seq_id}_t{p:04d}.pt").replace(".glb", "")
                 if os.path.exists(real_gt_path):
                     real_gt_data = torch.load(real_gt_path, map_location=device)
+                    
+                    with torch.cuda.amp.autocast(enabled=False):
+                        gt_pts = real_gt["world_points"].to(self.device)   # (S, H, W, 3)
+                        gt_ex = real_gt["extrinsic"].to(self.device)
+                        gt_cams = gt_ex[:, :3, 3]
+
+                        pred_pts = predictions["world_points"]  # already strided (S, H', W', 3)
+
+                        if t == 0:
+                            # Match stride to predictions
+                            _, pH, pW, _ = pred_pts.shape
+                            _, gH, gW, _ = gt_pts.shape
+
+                            # Downsample GT to match prediction resolution
+                            gt_pts_strided = gt_pts[:, ::max(1, gH//pH), ::max(1, gW//pW), :]
+                            # Ensure exact shape match
+                            gt_pts_strided = gt_pts_strided[:, :pH, :pW, :]
+
+                            # Corresponding points for Kabsch
+                            gt_flat = gt_pts_strided.reshape(-1, 3)
+                            pred_flat = pred_pts.reshape(-1, 3)
+
+                            both_valid = torch.isfinite(gt_flat).all(-1) & torch.isfinite(pred_flat).all(-1)
+
+                            gt_corr = gt_flat[both_valid]
+                            pred_corr = pred_flat[both_valid]
+
+                            n = min(50000, gt_corr.shape[0])
+                            idx = torch.randperm(gt_corr.shape[0], device=self.device)[:n]
+
+                            R_k, t_k, s_k = kabsch_umeyama_sim3(gt_corr[idx], pred_corr[idx])
+                            R_k, t_k, s_k = icp_sim3(
+                                gt_corr[idx],
+                                pred_corr[idx],
+                                init_R=R_k,
+                                init_t=t_k,
+                                init_s=s_k,
+                                max_iters=50
+                            )
+
+                        # Apply to FULL resolution GT (not strided)
+                        aligned_pts = s_k * (gt_pts @ R_k.T) + t_k
+                        aligned_cams = s_k * (gt_cams @ R_k.T) + t_k
+
+                    real_gt["world_points"] = aligned_pts
+                    new_ex = gt_ex.clone()
+                    new_ex[:, :3, 3] = aligned_cams
+                    real_gt["extrinsic"] = new_ex
+
+                    if real_gt["images"].dim() == 4 and real_gt["images"].shape[1] == 3:
+                        real_gt["images"] = real_gt["images"].permute(0, 2, 3, 1)
+
                     vox_real = build_voxel_from_gt_direct(real_gt_data, voxel_size, device)
                     gt_grids.append(extract_grid(vox_real, is_latent=False))
                     del vox_real, real_gt_data
