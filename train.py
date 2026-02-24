@@ -4250,4 +4250,4 @@ def main():
 
     trainer.fit(sys, dm)
 if __name__ == "__main__":
-    main()g
+    main()
