@@ -1213,7 +1213,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                     # Boost "Appearing" slightly more to ensure we catch the jump
                     #weights[appearing_mask] *= 20.0
 
-                    weights[appearing_mask] = 20.0
+                    #weights[appearing_mask] = 20.0
 
                     # (Total weight = pos_weight * 5.0 = 250ish)
 
@@ -1221,7 +1221,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                     # Since the base weight was 1.0, we need to multiply it by pos_weight * 5
                     # to match the importance of the appearing objects.
 
-                    weights[disappearing_mask] = 20.0
+                    #weights[disappearing_mask] = 20.0
                     # (Total weight = 250ish)
 
                     # 4. Calculate Loss
@@ -1957,7 +1957,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
         self._prev_keys = None
         self._prev_probs = None
 
-        threshold = 50.0
+        threshold = 25.0
 
         # --- METRICS BUFFER ---
         # Initialize all keys so get_avg doesn't crash if a sequence has no dynamic events
