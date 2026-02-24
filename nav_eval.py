@@ -174,14 +174,48 @@ def voxel_to_occ2d(
 #  Episode Sampling & Running
 # ═══════════════════════════════════════════════════════════════════
 
+def _get_interior_free_mask(occ_grid: np.ndarray) -> np.ndarray:
+    """
+    Return a boolean mask where True = cell is free AND all 8 neighbours are free.
+    This avoids spawning right next to obstacles.
+    """
+    free = ~occ_grid  # True where not occupied
+    H, W = free.shape
+    # Erode the free mask by 1 cell in every direction (8-connected)
+    interior = free.copy()
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            if dy == 0 and dx == 0:
+                continue
+            # Shift and AND: a cell is only interior if all shifted neighbours are also free
+            shifted = np.zeros_like(free)
+            src_r = slice(max(0, -dy), H + min(0, -dy))
+            src_c = slice(max(0, -dx), W + min(0, -dx))
+            dst_r = slice(max(0, dy), H + min(0, dy))
+            dst_c = slice(max(0, dx), W + min(0, dx))
+            shifted[dst_r, dst_c] = free[src_r, src_c]
+            interior &= shifted
+    return interior
+
+
 def sample_free_positions(
     occ_grid: np.ndarray, n: int, max_dist_cells: int = 20, min_dist_cells: int = 5, rng: np.random.Generator = None
 ) -> List[Tuple[Tuple[int, int], Tuple[int, int]]]:
-    """Sample n (start, goal) pairs on free cells with minimum geodesic separation."""
+    """
+    Sample n (start, goal) pairs on free cells that have all 8 neighbours free,
+    with minimum/maximum Euclidean separation.
+    Falls back to any free cell if no interior cells are available.
+    """
     if rng is None:
         rng = np.random.default_rng(42)
 
-    free_ys, free_xs = np.where(~occ_grid)
+    # Prefer interior free cells (free + all neighbours free)
+    interior = _get_interior_free_mask(occ_grid)
+    free_ys, free_xs = np.where(interior)
+
+    # Fallback: if too few interior cells, use all free cells
+    if len(free_ys) < 2:
+        free_ys, free_xs = np.where(~occ_grid)
     if len(free_ys) < 2:
         return []
 
@@ -196,7 +230,6 @@ def sample_free_positions(
         if dist >= min_dist_cells and dist <= max_dist_cells:
             episodes.append((s, g))
     return episodes
-
 
 @dataclass
 class EpisodeResult:
@@ -451,8 +484,8 @@ def main():
     model = model.to(device)
     model.eval()
     # ── BEV parameters (same as predict_step) ──
-    bev_size=(25.0, 25.0)
-    bev_origin=(-12.0, -12.0)
+    bev_size=(12.0, 12.0)
+    bev_origin=(-7.0, -7.0)
     z_band=(-2.0, 1.5)
     voxel_size = cfg.voxel_size
 

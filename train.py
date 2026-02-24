@@ -693,7 +693,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
     def align_probs_to_keys_soft(self, vox_gt, gt_probs, vox_pred, r_vox=3, default=0.0):
         """
-        r_vox=2 -> 27 neighbors. r_vox=2 -> 125 neighbors.
+        r_vox=1 -> 27 neighbors. r_vox=2 -> 125 neighbors.
         Returns:
           tgt_soft: (M_pred,) float
           valid:    (M_pred,) bool
@@ -1213,7 +1213,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                     # Boost "Appearing" slightly more to ensure we catch the jump
                     #weights[appearing_mask] *= 20.0
 
-                    #weights[appearing_mask] = 20.0
+                    weights[appearing_mask] = 20.0
 
                     # (Total weight = pos_weight * 5.0 = 250ish)
 
@@ -1221,7 +1221,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                     # Since the base weight was 1.0, we need to multiply it by pos_weight * 5
                     # to match the importance of the appearing objects.
 
-                    #weights[disappearing_mask] = 20.0
+                    weights[disappearing_mask] = 20.0
                     # (Total weight = 250ish)
 
                     # 4. Calculate Loss
@@ -1957,7 +1957,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
         self._prev_keys = None
         self._prev_probs = None
 
-        threshold = 25.0
+        threshold = 1.0
+        #threshold = 50.0
 
         # --- METRICS BUFFER ---
         # Initialize all keys so get_avg doesn't crash if a sequence has no dynamic events
@@ -2444,13 +2445,13 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
 
                     p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys_soft(
-                        self.vox_real_gt, p_occ_tgt, self.vox_gt, default=0.0, r_vox=2
+                        self.vox_real_gt, p_occ_tgt, self.vox_gt, default=0.0, r_vox=1
                     )
 
                     # Reverse: align pred to GT keys to find uncovered GT voxels
                     pred_probs_for_rev = torch.sigmoid(logit_pred_before)
                     _, gt_has_pred_coverage = self.align_probs_to_keys_soft(
-                        self.vox_gt, pred_probs_for_rev, self.vox_real_gt, default=0.0, r_vox=2
+                        self.vox_gt, pred_probs_for_rev, self.vox_real_gt, default=0.0, r_vox=1
                     )
                     fn_uncovered = ((p_occ_tgt > 0.5) & ~gt_has_pred_coverage).sum()
 
@@ -2465,10 +2466,10 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
                 tp = (pred_bin_int & tgt_bin_int).sum()
                 fp_int = (pred_bin_int & ~tgt_bin_int).sum()
-                fn = (~pred_bin_int & tgt_bin_int).sum() + fn_uncovered
+                fn = (~pred_bin_int & tgt_bin_int).sum()# + fn_uncovered
 
                 fp_hallucination = (pred_fp > 0.0).sum()
-                total_fp = fp_int + fp_hallucination
+                total_fp = fp_int #+ fp_hallucination
 
                 occ_iou = tp / (tp + total_fp + fn + 1e-8)
                 occ_recall = tp / (tp + fn + 1e-8)
@@ -2495,15 +2496,19 @@ class VoxelUpdaterSystem(pl.LightningModule):
                             torch.sigmoid(vox_gt_prev.vals_st * 10.0),
                             self.vox_gt,
                             default=0.0, 
-                            r_vox=2
+                            r_vox=1
                         )
 
                     # BUG FIX: Only evaluate dynamics where BOTH timesteps have valid coverage.
                     # Without this, voxels missing from the previous alignment get default=0.0,
                     # which falsely registers as "appearing" or "disappearing" transitions.
                     both_valid_gt = valid_mask & valid_prev_gt
+
+
+
                     # Index into the both_valid subset
                     both_in_valid = both_valid_gt[valid_mask]  # which of the valid_mask entries are also in valid_prev_gt
+
 
                     # Define Masks
                     gt_curr = (tgt_intersect[both_in_valid] > 0.5)
@@ -2529,8 +2534,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
                     # C. Dynamic IoU
                     if mask_dynamic.sum() > 0:
-                        pred_dyn = (pred_both_valid[mask_dynamic] > 0.0)
-                        gt_dyn   = gt_curr[mask_dynamic]
+                        pred_dyn = (pred_both_valid[mask_appearing] > 0.0)
+                        gt_dyn   = gt_curr[mask_appearing]
                         intersection = (pred_dyn & gt_dyn).sum()
                         union        = (pred_dyn | gt_dyn).sum()
                         metrics_buffer["gt_dyn_iou"].append((intersection / (union + 1e-8)).item())
@@ -2562,13 +2567,13 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
 
                 p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys_soft(
-                    self.vox_real_gt, p_occ_tgt, self.vox, default=0.0, r_vox=2
+                    self.vox_real_gt, p_occ_tgt, self.vox, default=0.0, r_vox=1
                 )
 
                 # Reverse: align pred to GT keys to find uncovered GT voxels
                 pred_probs_for_rev = torch.sigmoid(logit_pred_before)
                 _, gt_has_pred_coverage = self.align_probs_to_keys_soft(
-                    self.vox, pred_probs_for_rev, self.vox_real_gt, default=0.0, r_vox=2
+                    self.vox, pred_probs_for_rev, self.vox_real_gt, default=0.0, r_vox=1
                 )
                 fn_uncovered = ((p_occ_tgt > 0.5) & ~gt_has_pred_coverage).sum()
             else:
@@ -2578,13 +2583,13 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 p_occ_tgt = torch.sigmoid(logit_gt * 10.0) # Sharp GT
 
                 p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys_soft(
-                    self.vox_gt, p_occ_tgt, self.vox, default=0.0, r_vox=2
+                    self.vox_gt, p_occ_tgt, self.vox, default=0.0, r_vox=1
                 )
 
                 # Reverse: align pred to GT keys to find uncovered GT voxels
                 pred_probs_for_rev = torch.sigmoid(logit_pred_before)
                 _, gt_has_pred_coverage = self.align_probs_to_keys_soft(
-                    self.vox, pred_probs_for_rev, self.vox_gt, default=0.0, r_vox=2
+                    self.vox, pred_probs_for_rev, self.vox_gt, default=0.0, r_vox=1
                 )
                 fn_uncovered = ((p_occ_tgt > 0.5) & ~gt_has_pred_coverage).sum()
 
@@ -2598,10 +2603,10 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
             tp = (pred_bin_int & tgt_bin_int).sum()
             fp_int = (pred_bin_int & ~tgt_bin_int).sum()
-            fn = (~pred_bin_int & tgt_bin_int).sum() + fn_uncovered
+            fn = (~pred_bin_int & tgt_bin_int).sum()# + fn_uncovered
 
             fp_hallucination = (pred_fp > 0.0).sum()
-            total_fp = fp_int + fp_hallucination
+            total_fp = fp_int #+ fp_hallucination
 
             occ_iou = tp / (tp + total_fp + fn + 1e-8)
             occ_recall = tp / (tp + fn + 1e-8)
@@ -2626,7 +2631,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                         torch.sigmoid(vox_gt_prev.vals_st * 10.0),
                         self.vox,
                         default=0.0, 
-                        r_vox=2
+                        r_vox=1
                     )
                 else:
                     vox_gt_prev = gt_seq[t-1]
@@ -2637,11 +2642,16 @@ class VoxelUpdaterSystem(pl.LightningModule):
                         torch.sigmoid(vox_gt_prev.vals_st * 10.0),
                         self.vox,
                         default=0.0, 
-                        r_vox=2
+                        r_vox=1
                     )
 
                 # BUG FIX: Only evaluate dynamics where BOTH timesteps have valid coverage.
                 both_valid_model = valid_mask & valid_prev_model
+
+                # BUG FIX: Only evaluate dynamics where BOTH timesteps have valid coverage AND Z >= 0.5
+                both_valid_model = valid_mask & valid_prev_model
+                
+                both_in_valid_model = both_valid_model[valid_mask]  # subset of valid_mask entries
                 both_in_valid_model = both_valid_model[valid_mask]  # subset of valid_mask entries
 
                 # Define Masks
@@ -2668,8 +2678,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
                 # C. Dynamic IoU
                 if mask_dynamic.sum() > 0:
-                    pred_dyn = (pred_both_valid_model[mask_dynamic] > 0.0)
-                    gt_dyn   = gt_curr[mask_dynamic]
+                    pred_dyn = (pred_both_valid_model[mask_appearing] > 0.0)
+                    gt_dyn   = gt_curr[mask_appearing]
                     intersection = (pred_dyn & gt_dyn).sum()
                     union        = (pred_dyn | gt_dyn).sum()
                     metrics_buffer["dyn_iou"].append((intersection / (union + 1e-8)).item())
@@ -2695,13 +2705,13 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
 
                 p_occ_tgt_base_aligned, valid_mask_base = self.align_probs_to_keys_soft(
-                    self.vox_real_gt, p_occ_tgt, self.vox_baseline, default=0.0, r_vox=2
+                    self.vox_real_gt, p_occ_tgt, self.vox_baseline, default=0.0, r_vox=1
                 )
 
                 # Reverse: align baseline pred to GT keys to find uncovered GT voxels
                 base_probs_for_rev = torch.sigmoid(logit_base)
                 _, gt_has_base_coverage = self.align_probs_to_keys_soft(
-                    self.vox_baseline, base_probs_for_rev, self.vox_real_gt, default=0.0, r_vox=2
+                    self.vox_baseline, base_probs_for_rev, self.vox_real_gt, default=0.0, r_vox=1
                 )
                 fn_uncovered_base = ((p_occ_tgt > 0.5) & ~gt_has_base_coverage).sum()
             else:
@@ -2711,13 +2721,13 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 p_occ_tgt = torch.sigmoid(logit_gt * 10.0) # Sharp GT
 
                 p_occ_tgt_base_aligned, valid_mask_base = self.align_probs_to_keys_soft(
-                    self.vox_gt, p_occ_tgt, self.vox_baseline, default=0.0, r_vox=2
+                    self.vox_gt, p_occ_tgt, self.vox_baseline, default=0.0, r_vox=1
                 )
 
                 # Reverse: align baseline pred to GT keys to find uncovered GT voxels
                 base_probs_for_rev = torch.sigmoid(logit_base)
                 _, gt_has_base_coverage = self.align_probs_to_keys_soft(
-                    self.vox_baseline, base_probs_for_rev, self.vox_gt, default=0.0, r_vox=2
+                    self.vox_baseline, base_probs_for_rev, self.vox_gt, default=0.0, r_vox=1
                 )
                 fn_uncovered_base = ((p_occ_tgt > 0.5) & ~gt_has_base_coverage).sum()
 
@@ -2734,10 +2744,10 @@ class VoxelUpdaterSystem(pl.LightningModule):
             
             tp_base = (base_bin_int & tgt_bin_base).sum()
             fp_int_base = (base_bin_int & ~tgt_bin_base).sum()
-            fn_base = (~base_bin_int & tgt_bin_base).sum() + fn_uncovered_base
+            fn_base = (~base_bin_int & tgt_bin_base).sum() #+ fn_uncovered_base
             
             fp_hallucination_base = (base_fp > self.vox_baseline.p.occ_thresh).sum()
-            total_fp_base = fp_int_base + fp_hallucination_base
+            total_fp_base = fp_int_base #+ fp_hallucination_base
             
             base_iou = tp_base / (tp_base + total_fp_base + fn_base + 1e-8)
             base_recall = tp_base / (tp_base + fn_base + 1e-8)
@@ -2764,7 +2774,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                         torch.sigmoid(vox_gt_prev.vals_st * 10.0),
                         self.vox_baseline,
                         default=0.0, 
-                        r_vox=2
+                        r_vox=1
                     )
                 else:
                     vox_gt_prev = gt_seq[t-1]
@@ -2775,7 +2785,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                         torch.sigmoid(vox_gt_prev.vals_st * 10.0),
                         self.vox_baseline,
                         default=0.0, 
-                        r_vox=2
+                        r_vox=1
                     )
 
                 # BUG FIX: Only evaluate dynamics where BOTH timesteps have valid coverage.
@@ -2806,8 +2816,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
                 # 5. Baseline Dynamic IoU
                 if mask_dyn_base.sum() > 0:
-                    base_dyn_pred = (base_both_valid[mask_dyn_base] > self.vox_baseline.p.occ_thresh)
-                    gt_dyn_base   = gt_curr_base[mask_dyn_base]
+                    base_dyn_pred = (base_both_valid[mask_app_base] > self.vox_baseline.p.occ_thresh)
+                    gt_dyn_base   = gt_curr_base[mask_app_base]
                     
                     int_dyn_base = (base_dyn_pred & gt_dyn_base).sum()
                     uni_dyn_base = (base_dyn_pred | gt_dyn_base).sum()
@@ -2842,13 +2852,13 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 #p_occ_tgt = (self.vox_real_gt.vals_st > 0).float()
 
                 static_p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys_soft(
-                    self.vox_real_gt, p_occ_tgt, static_baseline_vox, default=0.0, r_vox=2
+                    self.vox_real_gt, p_occ_tgt, static_baseline_vox, default=0.0, r_vox=1
                 )
 
                 # Reverse: align static pred to GT keys to find uncovered GT voxels
                 static_probs_for_rev = torch.sigmoid(static_logit_pred_before)
                 _, gt_has_static_coverage = self.align_probs_to_keys_soft(
-                    static_baseline_vox, static_probs_for_rev, self.vox_real_gt, default=0.0, r_vox=2
+                    static_baseline_vox, static_probs_for_rev, self.vox_real_gt, default=0.0, r_vox=1
                 )
                 fn_uncovered_static = ((p_occ_tgt > 0.5) & ~gt_has_static_coverage).sum()
 
@@ -2859,13 +2869,13 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 p_occ_tgt = torch.sigmoid(logit_gt * 10.0) # Sharp GT
 
                 static_p_occ_tgt_aligned, valid_mask = self.align_probs_to_keys_soft(
-                    self.vox_gt, p_occ_tgt, static_baseline_vox, default=0.0, r_vox=2
+                    self.vox_gt, p_occ_tgt, static_baseline_vox, default=0.0, r_vox=1
                 )
 
                 # Reverse: align static pred to GT keys to find uncovered GT voxels
                 static_probs_for_rev = torch.sigmoid(static_logit_pred_before)
                 _, gt_has_static_coverage = self.align_probs_to_keys_soft(
-                    static_baseline_vox, static_probs_for_rev, self.vox_gt, default=0.0, r_vox=2
+                    static_baseline_vox, static_probs_for_rev, self.vox_gt, default=0.0, r_vox=1
                 )
                 fn_uncovered_static = ((p_occ_tgt > 0.5) & ~gt_has_static_coverage).sum()
 
@@ -2883,10 +2893,10 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
             tp = (pred_bin_int & tgt_bin_int).sum()
             fp_int = (pred_bin_int & ~tgt_bin_int).sum()
-            fn = (~pred_bin_int & tgt_bin_int).sum() + fn_uncovered_static
+            fn = (~pred_bin_int & tgt_bin_int).sum() #+ fn_uncovered_static
 
             fp_hallucination = (pred_fp > 0.0).sum()
-            total_fp = fp_int + fp_hallucination
+            total_fp = fp_int #+ fp_hallucination
 
             occ_iou = tp / (tp + total_fp + fn + 1e-8)
             occ_recall = tp / (tp + fn + 1e-8)
@@ -2914,7 +2924,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                         torch.sigmoid(vox_gt_prev.vals_st * 10.0),
                         static_baseline_vox,
                         default=0.0,
-                        r_vox=2
+                        r_vox=1
                     )
                 else:
                     vox_gt_prev = gt_seq[t-1]
@@ -2925,7 +2935,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                         torch.sigmoid(vox_gt_prev.vals_st * 10.0),
                         static_baseline_vox,
                         default=0.0,
-                        r_vox=2
+                        r_vox=1
                     )
 
                 # BUG FIX: Only evaluate dynamics where BOTH timesteps have valid coverage.
@@ -2956,8 +2966,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
                 # C. Dynamic IoU
                 if mask_dynamic.sum() > 0:
-                    pred_dyn = (pred_both_valid_static[mask_dynamic] > 0.0)
-                    gt_dyn   = gt_curr[mask_dynamic]
+                    pred_dyn = (pred_both_valid_static[mask_appearing] > 0.0)
+                    gt_dyn   = gt_curr[mask_appearing]
                     intersection = (pred_dyn & gt_dyn).sum()
                     union        = (pred_dyn | gt_dyn).sum()
                     metrics_buffer["static_dyn_iou"].append((intersection / (union + 1e-8)).item())
@@ -4119,6 +4129,7 @@ def main():
         seq_file="seq_manifest.json",
         voxel_size=0.2,
         radius_m=1,
+        #radius_m=0.2,
         topk=8,
         temp=0.5,
         feature_dim=16,
@@ -4250,4 +4261,4 @@ def main():
 
     trainer.fit(sys, dm)
 if __name__ == "__main__":
-    main()g
+    main()
