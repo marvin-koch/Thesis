@@ -39,6 +39,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from collections import defaultdict
+from scipy import ndimage
 
 # ---- project imports (adjust if your repo layout differs) ----
 from train import (
@@ -482,6 +483,160 @@ def visualize_episode(
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  Frontier-Based Exploration
+# ═══════════════════════════════════════════════════════════════════
+
+@dataclass
+class ExplorationResult:
+    coverage: float = 0.0          # fraction of GT-free cells visited
+    collisions: int = 0
+    steps: int = 0
+    distance_traveled: float = 0.0
+    frontiers_visited: int = 0
+
+    @property
+    def collision_rate(self) -> float:
+        return self.collisions / max(1, self.steps)
+
+    @property
+    def efficiency(self) -> float:
+        """Coverage per unit distance — higher is better."""
+        return self.coverage / max(self.distance_traveled, 1e-8)
+
+
+def _find_frontiers(occ_grid: np.ndarray, explored: np.ndarray) -> np.ndarray:
+    """
+    Frontier cells = explored FREE cells adjacent to at least one UNEXPLORED cell.
+    Returns boolean mask (H, W).
+    """
+    free_explored = explored & (~occ_grid)
+    unexplored = ~explored
+    unexplored_border = ndimage.binary_dilation(unexplored, iterations=1)
+    return free_explored & unexplored_border
+
+
+def _select_frontier_goal(
+    frontier_mask: np.ndarray, pos: Tuple[int, int]
+) -> Optional[Tuple[int, int]]:
+    """Pick the nearest frontier cell to navigate to."""
+    ys, xs = np.where(frontier_mask)
+    if len(ys) == 0:
+        return None
+    dists = (ys - pos[0]) ** 2 + (xs - pos[1]) ** 2
+    idx = np.argmin(dists)
+    return (int(ys[idx]), int(xs[idx]))
+
+
+def run_exploration(
+    occ_grids_over_time: List[np.ndarray],
+    gt_grids_over_time: List[np.ndarray],
+    start: Tuple[int, int],
+    sensor_radius: int = 10,
+    max_steps: int = 300,
+) -> ExplorationResult:
+    """
+    Simulate frontier-based exploration.
+
+    The robot iteratively:
+      1. Marks cells within sensor_radius as explored
+      2. Finds frontiers (explored-free adjacent to unexplored)
+      3. Plans A* to the nearest frontier on the method's occ grid
+      4. Walks one step along that plan
+      5. Collisions checked against GT
+    """
+    T = len(occ_grids_over_time)
+    H, W = occ_grids_over_time[0].shape
+    res = ExplorationResult()
+
+    gt_free_t0 = ~gt_grids_over_time[0]
+    total_free = gt_free_t0.sum()
+    if total_free == 0:
+        return res
+
+    explored = np.zeros((H, W), dtype=bool)
+    pos = start
+    plan = None
+    plan_idx = 0
+
+    # Pre-compute disc mask for sensor
+    yy, xx = np.ogrid[-sensor_radius:sensor_radius + 1, -sensor_radius:sensor_radius + 1]
+    disc = (yy ** 2 + xx ** 2) <= sensor_radius ** 2
+
+    for step in range(max_steps):
+        t = min(step, T - 1)
+        occ = occ_grids_over_time[t]
+        gt = gt_grids_over_time[t]
+
+        # 1. Sense — mark cells within radius as explored
+        r0 = max(0, pos[0] - sensor_radius)
+        r1 = min(H, pos[0] + sensor_radius + 1)
+        c0 = max(0, pos[1] - sensor_radius)
+        c1 = min(W, pos[1] + sensor_radius + 1)
+
+        dr0 = r0 - (pos[0] - sensor_radius)
+        dr1 = disc.shape[0] - ((pos[0] + sensor_radius + 1) - r1)
+        dc0 = c0 - (pos[1] - sensor_radius)
+        dc1 = disc.shape[1] - ((pos[1] + sensor_radius + 1) - c1)
+
+        explored[r0:r1, c0:c1] |= disc[dr0:dr1, dc0:dc1]
+
+        # 2. Check if we need to replan
+        need_replan = False
+        if plan is None or plan_idx >= len(plan):
+            need_replan = True
+        elif plan_idx < len(plan):
+            for k in range(plan_idx, min(plan_idx + 5, len(plan))):
+                r, c = plan[k]
+                if occ[r, c]:
+                    need_replan = True
+                    break
+
+        if need_replan:
+            frontier = _find_frontiers(occ, explored)
+            goal = _select_frontier_goal(frontier, pos)
+
+            if goal is None:
+                break  # no more reachable frontiers
+
+            plan = astar(occ, pos, goal)
+            plan_idx = 1
+            if plan is None:
+                # Try another frontier
+                frontier[goal[0], goal[1]] = False
+                goal = _select_frontier_goal(frontier, pos)
+                if goal is not None:
+                    plan = astar(occ, pos, goal)
+                    plan_idx = 1
+                if plan is None:
+                    res.steps += 1
+                    continue
+
+            res.frontiers_visited += 1
+
+        # 3. Move one step
+        if plan is not None and plan_idx < len(plan):
+            next_pos = plan[plan_idx]
+            plan_idx += 1
+        else:
+            next_pos = pos
+
+        # 4. Collision check against GT
+        if gt[next_pos[0], next_pos[1]]:
+            res.collisions += 1
+
+        dy = next_pos[0] - pos[0]
+        dx = next_pos[1] - pos[1]
+        res.distance_traveled += (dy ** 2 + dx ** 2) ** 0.5
+        pos = next_pos
+        res.steps += 1
+
+    # Final coverage
+    explored_free = explored & gt_free_t0
+    res.coverage = float(explored_free.sum()) / float(total_free)
+    return res
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  Main Evaluation Loop
 # ═══════════════════════════════════════════════════════════════════
 
@@ -526,6 +681,12 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num_viz", type=int, default=5,
                         help="Number of episodes to visualize per sequence")
+    parser.add_argument("--exploration_starts", type=int, default=10,
+                        help="Number of exploration episodes per sequence")
+    parser.add_argument("--exploration_steps", type=int, default=300,
+                        help="Max steps per exploration episode")
+    parser.add_argument("--sensor_radius", type=int, default=10,
+                        help="Exploration sensor radius in grid cells")
     args = parser.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -598,6 +759,7 @@ def main():
 
     # ── Aggregate results ──
     all_results = {m: [] for m in METHODS}  # method -> list of EpisodeResult
+    all_exploration = {m: [] for m in METHODS}  # method -> list of ExplorationResult
 
     val_loader = dm.val_dataloader()
     if val_loader is None:
@@ -895,6 +1057,40 @@ def main():
                     )
                 """
 
+        # ── Frontier-Based Exploration ──
+        explore_starts = sample_free_positions(
+            gt_grids[0], args.exploration_starts,
+            min_dist_cells=5, max_dist_cells=999, rng=rng,
+        )
+        explore_starts = [s for s, _ in explore_starts]  # only need start points
+
+        if explore_starts:
+            print(f"  Running {len(explore_starts)} exploration episodes...")
+            for method in METHODS:
+                grids = method_grids[method]
+                if not grids:
+                    continue
+                for start_pos in explore_starts:
+                    exp_result = run_exploration(
+                        grids, gt_grids, start_pos,
+                        sensor_radius=args.sensor_radius,
+                        max_steps=args.exploration_steps,
+                    )
+                    all_exploration[method].append(exp_result)
+
+            # Per-sequence exploration summary
+            print(f"  --- Exploration ---")
+            for method in METHODS:
+                results = all_exploration[method][-len(explore_starts):]
+                if not results:
+                    continue
+                cov = np.mean([r.coverage for r in results])
+                col = np.mean([r.collision_rate for r in results])
+                eff = np.mean([r.efficiency for r in results])
+                fv  = np.mean([r.frontiers_visited for r in results])
+                print(f"  {method:10s}  Coverage={cov:.3f}  ColRate={col:.4f}  "
+                      f"Efficiency={eff:.5f}  Frontiers={fv:.1f}")
+
         # Per-sequence summary
         for method in METHODS:
             results = all_results[method][-len(episodes):]
@@ -940,25 +1136,80 @@ def main():
         json.dump(summary, f, indent=2)
     print(f"\nMetrics saved to {json_path}")
 
-    # ── Bar chart ──
-    fig, axes = plt.subplots(1, 4, figsize=(16, 4))
-    metrics_to_plot = [("SR", "Success Rate ↑"), ("SPL", "SPL ↑"), ("CollisionRate", "Collision Rate ↓"), ("Replans", "Re-plans")]
+    # ═══════════════════════════════════════════════════════════════
+    #  Dataset-Wide Exploration Summary
+    # ═══════════════════════════════════════════════════════════════
+
+    print("\n" + "=" * 80)
+    print("DATASET-WIDE FRONTIER EXPLORATION RESULTS")
+    print("=" * 80)
+    exp_header = (f"{'Method':>12s} | {'Coverage':>8s} | {'ColRate':>8s} | "
+                  f"{'Efficien':>8s} | {'Frontiers':>9s} | {'Steps':>6s} | {'N':>5s}")
+    print(exp_header)
+    print("-" * len(exp_header))
+
+    exp_summary = {}
+    for method in METHODS:
+        results = all_exploration[method]
+        if not results:
+            continue
+        cov  = float(np.mean([r.coverage for r in results]))
+        cr   = float(np.mean([r.collision_rate for r in results]))
+        eff  = float(np.mean([r.efficiency for r in results]))
+        fv   = float(np.mean([r.frontiers_visited for r in results]))
+        st   = float(np.mean([r.steps for r in results]))
+        exp_summary[method] = {
+            "Coverage": cov, "CollisionRate": cr, "Efficiency": eff,
+            "Frontiers": fv, "AvgSteps": st, "N": len(results),
+        }
+        print(f"{method:>12s} | {cov:8.3f} | {cr:8.4f} | {eff:8.5f} | {fv:9.1f} | {st:6.0f} | {len(results):>5d}")
+
+    print("=" * 80)
+
+    # Save combined JSON
+    combined_json = {"navigation": summary, "exploration": exp_summary}
+    json_path = os.path.join(args.out, "all_metrics.json")
+    with open(json_path, "w") as f:
+        json.dump(combined_json, f, indent=2)
+    print(f"All metrics saved to {json_path}")
+
+    # ── Combined bar chart: Navigation + Exploration ──
+    fig, axes = plt.subplots(2, 4, figsize=(18, 8))
+
+    # Row 1: Navigation
+    nav_metrics = [("SR", "Success Rate ↑"), ("SPL", "SPL ↑"),
+                   ("CollisionRate", "Collision Rate ↓"), ("Replans", "Re-plans ↓")]
     colors = {"model": "#2196F3", "baseline": "#FF9800", "static": "#9E9E9E", "gt": "#4CAF50"}
 
-    for ax, (key, label) in zip(axes, metrics_to_plot):
+    for ax, (key, label) in zip(axes[0], nav_metrics):
         vals = [summary.get(m, {}).get(key, 0) for m in METHODS]
         bars = ax.bar(METHODS, vals, color=[colors.get(m, "#ccc") for m in METHODS])
         ax.set_ylabel(label)
         ax.set_ylim(bottom=0)
         for bar, v in zip(bars, vals):
             ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
-                    f"{v:.3f}", ha="center", va="bottom", fontsize=9)
+                    f"{v:.3f}", ha="center", va="bottom", fontsize=8)
+    axes[0][0].set_title("Point-Goal Navigation", fontsize=11, fontweight="bold", loc="left")
 
-    fig.suptitle("Point-Goal Navigation – Dynamic Obstacle Avoidance", fontsize=13)
+    # Row 2: Exploration
+    exp_plot_metrics = [("Coverage", "Coverage ↑"), ("CollisionRate", "Collision Rate ↓"),
+                        ("Efficiency", "Efficiency ↑"), ("Frontiers", "Frontiers Reached")]
+
+    for ax, (key, label) in zip(axes[1], exp_plot_metrics):
+        vals = [exp_summary.get(m, {}).get(key, 0) for m in METHODS]
+        bars = ax.bar(METHODS, vals, color=[colors.get(m, "#ccc") for m in METHODS])
+        ax.set_ylabel(label)
+        ax.set_ylim(bottom=0)
+        for bar, v in zip(bars, vals):
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
+                    f"{v:.3f}", ha="center", va="bottom", fontsize=8)
+    axes[1][0].set_title("Frontier Exploration", fontsize=11, fontweight="bold", loc="left")
+
+    fig.suptitle("Downstream Evaluation – Dynamic Voxel Mapping", fontsize=14)
     fig.tight_layout()
-    fig.savefig(os.path.join(args.out, "nav_summary.png"), dpi=150)
+    fig.savefig(os.path.join(args.out, "combined_summary.png"), dpi=150)
     plt.close(fig)
-    print(f"Summary plot saved to {os.path.join(args.out, 'nav_summary.png')}")
+    print(f"Combined plot saved to {os.path.join(args.out, 'combined_summary.png')}")
 
 
 if __name__ == "__main__":
