@@ -1108,6 +1108,26 @@ def main():
             print("  No grids built, skipping.")
             continue
 
+        # ── Keep only timesteps where GT changed (dynamics present) ──
+        # Always keep t=0; then keep any t where GT differs from previous
+        dynamic_idx = [0]
+        for i in range(1, len(gt_grids)):
+            if not np.array_equal(gt_grids[i], gt_grids[i - 1]):
+                dynamic_idx.append(i)
+
+        n_total = len(gt_grids)
+        n_dyn = len(dynamic_idx)
+        print(f"  Dynamic timesteps: {n_dyn}/{n_total}  (skipping {n_total - n_dyn} static)")
+
+        if n_dyn < 2:
+            print("  No dynamic changes detected, skipping sequence.")
+            continue
+
+        # Filter all grid lists to only dynamic timesteps
+        gt_grids = [gt_grids[i] for i in dynamic_idx]
+        for m in METHODS:
+            method_grids[m] = [method_grids[m][i] for i in dynamic_idx]
+
         # ── Sample navigation episodes ──
         # Use the first GT grid for sampling start/goal (ensures they're initially reachable)
         episodes = sample_free_positions(
