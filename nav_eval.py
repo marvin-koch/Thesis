@@ -527,12 +527,84 @@ def _select_frontier_goal(
     return (int(ys[idx]), int(xs[idx]))
 
 
+def visualize_exploration_step(
+    occ_grid: np.ndarray,
+    gt_grid: np.ndarray,
+    explored: np.ndarray,
+    frontier: np.ndarray,
+    pos: Tuple[int, int],
+    plan_path: Optional[List[Tuple[int, int]]],
+    goal: Optional[Tuple[int, int]],
+    save_path: str,
+    title: str = "",
+):
+    """Save a top-down visualization of one exploration step."""
+    H, W = occ_grid.shape
+    img = np.ones((H, W, 3), dtype=np.uint8) * 40  # dark = unexplored
+
+    # Explored free space
+    explored_free = explored & (~occ_grid)
+    img[explored_free] = [180, 220, 255]  # light blue
+
+    # Walls from the map the robot sees
+    img[occ_grid & explored] = [80, 80, 80]
+
+    # GT-only obstacles (hidden from robot)
+    gt_only = gt_grid & ~occ_grid & explored
+    img[gt_only] = [255, 120, 120]  # light red
+
+    # Frontier cells
+    img[frontier] = [255, 220, 50]  # yellow
+
+    # Planned path
+    if plan_path:
+        for r, c in plan_path:
+            if 0 <= r < H and 0 <= c < W:
+                img[r, c] = [100, 180, 255]
+
+    # Current frontier goal
+    if goal is not None:
+        for dr in range(-1, 2):
+            for dc in range(-1, 2):
+                gr, gc = goal[0] + dr, goal[1] + dc
+                if 0 <= gr < H and 0 <= gc < W:
+                    img[gr, gc] = [200, 0, 0]
+
+    # Robot position
+    for dr in range(-2, 3):
+        for dc in range(-2, 3):
+            pr, pc = pos[0] + dr, pos[1] + dc
+            if 0 <= pr < H and 0 <= pc < W:
+                img[pr, pc] = [0, 255, 0]
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    ax.imshow(img, origin="lower")
+    ax.set_title(title, fontsize=11)
+
+    patches = [
+        mpatches.Patch(color=[c / 255 for c in [180, 220, 255]], label="Explored free"),
+        mpatches.Patch(color=[c / 255 for c in [40, 40, 40]], label="Unexplored"),
+        mpatches.Patch(color=[c / 255 for c in [80, 80, 80]], label="Map wall"),
+        mpatches.Patch(color=[c / 255 for c in [255, 120, 120]], label="Hidden (GT)"),
+        mpatches.Patch(color=[c / 255 for c in [255, 220, 50]], label="Frontier"),
+        mpatches.Patch(color=[c / 255 for c in [100, 180, 255]], label="Planned path"),
+        mpatches.Patch(color=[c / 255 for c in [0, 255, 0]], label="Robot"),
+        mpatches.Patch(color=[c / 255 for c in [200, 0, 0]], label="Frontier goal"),
+    ]
+    ax.legend(handles=patches, loc="upper right", fontsize=7)
+    ax.axis("off")
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=100)
+    plt.close(fig)
+
+
 def run_exploration(
     occ_grids_over_time: List[np.ndarray],
     gt_grids_over_time: List[np.ndarray],
     start: Tuple[int, int],
     sensor_radius: int = 10,
     max_steps: int = 300,
+    viz_dir: Optional[str] = None,
 ) -> ExplorationResult:
     """
     Simulate frontier-based exploration.
@@ -543,6 +615,8 @@ def run_exploration(
       3. Plans A* to the nearest frontier on the method's occ grid
       4. Walks one step along that plan
       5. Collisions checked against GT
+
+    If viz_dir is set, saves a per-step image to that directory.
     """
     T = len(occ_grids_over_time)
     H, W = occ_grids_over_time[0].shape
@@ -557,10 +631,15 @@ def run_exploration(
     pos = start
     plan = None
     plan_idx = 0
+    current_goal = None
+    frontier = np.zeros((H, W), dtype=bool)
 
     # Pre-compute disc mask for sensor
     yy, xx = np.ogrid[-sensor_radius:sensor_radius + 1, -sensor_radius:sensor_radius + 1]
     disc = (yy ** 2 + xx ** 2) <= sensor_radius ** 2
+
+    if viz_dir is not None:
+        os.makedirs(viz_dir, exist_ok=True)
 
     for step in range(max_steps):
         t = min(step, T - 1)
@@ -593,19 +672,26 @@ def run_exploration(
 
         if need_replan:
             frontier = _find_frontiers(occ, explored)
-            goal = _select_frontier_goal(frontier, pos)
+            current_goal = _select_frontier_goal(frontier, pos)
 
-            if goal is None:
+            if current_goal is None:
+                # Save final frame before breaking
+                if viz_dir is not None:
+                    visualize_exploration_step(
+                        occ, gt, explored, frontier, pos, plan, current_goal,
+                        os.path.join(viz_dir, f"{step:04d}.png"),
+                        title=f"Step {step} — no frontiers left",
+                    )
                 break  # no more reachable frontiers
 
-            plan = astar(occ, pos, goal)
+            plan = astar(occ, pos, current_goal)
             plan_idx = 1
             if plan is None:
                 # Try another frontier
-                frontier[goal[0], goal[1]] = False
-                goal = _select_frontier_goal(frontier, pos)
-                if goal is not None:
-                    plan = astar(occ, pos, goal)
+                frontier[current_goal[0], current_goal[1]] = False
+                current_goal = _select_frontier_goal(frontier, pos)
+                if current_goal is not None:
+                    plan = astar(occ, pos, current_goal)
                     plan_idx = 1
                 if plan is None:
                     res.steps += 1
@@ -613,14 +699,22 @@ def run_exploration(
 
             res.frontiers_visited += 1
 
-        # 3. Move one step
+        # 3. Per-step visualization
+        if viz_dir is not None:
+            visualize_exploration_step(
+                occ, gt, explored, frontier, pos, plan, current_goal,
+                os.path.join(viz_dir, f"{step:04d}.png"),
+                title=f"Step {step}  cov={explored[gt_free_t0].sum()/total_free:.1%}",
+            )
+
+        # 4. Move one step
         if plan is not None and plan_idx < len(plan):
             next_pos = plan[plan_idx]
             plan_idx += 1
         else:
             next_pos = pos
 
-        # 4. Collision check against GT
+        # 5. Collision check against GT
         if gt[next_pos[0], next_pos[1]]:
             res.collisions += 1
 
@@ -1070,11 +1164,18 @@ def main():
                 grids = method_grids[method]
                 if not grids:
                     continue
-                for start_pos in explore_starts:
+                for exp_idx, start_pos in enumerate(explore_starts):
+                    # Visualize only the first episode per method
+                    if exp_idx == 0:
+                        viz_path = os.path.join(seq_out_dir, f"explore_{method}")
+                    else:
+                        viz_path = None
+
                     exp_result = run_exploration(
                         grids, gt_grids, start_pos,
                         sensor_radius=args.sensor_radius,
                         max_steps=args.exploration_steps,
+                        viz_dir=viz_path,
                     )
                     all_exploration[method].append(exp_result)
 
