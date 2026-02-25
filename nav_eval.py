@@ -47,6 +47,8 @@ from train import (
 )
 from voxel.voxel import TorchSparseVoxelGrid, VoxelParams
 from voxel.utils import to_torch, rotate_points, build_maps_from_points_and_centers_torch,BevSpec, bev_from_voxels
+from pytorch3d.ops import knn_points
+
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -117,6 +119,87 @@ def path_length(path: List[Tuple[int, int]]) -> float:
     return d
 
 
+def kabsch_umeyama_sim3(src, dst):
+
+    # 1. Centroid subtraction
+    mu_src = src.mean(dim=0)
+    mu_dst = dst.mean(dim=0)
+
+    src_c = src - mu_src
+    dst_c = dst - mu_dst
+
+    # 2. Compute Scale (s)
+    # Scale is the ratio of root-mean-square deviations from centroids
+    var_src = (src_c**2).sum(dim=-1).mean()
+    var_dst = (dst_c**2).sum(dim=-1).mean()
+    scale = torch.sqrt(var_dst / var_src)
+
+    # 3. Compute Rotation (R) using SVD
+    # Correlation matrix
+    H = src_c.T @ dst_c
+    U, S, Vh = torch.linalg.svd(H)
+
+    # Correction for reflection
+    d = torch.sign(torch.linalg.det(U @ Vh))
+    diag = torch.ones(3, device=src.device)
+    diag[2] = d
+
+    R = Vh.T @ torch.diag(diag) @ U.T
+
+    # 4. Compute Translation (t)
+    # t = mu_dst - s * (R @ mu_src)
+    translation = mu_dst - scale * (R @ mu_src)
+
+    return R, translation, scale
+
+def icp_sim3(src, dst, init_R, init_t, init_s, max_iters=20, tolerance=1e-5):
+
+    # Apply initial Kabsch alignment
+    src_curr = init_s * (src @ init_R.T) + init_t
+
+    # Accumulators for the total transformation
+    R_acc = init_R.clone()
+    t_acc = init_t.clone()
+    s_acc = init_s.clone()
+
+    prev_loss = float('inf')
+
+    for i in range(max_iters):
+        # 1. Find true nearest neighbors in 3D space
+        # knn_points expects batched tensors: (1, N, 3)
+        res = knn_points(src_curr.unsqueeze(0), dst.unsqueeze(0), K=1)
+
+        # Squeeze out the batch dimension
+        idx = res.idx.squeeze(0).squeeze(-1)      # (N,)
+        dists = res.dists.squeeze(0).squeeze(-1)  # (N,)
+
+        # 2. Filter Outliers (Crucial for Dust3R noise!)
+        # Only keep the 85% closest points so floating artifacts don't warp the room
+        q85 = torch.quantile(dists, 0.85)
+        valid = dists < q85
+
+        src_matched = src_curr[valid]
+        dst_matched = dst[idx[valid]]
+
+        # 3. Estimate new transformation on the matched pairs
+        R, t, s = kabsch_umeyama_sim3(src_matched, dst_matched)
+
+        # 4. Apply transformation for the next iteration
+        src_curr = s * (src_curr @ R.T) + t
+
+        # 5. Update global accumulators
+        # (Sim3 Composition: S2 * R2 * (S1 * R1 * X + T1) + T2)
+        t_acc = s * (R @ t_acc) + t
+        R_acc = R @ R_acc
+        s_acc = s * s_acc
+
+        # Check for convergence
+        mean_dist = dists[valid].mean().item()
+        if abs(prev_loss - mean_dist) < tolerance:
+            break
+        prev_loss = mean_dist
+
+    return R_acc, t_acc, s_acc
 # ═══════════════════════════════════════════════════════════════════
 #  Voxel Grid  →  2-D Occupancy Grid
 # ═══════════════════════════════════════════════════════════════════
@@ -199,7 +282,7 @@ def _get_interior_free_mask(occ_grid: np.ndarray) -> np.ndarray:
 
 
 def sample_free_positions(
-    occ_grid: np.ndarray, n: int, max_dist_cells: int = 20, min_dist_cells: int = 5, rng: np.random.Generator = None
+    occ_grid: np.ndarray, n: int, max_dist_cells: int = 30, min_dist_cells: int = 10, rng: np.random.Generator = None
 ) -> List[Tuple[Tuple[int, int], Tuple[int, int]]]:
     """
     Sample n (start, goal) pairs on free cells that have all 8 neighbours free,
@@ -258,6 +341,9 @@ def run_episode(
     goal: Tuple[int, int],
     max_steps: int = 200,
     goal_radius: int = 2,
+    method="gt",
+    episode=0,
+    seq="scene"
 ) -> EpisodeResult:
     """
     Simulate one navigation episode.
@@ -314,6 +400,15 @@ def run_episode(
             plan_idx += 1
         else:
             next_pos = pos  # stuck
+
+        # MOVE THE VIZ HERE
+        visualize_episode(
+            occ_grids_over_time[t],
+            gt_grids_over_time[t],
+            pos, goal, plan,
+            os.path.join(seq, f"{episode}_{method}_{step:03d}.png"),
+            title=f"Episode {episode}, Step {step} - {method}"
+        )
 
         # Record collision if GT says this cell is occupied
         if gt_grids_over_time[t][next_pos[0], next_pos[1]]:
@@ -414,9 +509,9 @@ def build_voxel_from_gt_direct(sim_data, voxel_size, device):
 def main():
     parser = argparse.ArgumentParser(description="Point-Goal Nav Evaluation on Dynamic Voxel Maps")
     parser.add_argument("--out", default="nav_results", help="Output directory")
-    parser.add_argument("--episodes_per_seq", type=int, default=5)
-    parser.add_argument("--steps_per_episode", type=int, default=10)
-    parser.add_argument("--min_dist_cells", type=int, default=10,
+    parser.add_argument("--episodes_per_seq", type=int, default=20)
+    parser.add_argument("--steps_per_episode", type=int, default=100)
+    parser.add_argument("--min_dist_cells", type=int, default=15,
                         help="Min start-goal distance in grid cells")
     parser.add_argument("--goal_radius", type=int, default=2)
     parser.add_argument("--voxel_size", type=float, default=0.2)
@@ -680,11 +775,11 @@ def main():
             if real_gt_root:
                 real_gt_path = os.path.join(real_gt_root, f"{seq_id}_t{p:04d}.pt").replace(".glb", "")
                 if os.path.exists(real_gt_path):
-                    real_gt_data = torch.load(real_gt_path, map_location=device)
+                    real_gt = torch.load(real_gt_path, map_location=device)
                     
                     with torch.cuda.amp.autocast(enabled=False):
-                        gt_pts = real_gt["world_points"].to(self.device)   # (S, H, W, 3)
-                        gt_ex = real_gt["extrinsic"].to(self.device)
+                        gt_pts = real_gt["world_points"].to(device)   # (S, H, W, 3)
+                        gt_ex = real_gt["extrinsic"].to(device)
                         gt_cams = gt_ex[:, :3, 3]
 
                         pred_pts = predictions["world_points"]  # already strided (S, H', W', 3)
@@ -709,7 +804,7 @@ def main():
                             pred_corr = pred_flat[both_valid]
 
                             n = min(50000, gt_corr.shape[0])
-                            idx = torch.randperm(gt_corr.shape[0], device=self.device)[:n]
+                            idx = torch.randperm(gt_corr.shape[0], device=device)[:n]
 
                             R_k, t_k, s_k = kabsch_umeyama_sim3(gt_corr[idx], pred_corr[idx])
                             R_k, t_k, s_k = icp_sim3(
@@ -733,9 +828,9 @@ def main():
                     if real_gt["images"].dim() == 4 and real_gt["images"].shape[1] == 3:
                         real_gt["images"] = real_gt["images"].permute(0, 2, 3, 1)
 
-                    vox_real = build_voxel_from_gt_direct(real_gt_data, voxel_size, device)
+                    vox_real = build_voxel_from_gt_direct(real_gt, voxel_size, device)
                     gt_grids.append(extract_grid(vox_real, is_latent=False))
-                    del vox_real, real_gt_data
+                    del vox_real, real_gt
                 else:
                     gt_grids.append(extract_grid(gt_seq[t], is_latent=False))
             else:
@@ -783,17 +878,22 @@ def main():
                     grids, gt_grids, start, goal,
                     max_steps=args.steps_per_episode,
                     goal_radius=args.goal_radius,
+                    method=method,
+                    episode=ep_idx,
+                    seq=seq_out_dir,
                 )
                 all_results[method].append(result)
 
                 # Visualize a few
-                if ep_idx < args.num_viz and method in ["model", "gt"]:
+                """
+                if ep_idx < args.num_viz and method in ["model", "gt", "baseline"]:
                     plan = astar(grids[0], start, goal)
                     visualize_episode(
                         grids[0], gt_grids[0], start, goal, plan,
                         os.path.join(seq_out_dir, f"ep{ep_idx}_{method}.png"),
                         title=f"{method.upper()} – ep {ep_idx}",
                     )
+                """
 
         # Per-sequence summary
         for method in METHODS:
