@@ -356,6 +356,8 @@ def run_episode(
     plan = None
     plan_idx = 0
     T = len(occ_grids_over_time)
+    trajectory = [start]       # full trail of positions visited
+    collision_history = []     # list of (step, attempted_pos) for every collision
 
     # Compute optimal path length on initial GT grid
     opt_path = astar(gt_grids_over_time[0], start, goal)
@@ -372,14 +374,13 @@ def run_episode(
             res.success = True
             break
 
-        # Check if current plan is still valid
+        # Check if current plan is still valid (using the method's own map)
         need_replan = False
         if plan is None or plan_idx >= len(plan):
             need_replan = True
         elif plan_idx < len(plan):
-            # Check if upcoming cells on the plan are now blocked
-            look_ahead = min(plan_idx + 5, len(plan))
-            for k in range(plan_idx, look_ahead):
+            # Check if ANY upcoming cell on the remaining plan is now blocked
+            for k in range(plan_idx, len(plan)):
                 r, c = plan[k]
                 if occ_grids_over_time[t][r, c]:
                     need_replan = True
@@ -402,23 +403,36 @@ def run_episode(
         else:
             next_pos = pos  # stuck
 
-        # MOVE THE VIZ HERE
+        # Record collision if GT says this cell is occupied
+        collision_this_step = False
+        attempted_pos = next_pos
+        if gt_grids_over_time[t][next_pos[0], next_pos[1]]:
+            res.collisions += 1
+            collision_this_step = True
+            collision_history.append((step, attempted_pos))
+            # Robot bumped into an obstacle it didn't see — force a replan
+            # next step so it routes around it. Stay at current position.
+            plan = None
+            next_pos = pos
+
+        # Visualize AFTER collision logic so the viz reflects the replan
         visualize_episode(
             occ_grids_over_time[t],
             gt_grids_over_time[t],
-            pos, goal, plan,
+            start, goal, plan,
             os.path.join(seq, f"{episode}_{method}_{step:03d}.png"),
-            title=f"Episode {episode}, Step {step} - {method}"
+            title=f"{method.upper()} – step {step}",
+            collision_pos=attempted_pos if collision_this_step else None,
+            robot_pos=pos,
+            trajectory=trajectory,
+            collision_history=collision_history,
         )
-
-        # Record collision if GT says this cell is occupied
-        if gt_grids_over_time[t][next_pos[0], next_pos[1]]:
-            res.collisions += 1
 
         dy = next_pos[0] - pos[0]
         dx = next_pos[1] - pos[1]
         res.path_length_actual += (dy ** 2 + dx ** 2) ** 0.5
         pos = next_pos
+        trajectory.append(pos)
         res.steps += 1
 
     return res
@@ -436,49 +450,85 @@ def visualize_episode(
     plan_path: Optional[List[Tuple[int, int]]],
     save_path: str,
     title: str = "",
+    collision_pos: Optional[Tuple[int, int]] = None,
+    robot_pos: Optional[Tuple[int, int]] = None,
+    trajectory: Optional[List[Tuple[int, int]]] = None,
+    collision_history: Optional[List[Tuple[int, Tuple[int, int]]]] = None,
 ):
-    """Save a top-down visualization of one episode."""
+    """Save a paper-quality top-down visualization of one episode frame."""
     H, W = occ_grid.shape
-    img = np.ones((H, W, 3), dtype=np.uint8) * 240  # light grey background
 
-    # Walls from the map the robot sees
-    img[occ_grid] = [80, 80, 80]
+    # --- build RGB canvas ---
+    img = np.ones((H, W, 3), dtype=np.float32) * 0.94  # off-white background
 
-    # GT walls the robot doesn't know about (dynamic diff)
+    # Walls from the method's map
+    img[occ_grid] = [0.30, 0.30, 0.30]
+
+    # GT-only walls (hidden dynamic obstacles)
     gt_only = gt_grid & ~occ_grid
-    img[gt_only] = [255, 120, 120]  # light red = hidden obstacle
+    img[gt_only] = [0.90, 0.42, 0.42]          # muted red
 
-    # Planned path
+    # Trajectory trail (drawn before plan so plan overlays it)
+    if trajectory and len(trajectory) > 1:
+        for i, (r, c) in enumerate(trajectory):
+            if 0 <= r < H and 0 <= c < W:
+                # Fade from light to dark along the trail
+                alpha = 0.3 + 0.7 * (i / len(trajectory))
+                img[r, c] = [0.40 * alpha, 0.75 * alpha, 0.40 * alpha]
+
+    # Planned path (thin blue)
     if plan_path:
         for r, c in plan_path:
             if 0 <= r < H and 0 <= c < W:
-                img[r, c] = [100, 180, 255]
+                img[r, c] = [0.30, 0.60, 0.95]
 
-    # Start & goal
-    for dr in range(-2, 3):
-        for dc in range(-2, 3):
-            sr, sc = start[0] + dr, start[1] + dc
-            gr, gc = goal[0] + dr, goal[1] + dc
-            if 0 <= sr < H and 0 <= sc < W:
-                img[sr, sc] = [0, 200, 0]
-            if 0 <= gr < H and 0 <= gc < W:
-                img[gr, gc] = [200, 0, 0]
+    # --- plot with matplotlib for markers & legend ---
+    fig, ax = plt.subplots(figsize=(6, 6))
+    ax.imshow(img, origin="lower", interpolation="nearest")
 
-    fig, ax = plt.subplots(figsize=(8, 8))
-    ax.imshow(img, origin="lower")
-    ax.set_title(title, fontsize=11)
+    # Start marker
+    ax.plot(start[1], start[0], marker="s", color="#2ca02c", markersize=8,
+            markeredgecolor="white", markeredgewidth=0.8, zorder=5, label="Start")
 
-    patches = [
-        mpatches.Patch(color=[c / 255 for c in [80, 80, 80]], label="Map obstacle"),
-        mpatches.Patch(color=[c / 255 for c in [255, 120, 120]], label="Hidden (GT only)"),
-        mpatches.Patch(color=[c / 255 for c in [100, 180, 255]], label="Planned path"),
-        mpatches.Patch(color=[c / 255 for c in [0, 200, 0]], label="Start"),
-        mpatches.Patch(color=[c / 255 for c in [200, 0, 0]], label="Goal"),
+    # Goal marker
+    ax.plot(goal[1], goal[0], marker="*", color="#d62728", markersize=12,
+            markeredgecolor="white", markeredgewidth=0.8, zorder=5, label="Goal")
+
+    # Robot current position
+    if robot_pos is not None:
+        ax.plot(robot_pos[1], robot_pos[0], marker="o", color="#1f77b4",
+                markersize=8, markeredgecolor="white", markeredgewidth=0.8,
+                zorder=6, label="Robot")
+
+    # All past collisions (small red ×)
+    if collision_history:
+        for _, (cr, cc) in collision_history:
+            ax.plot(cc, cr, marker="x", color="#ff7f0e", markersize=7,
+                    markeredgewidth=2.0, zorder=7)
+        # One legend entry for collisions
+        ax.plot([], [], marker="x", color="#ff7f0e", markersize=7,
+                markeredgewidth=2.0, linestyle="None", label="Collision")
+
+    # Current-step collision highlight (larger)
+    if collision_pos is not None:
+        ax.plot(collision_pos[1], collision_pos[0], marker="x", color="#ff7f0e",
+                markersize=12, markeredgewidth=2.5, zorder=8)
+
+    # Legend patches for grid colours
+    grid_patches = [
+        mpatches.Patch(color=[0.30, 0.30, 0.30], label="Map obstacle"),
+        mpatches.Patch(color=[0.90, 0.42, 0.42], label="Hidden obstacle (GT)"),
+        mpatches.Patch(color=[0.30, 0.60, 0.95], label="Planned path"),
+        mpatches.Patch(color=[0.40, 0.75, 0.40], label="Trajectory"),
     ]
-    ax.legend(handles=patches, loc="upper right", fontsize=8)
+    handles, labels = ax.get_legend_handles_labels()
+    ax.legend(handles=grid_patches + handles, loc="upper right", fontsize=7,
+              framealpha=0.85, edgecolor="0.6")
+
+    ax.set_title(title, fontsize=11, pad=6)
     ax.axis("off")
-    fig.tight_layout()
-    fig.savefig(save_path, dpi=120)
+    fig.tight_layout(pad=0.4)
+    fig.savefig(save_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
 
 
