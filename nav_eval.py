@@ -830,6 +830,7 @@ def main():
 
     # ── Load model ──
     ckpt_path = "/cluster/scratch/kochmar/checkpoints/full_ablation/voxup-epoch=03-val_loss_total=7.9336.ckpt"
+    ckpt_path = "/cluster/scratch/kochmar/checkpoints/full10/voxup-epoch=09-val_loss_total=7.6451.ckpt"
     model = VoxelUpdaterSystem.load_from_checkpoint(ckpt_path, strict=False, cfg=cfg)
     model = model.to(device)
     model.eval()
