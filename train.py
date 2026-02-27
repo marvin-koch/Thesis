@@ -69,6 +69,14 @@ from baselines import (
     SimpleLogOdds, compute_extra_baseline_metrics,
 )
 
+try:
+    from monocular_depth_baseline import MonocularDepthFusion
+    HAS_MONODEPTH = True
+except ImportError:
+    HAS_MONODEPTH = False
+    print("[WARN] monocular_depth_baseline not available. "
+          "pip install transformers --break-system-packages to enable.")
+
 
 try:
     import umap
@@ -2120,6 +2128,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
             img = predictions["images"]
             if img.shape[-3] == 3 and img.shape[-1] != 3:
                  img = img.permute(0, 2, 3, 1) # (S, 3, H, W) -> (S, H, W, 3)
+            predictions["images_fullres"] = img.clone()  # keep full-res for monodepth
             predictions["images"] = img[..., ::stride, ::stride, :]
             del img
 
@@ -2152,6 +2161,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 threshold=threshold
             )
 
+        # t=0: feed monodepth baseline with full-res images + extrinsics
+        # (deferred until after extra_baselines dict is created below)
 
         # Initialize CUDA events for high-precision timing
         t_start_pre  = torch.cuda.Event(enable_timing=True)
@@ -2173,6 +2184,14 @@ class VoxelUpdaterSystem(pl.LightningModule):
             "lastframe": LastFrameFusion(voxel_size=self.cfg.voxel_size, device=device),
             "confwt":    ConfWeightedFusion(voxel_size=self.cfg.voxel_size, device=device, free_penalty=0.15),
         }
+        if HAS_MONODEPTH:
+            extra_baselines["monodepth"] = MonocularDepthFusion(
+                voxel_size=self.cfg.voxel_size,
+                device=device,
+                hfov_deg=90.0,       # standard Habitat pinhole
+                img_size=512,
+                max_range=20.0,
+            )
         for bname in extra_baselines:
             for mkey in ["occ_iou", "occ_recall", "occ_precision",
                          "dyn_iou", "dyn_recall_appearing",
@@ -2190,6 +2209,15 @@ class VoxelUpdaterSystem(pl.LightningModule):
         prev_baseline_binary = None
         prev_gt_keys = None
         prev_gt_binary = None
+
+        # t=0: feed monodepth baseline with full-res images + extrinsics
+        if HAS_MONODEPTH and "monodepth" in extra_baselines:
+            with torch.no_grad():
+                extra_baselines["monodepth"].integrate_from_images(
+                    predictions.get("images_fullres", predictions["images"]),
+                    predictions["extrinsic"],
+                )
+            predictions.pop("images_fullres", None)
 
         for t in range(T):
             # print(f"Step {t}...")
@@ -2269,6 +2297,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 img = predictions["images"]
                 if img.shape[-3] == 3 and img.shape[-1] != 3:
                      img = img.permute(0, 2, 3, 1) # (S, 3, H, W) -> (S, H, W, 3)
+                predictions["images_fullres"] = img.clone()  # keep full-res for monodepth
                 predictions["images"] = img[..., ::stride, ::stride, :]
                 del img
 
@@ -2379,8 +2408,21 @@ class VoxelUpdaterSystem(pl.LightningModule):
             # Feed same data to extra baselines
             eb_pts, eb_cams, eb_conf = _eb_data
             for bname, bobj in extra_baselines.items():
+                if bname == "monodepth":
+                    continue  # monodepth uses images, not DUSt3R points
                 bobj.integrate(eb_pts, eb_cams, conf=eb_conf,
                             max_range=20.0)
+
+            # Monodepth baseline: run depth estimation + unproject + fuse
+            if HAS_MONODEPTH and "monodepth" in extra_baselines:
+                with torch.no_grad():
+                    extra_baselines["monodepth"].integrate_from_images(
+                        predictions.get("images_fullres", predictions["images"]),
+                        predictions["extrinsic"],
+                    )
+
+            # Free full-res images to save GPU memory
+            predictions.pop("images_fullres", None)
             
             # Calculate durations in milliseconds
             ms_pre  = t_start_pre.elapsed_time(t_end_pre)
@@ -3133,6 +3175,19 @@ class VoxelUpdaterSystem(pl.LightningModule):
         print(f"    Appearing Recall:    {self.get_avg(metrics_buffer, 'static_dyn_recall_appearing'):.4f}  (High = Fast reaction to new objects)")
         print(f"    Disappearing Recall: {self.get_avg(metrics_buffer, 'static_dyn_recall_disappearing'):.4f}  (High = Good cleanup)")
         print(f"    Ghost Rate:          {self.get_avg(metrics_buffer, 'static_dyn_ghost_rate'):.4f}  (High = Objects leave trails)")
+        if HAS_MONODEPTH and "monodepth_occ_iou" in metrics_buffer:
+            print("-" * 60)
+            print(f"  MONODEPTH Baseline (DepthAnythingV2 + OctoMap):")
+            print(f"    IoU:                 {self.get_avg(metrics_buffer, 'monodepth_occ_iou'):.4f}")
+            print(f"    Recall:              {self.get_avg(metrics_buffer, 'monodepth_occ_recall'):.4f}")
+            print(f"    Precision:           {self.get_avg(metrics_buffer, 'monodepth_occ_precision'):.4f}")
+            if metrics_buffer.get("monodepth_dyn_iou"):
+                print(f"    Dynamic IoU:         {self.get_avg(metrics_buffer, 'monodepth_dyn_iou'):.4f}")
+                print(f"    Appearing Recall:    {self.get_avg(metrics_buffer, 'monodepth_dyn_recall_appearing'):.4f}")
+                print(f"    Disappearing Recall: {self.get_avg(metrics_buffer, 'monodepth_dyn_recall_disappearing'):.4f}")
+                print(f"    Ghost Rate:          {self.get_avg(metrics_buffer, 'monodepth_dyn_ghost_rate'):.4f}")
+            if metrics_buffer.get("monodepth_tfs"):
+                print(f"    TFS:                 {self.get_avg(metrics_buffer, 'monodepth_tfs'):.4f}")
         print("-" * 60)
         if self.cfg.real_gt_voxels_file:                   
             print(f"    GT Chamfer Dist: {self.get_avg(metrics_buffer, 'gt_chamfer_dist'):.4f}  (Lower = Better)")
