@@ -263,6 +263,25 @@ def main():
     print(f"    Precision:           {avg(all_metrics.get('static_occ_precision', [])):.4f}")
     print("-" * 70)
 
+    # --- Extra baselines (TSDF, EMA, LastFrame, ConfWt, MonoDepth) ---
+    extra_baseline_names = ["tsdf", "ema", "lastframe", "confwt", "monodepth"]
+    extra_baseline_labels = {
+        "tsdf":      "TSDF Fusion",
+        "ema":       "EMA Fusion",
+        "lastframe": "Last-Frame",
+        "confwt":    "Conf-Weighted",
+        "monodepth": "MONODEPTH (DepthAnythingV2 + OctoMap)",
+    }
+    for bname in extra_baseline_names:
+        key = f"{bname}_occ_iou"
+        if key in all_metrics and len(all_metrics[key]) > 0:
+            label = extra_baseline_labels.get(bname, bname.upper())
+            print(f"  {label} Metrics:")
+            print(f"    IoU:                 {avg(all_metrics.get(f'{bname}_occ_iou', [])):.4f}")
+            print(f"    Recall:              {avg(all_metrics.get(f'{bname}_occ_recall', [])):.4f}")
+            print(f"    Precision:           {avg(all_metrics.get(f'{bname}_occ_precision', [])):.4f}")
+            print("-" * 70)
+
     if "gt_dyn_iou" in all_metrics and len(all_metrics["gt_dyn_iou"]) > 0:
         print(f"  Dynamic Metrics GT (Changes Only):")
         print(f"    Dynamic IoU:         {avg(all_metrics['gt_dyn_iou']):.4f}")
@@ -290,6 +309,18 @@ def main():
     print(f"    Ghost Rate:          {avg(all_metrics.get('static_dyn_ghost_rate', [])):.4f}")
     print("-" * 70)
 
+    # --- Extra baseline dynamic metrics ---
+    for bname in extra_baseline_names:
+        key = f"{bname}_dyn_iou"
+        if key in all_metrics and len(all_metrics[key]) > 0:
+            label = extra_baseline_labels.get(bname, bname.upper())
+            print(f"  Dynamic Metrics {label} (Changes Only):")
+            print(f"    Dynamic IoU:         {avg(all_metrics.get(f'{bname}_dyn_iou', [])):.4f}")
+            print(f"    Appearing Recall:    {avg(all_metrics.get(f'{bname}_dyn_recall_appearing', [])):.4f}")
+            print(f"    Disappearing Recall: {avg(all_metrics.get(f'{bname}_dyn_recall_disappearing', [])):.4f}")
+            print(f"    Ghost Rate:          {avg(all_metrics.get(f'{bname}_dyn_ghost_rate', [])):.4f}")
+            print("-" * 70)
+
     if "gt_chamfer_dist" in all_metrics and len(all_metrics["gt_chamfer_dist"]) > 0:
         print(f"    GT Chamfer Dist:       {avg(all_metrics['gt_chamfer_dist']):.4f}")
     print(f"    Chamfer Dist:          {avg(all_metrics.get('chamfer_dist', [])):.4f}")
@@ -300,6 +331,11 @@ def main():
     print(f"    GT TFS:              {avg(all_metrics.get('tfs_gt', [])):.4f}")
     print(f"    Model TFS:           {avg(all_metrics.get('tfs_model', [])):.4f}")
     print(f"    Baseline TFS:        {avg(all_metrics.get('tfs_baseline', [])):.4f}")
+    for bname in extra_baseline_names:
+        key = f"{bname}_tfs"
+        if key in all_metrics and len(all_metrics[key]) > 0:
+            label = extra_baseline_labels.get(bname, bname.upper())
+            print(f"    {label} TFS: {avg(all_metrics[key]):.4f}")
     print("=" * 70)
       
 

@@ -128,7 +128,7 @@ class MonocularDepthFusion:
         self,
         voxel_size: float = 0.2,
         device: torch.device | str = "cuda",
-        model_id: str = DEPTH_ANYTHING_V2_SMALL,
+        model_id: str = DEPTH_ANYTHING_V2_LARGE,
         hfov_deg: float = 90.0,
         img_size: int = 512,
         max_range: float = 20.0,
