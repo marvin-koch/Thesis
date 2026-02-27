@@ -2224,6 +2224,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 hfov_deg=90.0,       # standard Habitat pinhole
                 img_size=512,
                 max_range=20.0,
+                promote_epochs=1,    # promote to LT immediately (avoid ST decay)
             )
         for bname in extra_baselines:
             for mkey in ["occ_iou", "occ_recall", "occ_precision",
@@ -2243,19 +2244,23 @@ class VoxelUpdaterSystem(pl.LightningModule):
         prev_gt_keys = None
         prev_gt_binary = None
 
-        # t=0: feed monodepth baseline with full-res images + extrinsics
+        # t=0: calibrate and feed monodepth baseline
         if HAS_MONODEPTH and "monodepth" in extra_baselines:
             with torch.no_grad():
-                # Build properly aligned extrinsics (DUSt3R path)
                 mono_extrs = self._align_extrinsics_for_monodepth(
                     predictions["extrinsic"], camera_R=Rmw @ R_w2m, tmw_scaled=tmw_scaled,
                 )
-                extra_baselines["monodepth"].integrate_from_images(
-                    predictions.get("images_fullres", predictions["images"]),
-                    mono_extrs,
-                    # Depth Anything V2 outputs real metres, but the aligned
-                    # frame is scale_factor × metres.  Must pre-scale depth.
+                mono_imgs = predictions.get("images_fullres", predictions["images"])
+                # One-time calibration: derive rotation convention from
+                # DUSt3R world_points (already aligned + scaled at this point)
+                extra_baselines["monodepth"].calibrate(
+                    images=mono_imgs,
+                    extrinsics=mono_extrs,
+                    ref_world_points=predictions["world_points"],
                     depth_scale=scale_factor,
+                )
+                extra_baselines["monodepth"].integrate_from_images(
+                    mono_imgs, mono_extrs, depth_scale=scale_factor,
                 )
             predictions.pop("images_fullres", None)
 
