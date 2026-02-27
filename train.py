@@ -679,7 +679,6 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
         self.vox_baseline = vox
 
-        self.vox_baseline.next_epoch()
 
         # Return flat extracted data so extra baselines can reuse it
         # frames_map[0] = (N,3) points, cam_centers_map[0] = (S,3) per-view cams,
@@ -4144,8 +4143,8 @@ def main():
         num_workers=0,
         precision="bf16",
         skip=True,
-        #weight_decay=0.05,
-        weight_decay=0.00,
+        weight_decay=0.05,
+        #weight_decay=0.00,
         lambda_occ= 1.0,
         lambda_temp = 0.05,      # temporal consistency weight
         #lambda_temp = 0.0,      # temporal consistency weight
