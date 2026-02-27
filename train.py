@@ -627,6 +627,33 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
         return bev, mst, Rmw, tmw
     
+    @staticmethod
+    def _align_extrinsics_for_monodepth(raw_extrs, camera_R, tmw_scaled):
+        """
+        Build fully-aligned camera-to-world extrinsics for monodepth unprojection.
+
+        The DUSt3R extrinsics in ``predictions["extrinsic"]`` only have their
+        translations scaled (``*= scale_factor``); the rotation matrices and
+        translation vectors still sit in DUSt3R's raw coordinate frame.
+        ``run_baseline_inference`` handles this internally via ``camera_R``/
+        ``camera_t`` passed to ``build_frames_…``, but monodepth needs
+        explicit c2w matrices.
+
+        Args:
+            raw_extrs:   (S, 4, 4) extrinsics with translations already scaled.
+            camera_R:    (3, 3)  ``Rmw @ R_w2m`` combined rotation.
+            tmw_scaled:  (3,)    ``tmw * scale_factor`` translation.
+
+        Returns:
+            aligned: (S, 4, 4) extrinsics in the GT-aligned metric frame.
+        """
+        aligned = raw_extrs.clone()
+        # Rotate the c2w orientation into the aligned frame
+        aligned[:, :3, :3] = camera_R @ raw_extrs[:, :3, :3]
+        # Rotate + translate the camera center
+        aligned[:, :3, 3]  = (camera_R @ raw_extrs[:, :3, 3].unsqueeze(-1)).squeeze(-1) + tmw_scaled
+        return aligned
+
     def run_baseline_inference(self, predictions, Rmw=None, tmw=None, scale_factor=1.0, threshold=50.0):
         """
         Runs the baseline reconstruction pipeline (Ray carving/Integration) on the provided predictions.
@@ -2214,9 +2241,14 @@ class VoxelUpdaterSystem(pl.LightningModule):
         # t=0: feed monodepth baseline with full-res images + extrinsics
         if HAS_MONODEPTH and "monodepth" in extra_baselines:
             with torch.no_grad():
+                # Build properly aligned extrinsics (DUSt3R path)
+                mono_extrs = self._align_extrinsics_for_monodepth(
+                    predictions["extrinsic"], camera_R=Rmw @ R_w2m, tmw_scaled=tmw_scaled,
+                )
                 extra_baselines["monodepth"].integrate_from_images(
                     predictions.get("images_fullres", predictions["images"]),
-                    predictions["extrinsic"],
+                    mono_extrs,
+                    depth_scale=1.0,  # aligned frame is metric, DA-V2 is metric
                 )
             predictions.pop("images_fullres", None)
 
@@ -2417,10 +2449,28 @@ class VoxelUpdaterSystem(pl.LightningModule):
             # Monodepth baseline: run depth estimation + unproject + fuse
             if HAS_MONODEPTH and "monodepth" in extra_baselines:
                 with torch.no_grad():
-                    extra_baselines["monodepth"].integrate_from_images(
-                        predictions.get("images_fullres", predictions["images"]),
-                        predictions["extrinsic"],
-                    )
+                    if self.cfg.real_gt_voxels_file:
+                        # --- GT extrinsics path (strongest, fully DUSt3R-independent) ---
+                        # Use real_gt extrinsics aligned via Kabsch/ICP (R_k, t_k, s_k)
+                        gt_ex_aligned = real_gt["extrinsic"].clone()
+                        # Rotate c2w orientation to aligned frame
+                        gt_ex_aligned[:, :3, :3] = R_k @ gt_ex_aligned[:, :3, :3]
+                        # Translations are already aligned (aligned_cams was stored)
+                        mono_imgs = real_gt.get("images", predictions.get("images_fullres", predictions["images"]))
+                        extra_baselines["monodepth"].integrate_from_images(
+                            mono_imgs, gt_ex_aligned,
+                            depth_scale=s_k.item() if torch.is_tensor(s_k) else float(s_k),
+                        )
+                    else:
+                        # --- DUSt3R extrinsics fallback ---
+                        mono_extrs = self._align_extrinsics_for_monodepth(
+                            predictions["extrinsic"], camera_R=Rmw @ R_w2m, tmw_scaled=tmw_scaled,
+                        )
+                        extra_baselines["monodepth"].integrate_from_images(
+                            predictions.get("images_fullres", predictions["images"]),
+                            mono_extrs,
+                            depth_scale=1.0,
+                        )
 
             # Free full-res images to save GPU memory
             predictions.pop("images_fullres", None)

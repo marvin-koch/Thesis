@@ -208,6 +208,7 @@ class MonocularDepthFusion:
         extrinsics: torch.Tensor,
         max_range: Optional[float] = None,
         max_depth_m: float = 10.0,
+        depth_scale: float = 1.0,
     ):
         """
         Run monocular depth on each view, unproject, and fuse.
@@ -216,8 +217,14 @@ class MonocularDepthFusion:
             images:     (S, H, W, 3) float32 in [0, 1]  **or**
                         (S, 3, H, W) float32 in [0, 1].
             extrinsics: (S, 4, 4) camera-to-world matrices.
+                        **Must already be in the aligned evaluation frame**
+                        (i.e. rotations AND translations fully transformed).
             max_range:  override per-ray max range for integration.
             max_depth_m: clamp predicted depth (avoids sky hallucinations).
+            depth_scale: multiply metric depth by this before unprojection.
+                         Use 1.0 when the aligned frame is metric (DUSt3R path).
+                         Use s_k when aligning GT extrinsics via Kabsch/ICP
+                         (because s_k converts GT-metres → aligned-frame units).
         """
         if max_range is None:
             max_range = self.max_range
@@ -241,7 +248,7 @@ class MonocularDepthFusion:
 
         for s in range(S):
             depth = self._estimate_depth(imgs[s], target_hw=(H, W))  # (H, W)
-            depth = depth.clamp(max=max_depth_m)
+            depth = depth.clamp(max=max_depth_m) * depth_scale
 
             pts_w, cam_c = _unproject_depth(depth, self._K, extrs[s])
 
