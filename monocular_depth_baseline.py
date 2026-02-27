@@ -334,6 +334,20 @@ class MonocularDepthFusion:
     # ------------------------------------------------------------------
     # Convenience properties (mirror TorchSparseVoxelGrid for metrics)
     # ------------------------------------------------------------------
+    def __getattr__(self, name):
+        """Delegate any attribute not found on this wrapper to the inner vox grid.
+        This ensures compute_extra_baseline_metrics (which calls _unhash_keys,
+        _display_vals, p.occ_thresh, etc.) works transparently."""
+        # Avoid infinite recursion during init / pickling
+        if name in ("vox", "__dict__", "__class__"):
+            raise AttributeError(name)
+        try:
+            return getattr(self.vox, name)
+        except AttributeError:
+            raise AttributeError(
+                f"'{type(self).__name__}' object has no attribute '{name}'"
+            )
+
     @property
     def keys(self):
         return self.vox.keys
