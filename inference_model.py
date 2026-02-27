@@ -104,6 +104,9 @@ def main():
 
     #sigma 3
     ckpt_path = "/cluster/scratch/kochmar/checkpoints/full10/voxup-epoch=09-val_loss_total=7.6451.ckpt"
+    #ckpt_path = "/cluster/scratch/kochmar/checkpoints/full_ablation/voxup-epoch=03-val_loss_total=7.9336.ckpt"
+
+
     #ckpt_path = "/cluster/scratch/kochmar/checkpoints/full_finetune/voxup-epoch=01-val_loss_total=7.9398.ckpt"
 
     #sigam 2
@@ -120,6 +123,13 @@ def main():
     #ckpt_path = "/cluster/scratch/kochmar/checkpoints/full_finetune/voxup-epoch=09-val_loss_total=21.1281.ckpt"
 
 
+    #ablation
+    #Mean-Pooling
+    ckpt_path = "/cluster/scratch/kochmar/checkpoints/full_ablation/voxup-epoch=03-val_loss_total=9.0795.ckpt"
+
+    #Simple Loss
+    ckpt_path = "/cluster/scratch/kochmar/checkpoints/full_ablation/voxup-epoch=09-val_loss_total=7.0411.ckpt"
+
 
     out_dir = "/cluster/scratch/kochmar/predict_outputs_eval/"
     os.makedirs(out_dir, exist_ok=True)
@@ -135,8 +145,11 @@ def main():
         real_gt_voxels_file="hm3d_voxels",
 
         #gt_voxels_file="gt_voxels_per_timestep_new_3",
+
         #gt_voxels_file="gt_voxels_per_timestep_new_2",
         gt_voxels_file="gt_voxels_per_timestep_new",
+
+        #gt_voxels_file="gt_voxels_per_timestep_new_25",
 
 
         precomputed_cache_file="precomputed_cache",
@@ -145,6 +158,8 @@ def main():
         #pose_file="gt_poses_new_3",
         #pose_file="gt_poses_new_2",
         pose_file="gt_poses_new",
+        #pose_file="gt_poses_new_25",
+
 
         seq_file="seq_manifest.json",
         voxel_size=0.2,
@@ -217,6 +232,7 @@ def main():
                 all_metrics[key] = []
             all_metrics[key].extend(vals)
 
+        """
         for j, (bev, bev_gt, bev_baseline) in enumerate(zip(bevs, bevs_gt, bevs_baseline)):
             print(j)
             #save_bev(bev, meta, out_dir + f"bev_{i}_{j}.png", out_dir + f"bev_{i}_{j}_np.npy", out_dir + f"bev_{i}_{j}_meta.json")
@@ -231,6 +247,7 @@ def main():
                 meta, 
                 path=f"{out_dir}compare_step_{i}_{j}.png"
             )
+        """
 
     # --- Print dataset-wide average metrics ---
     def avg(vals):
@@ -301,6 +318,25 @@ def main():
     print(f"    Model TFS:           {avg(all_metrics.get('tfs_model', [])):.4f}")
     print(f"    Baseline TFS:        {avg(all_metrics.get('tfs_baseline', [])):.4f}")
     print("=" * 70)
+
+
+    # --- Extra Baselines ---
+    for bname, label in [("tsdf", "TSDF Fusion"),
+                         ("ema",  "EMA Fusion"),
+                         ("lastframe", "Last-Frame (No Memory)"),
+                         ("confwt", "Conf-Weighted Counting")]:
+        iou_key = f"{bname}_occ_iou"
+        if iou_key in all_metrics and len(all_metrics[iou_key]) > 0:
+            print(f"  {label} Metrics:")
+            print(f"    IoU:                 {avg(all_metrics[f'{bname}_occ_iou']):.4f}")
+            print(f"    Recall:              {avg(all_metrics[f'{bname}_occ_recall']):.4f}")
+            print(f"    Precision:           {avg(all_metrics[f'{bname}_occ_precision']):.4f}")
+            print(f"    Dynamic IoU:         {avg(all_metrics.get(f'{bname}_dyn_iou', [])):.4f}")
+            print(f"    Appearing Recall:    {avg(all_metrics.get(f'{bname}_dyn_recall_appearing', [])):.4f}")
+            print(f"    Disappearing Recall: {avg(all_metrics.get(f'{bname}_dyn_recall_disappearing', [])):.4f}")
+            print(f"    Ghost Rate:          {avg(all_metrics.get(f'{bname}_dyn_ghost_rate', [])):.4f}")
+            print(f"    TFS:                 {avg(all_metrics.get(f'{bname}_tfs', [])):.4f}")
+            print("-" * 70)
       
 
 

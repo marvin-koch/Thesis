@@ -3168,7 +3168,15 @@ class VoxelUpdaterSystem(pl.LightningModule):
             os.makedirs(save_dir, exist_ok=True)
             fname = f"{save_dir}/step_{t}.ply"
             #self.export_debug_ply(fname, t)
-            self.export_separated_ply(t, save_dir=save_dir)
+
+
+            # Get the monodepth object if it exists
+            mono_baseline = extra_baselines.get("monodepth")
+
+            # Call the updated export function
+            #Removed to save space
+            #self.export_separated_ply(t, save_dir=save_dir, monodepth_vox=mono_baseline)
+
             #self.export_latent_colored_ply(f"{save_dir}/latent_step_{t}.ply", t)
             #self.export_kmeans_ply(f"{save_dir}/kmeans_{t}.ply", t)
 
@@ -3732,7 +3740,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
 
         print(f"Saved K-Means PLY: {filename}")
 
-    def export_separated_ply(self, step_idx, save_dir="debug_viz"):
+    def export_separated_ply(self, step_idx, save_dir="debug_viz", monodepth_vox=None):
         """
         Exports GT and Prediction to separate PLY files.
         - GT: Green points (step_X_gt.ply)
@@ -3796,6 +3804,26 @@ class VoxelUpdaterSystem(pl.LightningModule):
                     colors_real
                 )
 
+        if monodepth_vox is not None:
+            # Check if it has the vox attribute (MonocularDepthFusion wraps the grid)
+            vox_grid = getattr(monodepth_vox, "vox", monodepth_vox)
+            mask_mono = vox_grid.occupied_mask()
+
+            if mask_mono.any():
+                # Get centers of occupied voxels
+                centers_mono = vox_grid.voxel_centers()[mask_mono].detach().cpu().numpy()
+
+                # Create Cyan colors (0, 255, 255)
+                colors_mono = np.zeros_like(centers_mono)
+                colors_mono[:, 1] = 255 # Green
+                colors_mono[:, 2] = 255 # Blue
+
+                self._write_ply(
+                    os.path.join(save_dir, f"step_{step_idx}_monodepth.ply"),
+                    centers_mono,
+                    colors_mono
+                )
+                print(f"  [Viz] Exported Monocular Depth PLY")
 
 
         # -----------------------------

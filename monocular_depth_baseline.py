@@ -128,7 +128,7 @@ class MonocularDepthFusion:
         self,
         voxel_size: float = 0.2,
         device: torch.device | str = "cuda",
-        model_id: str = DEPTH_ANYTHING_V2_SMALL,
+        model_id: str = DEPTH_ANYTHING_V2_LARGE,
         hfov_deg: float = 90.0,
         img_size: int = 512,
         max_range: float = 20.0,
@@ -267,17 +267,19 @@ class MonocularDepthFusion:
 
         # Procrustes: solve  ref_cam ≈ R_correction @ cam_pts
         # i.e.  H = cam_pts^T @ ref_cam, then SVD
-        H_mat = cam_pts.T @ ref_cam
-        U, Sv, Vh = torch.linalg.svd(H_mat)
-        d = torch.det(Vh.T @ U.T)
-        diag = torch.ones(3, device=dev)
-        diag[2] = d.sign()
-        R_correction = Vh.T @ torch.diag(diag) @ U.T
+        with torch.cuda.amp.autocast(enabled=False):
 
-        # Check residuals
-        corrected = cam_pts @ R_correction.T
-        residual_corrected = (corrected - ref_cam).norm(dim=-1).median().item()
-        residual_identity = (cam_pts - ref_cam).norm(dim=-1).median().item()
+            H_mat = cam_pts.T @ ref_cam
+            U, Sv, Vh = torch.linalg.svd(H_mat)
+            d = torch.det(Vh.T @ U.T)
+            diag = torch.ones(3, device=dev)
+            diag[2] = d.sign()
+            R_correction = Vh.T @ torch.diag(diag) @ U.T
+
+            # Check residuals
+            corrected = cam_pts @ R_correction.T
+            residual_corrected = (corrected - ref_cam).norm(dim=-1).median().item()
+            residual_identity = (cam_pts - ref_cam).norm(dim=-1).median().item()
 
         print(f"[MonocularDepthFusion] Calibration ({cam_pts.shape[0]} pts):")
         print(f"  Median residual WITH correction:    {residual_corrected:.4f}")
