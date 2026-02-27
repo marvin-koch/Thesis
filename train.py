@@ -2221,6 +2221,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
             extra_baselines["monodepth"] = MonocularDepthFusion(
                 voxel_size=self.cfg.voxel_size,
                 device=device,
+                model_id=MonocularDepthFusion.DEPTH_ANYTHING_V2_LARGE,
                 hfov_deg=90.0,       # standard Habitat pinhole
                 img_size=512,
                 max_range=20.0,
