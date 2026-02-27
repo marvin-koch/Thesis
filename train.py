@@ -686,6 +686,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
         )
 
         self.vox_baseline = vox
+        self.vox_baseline.next_epoch()
+
 
 
         # Return flat extracted data so extra baselines can reuse it
