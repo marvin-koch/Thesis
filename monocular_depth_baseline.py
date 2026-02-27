@@ -222,15 +222,21 @@ class MonocularDepthFusion:
             max_range:  override per-ray max range for integration.
             max_depth_m: clamp predicted depth (avoids sky hallucinations).
             depth_scale: multiply metric depth by this before unprojection.
-                         Use 1.0 when the aligned frame is metric (DUSt3R path).
-                         Use s_k when aligning GT extrinsics via Kabsch/ICP
-                         (because s_k converts GT-metres → aligned-frame units).
+                         For DUSt3R extrinsics: use ``scale_factor`` (from
+                         Kabsch alignment of DUSt3R→GT).
+                         For GT extrinsics: use ``s_k`` (from Kabsch/ICP).
+                         This is necessary because DepthAnything outputs real
+                         metres, but the evaluation frame is scale × metres.
         """
         if max_range is None:
             max_range = self.max_range
 
         imgs = images.to(self.device, dtype=torch.float32)
         extrs = extrinsics.to(self.device, dtype=torch.float32)
+
+        # normalise list → stacked tensor
+        if isinstance(extrs, list):
+            extrs = torch.stack(extrs, dim=0).to(self.device, dtype=torch.float32)
 
         # normalise layout to (S, H, W, 3)
         if imgs.ndim == 4 and imgs.shape[1] == 3 and imgs.shape[-1] != 3:
@@ -265,6 +271,13 @@ class MonocularDepthFusion:
 
         pts_cat = torch.cat(all_pts, dim=0)
         cams_cat = torch.cat(all_cams, dim=0)
+
+        # --- Sanity-check: print point cloud stats for debugging alignment ---
+        n = pts_cat.shape[0]
+        dists = torch.linalg.norm(pts_cat - cams_cat, dim=-1)
+        print(f"  [MonoDepth] {n} pts | depth_scale={depth_scale:.3f} | "
+              f"range [{dists.min():.2f}, {dists.median():.2f}, {dists.max():.2f}] | "
+              f"xyz mean={pts_cat.mean(0).tolist()}")
 
         # feed into the standard log-odds voxel grid (OctoMap-style)
         self.vox.integrate_points_with_cameras(

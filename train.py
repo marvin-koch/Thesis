@@ -630,28 +630,32 @@ class VoxelUpdaterSystem(pl.LightningModule):
     @staticmethod
     def _align_extrinsics_for_monodepth(raw_extrs, camera_R, tmw_scaled):
         """
-        Build fully-aligned camera-to-world extrinsics for monodepth unprojection.
+        Build fully-aligned c2w extrinsics for monodepth unprojection.
 
-        The DUSt3R extrinsics in ``predictions["extrinsic"]`` only have their
-        translations scaled (``*= scale_factor``); the rotation matrices and
-        translation vectors still sit in DUSt3R's raw coordinate frame.
-        ``run_baseline_inference`` handles this internally via ``camera_R``/
-        ``camera_t`` passed to ``build_frames_…``, but monodepth needs
-        explicit c2w matrices.
+        DUSt3R extrinsics at this point have only their translations scaled
+        (``*= scale_factor``); rotations are still in DUSt3R's raw frame.
+
+        This constructs c2w matrices in the evaluation-aligned frame so that
+        ``R_aligned @ (depth_scale * cam_pt) + t_aligned`` lands in the same
+        coordinate system as the DUSt3R points / GT voxels.
 
         Args:
-            raw_extrs:   (S, 4, 4) extrinsics with translations already scaled.
-            camera_R:    (3, 3)  ``Rmw @ R_w2m`` combined rotation.
-            tmw_scaled:  (3,)    ``tmw * scale_factor`` translation.
+            raw_extrs:   (S, 4, 4) tensor **or** list of (4, 4) tensors.
+            camera_R:    (3, 3)  ``Rmw @ R_w2m``.
+            tmw_scaled:  (3,)    ``tmw * scale_factor``.
 
         Returns:
-            aligned: (S, 4, 4) extrinsics in the GT-aligned metric frame.
+            aligned: (S, 4, 4) tensor in the GT-aligned frame.
         """
+        # normalise list → stacked tensor
+        if isinstance(raw_extrs, list):
+            raw_extrs = torch.stack(raw_extrs, dim=0)
+
         aligned = raw_extrs.clone()
         # Rotate the c2w orientation into the aligned frame
         aligned[:, :3, :3] = camera_R @ raw_extrs[:, :3, :3]
-        # Rotate + translate the camera center
-        aligned[:, :3, 3]  = (camera_R @ raw_extrs[:, :3, 3].unsqueeze(-1)).squeeze(-1) + tmw_scaled
+        # Rotate + translate the camera centre
+        aligned[:, :3, 3] = (camera_R @ raw_extrs[:, :3, 3].unsqueeze(-1)).squeeze(-1) + tmw_scaled
         return aligned
 
     def run_baseline_inference(self, predictions, Rmw=None, tmw=None, scale_factor=1.0, threshold=50.0):
@@ -2249,7 +2253,9 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 extra_baselines["monodepth"].integrate_from_images(
                     predictions.get("images_fullres", predictions["images"]),
                     mono_extrs,
-                    depth_scale=1.0,  # aligned frame is metric, DA-V2 is metric
+                    # Depth Anything V2 outputs real metres, but the aligned
+                    # frame is scale_factor × metres.  Must pre-scale depth.
+                    depth_scale=scale_factor,
                 )
             predictions.pop("images_fullres", None)
 
@@ -2451,26 +2457,32 @@ class VoxelUpdaterSystem(pl.LightningModule):
             if HAS_MONODEPTH and "monodepth" in extra_baselines:
                 with torch.no_grad():
                     if self.cfg.real_gt_voxels_file:
-                        # --- GT extrinsics path (strongest, fully DUSt3R-independent) ---
-                        # Use real_gt extrinsics aligned via Kabsch/ICP (R_k, t_k, s_k)
+                        # --- GT extrinsics path (fully DUSt3R-independent) ---
+                        # real_gt["extrinsic"] already has aligned translations
+                        # (aligned_cams = s_k * R_k @ gt_cams + t_k) but rotation
+                        # is still in GT frame → rotate by R_k.
                         gt_ex_aligned = real_gt["extrinsic"].clone()
-                        # Rotate c2w orientation to aligned frame
+                        if isinstance(gt_ex_aligned, list):
+                            gt_ex_aligned = torch.stack(gt_ex_aligned, dim=0)
                         gt_ex_aligned[:, :3, :3] = R_k @ gt_ex_aligned[:, :3, :3]
-                        # Translations are already aligned (aligned_cams was stored)
+                        # Depth (real metres) must be scaled by s_k to match
+                        # the aligned frame (s_k × metres).
                         mono_imgs = real_gt.get("images", predictions.get("images_fullres", predictions["images"]))
                         extra_baselines["monodepth"].integrate_from_images(
                             mono_imgs, gt_ex_aligned,
                             depth_scale=s_k.item() if torch.is_tensor(s_k) else float(s_k),
                         )
                     else:
-                        # --- DUSt3R extrinsics fallback ---
+                        # --- DUSt3R extrinsics path ---
                         mono_extrs = self._align_extrinsics_for_monodepth(
                             predictions["extrinsic"], camera_R=Rmw @ R_w2m, tmw_scaled=tmw_scaled,
                         )
+                        # Depth (real metres) must be scaled by scale_factor to
+                        # match the aligned frame (scale_factor × metres).
                         extra_baselines["monodepth"].integrate_from_images(
                             predictions.get("images_fullres", predictions["images"]),
                             mono_extrs,
-                            depth_scale=1.0,
+                            depth_scale=scale_factor,
                         )
 
             # Free full-res images to save GPU memory
