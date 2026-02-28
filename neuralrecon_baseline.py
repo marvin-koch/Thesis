@@ -70,7 +70,7 @@ class Sparse3DConvBlock(nn.Module):
     def __init__(self, in_channels: int, out_channels: int):
         super().__init__()
         self.conv = nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=0, bias=True)
-        self.norm = nn.InstanceNorm3d(out_channels)
+        self.norm = nn.LayerNorm(out_channels)
         self.act = nn.ReLU(inplace=True)
 
     @staticmethod
@@ -123,7 +123,7 @@ class Sparse3DConvBlock(nn.Module):
         # 6. Apply 3D conv (kernel_size=3, no padding → output is 1×1×1)
         out = self.conv(volumes)            # (M, C_out, 1, 1, 1)
         out = out.view(M, -1)              # (M, C_out)
-        out = self.act(self.norm(out.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)).squeeze(-1).squeeze(-1).squeeze(-1))
+        out = self.act(self.norm(out))      # LayerNorm works on (M, C_out) directly
 
         return out
 
