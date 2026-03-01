@@ -69,6 +69,8 @@ from baselines import (
     SimpleLogOdds, compute_extra_baseline_metrics,
 )
 
+from neuralrecon_baseline import NeuralReconVoxelGrid
+
 try:
     from monocular_depth_baseline import MonocularDepthFusion
     HAS_MONODEPTH = True
@@ -181,7 +183,16 @@ class VoxelUpdaterSystem(pl.LightningModule):
         # ---- core components (replace with your actual imports) ----
         #self.voxel_size = 0.01
         self.voxel_size = self.cfg.voxel_size
+        """
         self.vox = LatentVoxelGrid(
+            origin_xyz=np.zeros(3, dtype=np.float32),
+            params=VoxelParams(voxel_size=self.voxel_size, promote_hits=2),
+            device=self.device, feature_dim=self.feature_dim
+        )
+        """
+
+        # Now:
+        self.vox = NeuralReconVoxelGrid(
             origin_xyz=np.zeros(3, dtype=np.float32),
             params=VoxelParams(voxel_size=self.voxel_size, promote_hits=2),
             device=self.device, feature_dim=self.feature_dim
@@ -1253,7 +1264,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                     # Boost "Appearing" slightly more to ensure we catch the jump
                     #weights[appearing_mask] *= 20.0
 
-                    weights[appearing_mask] = 20.0
+                    #weights[appearing_mask] = 20.0
 
                     # (Total weight = pos_weight * 5.0 = 250ish)
 
@@ -1261,7 +1272,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                     # Since the base weight was 1.0, we need to multiply it by pos_weight * 5
                     # to match the importance of the appearing objects.
 
-                    weights[disappearing_mask] = 20.0
+                    #weights[disappearing_mask] = 20.0
                     # (Total weight = 250ish)
 
                     # 4. Calculate Loss
@@ -2592,7 +2603,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 metrics_buffer["gt_occ_precision"].append(occ_precision.item())
                 metrics_buffer["gt_occ_precision_inter"].append(occ_precision_inter.item())
 
-                # ---------------------------------------------------------
+               # ---------------------------------------------------------
                 # DYNAMIC METRICS (GT)
                 # ---------------------------------------------------------
                 # Compare Current GT (t) vs Previous GT (t-1)
@@ -2643,6 +2654,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                         metrics_buffer["gt_dyn_ghost_rate"].append(pred_ghosts.float().mean().item())
                         metrics_buffer["gt_dyn_recall_disappearing"].append((~pred_ghosts).float().mean().item())
 
+                    """
                     # C. Dynamic IoU
                     if mask_dynamic.sum() > 0:
                         pred_dyn = (pred_both_valid[mask_appearing] > 0.0)
@@ -2650,7 +2662,21 @@ class VoxelUpdaterSystem(pl.LightningModule):
                         intersection = (pred_dyn & gt_dyn).sum()
                         union        = (pred_dyn | gt_dyn).sum()
                         metrics_buffer["gt_dyn_iou"].append((intersection / (union + 1e-8)).item())
+                    """
+                    # C. Dynamic IoU
+                    if mask_dynamic.sum() > 0:
+                        pred_dyn = (pred_both_valid[mask_dynamic] > 0.0)
+                        gt_dyn   = gt_curr[mask_dynamic]
 
+                        tp = (pred_dyn & gt_dyn).sum().float()
+                        fp = (pred_dyn & ~gt_dyn).sum().float()
+                        fn = (~pred_dyn & gt_dyn).sum().float()
+
+                        union = tp + fp + fn
+                        if union > 0:
+                            metrics_buffer["gt_dyn_iou"].append((tp / union).item())
+                        else:
+                            metrics_buffer["gt_dyn_iou"].append(1.0)
 
 
 
@@ -2728,6 +2754,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
             metrics_buffer["occ_recall"].append(occ_recall.item())
             metrics_buffer["occ_precision"].append(occ_precision.item())
             metrics_buffer["occ_precision_inter"].append(occ_precision_inter.item())
+
             # ---------------------------------------------------------
             # DYNAMIC METRICS (Model)
             # ---------------------------------------------------------
@@ -2786,7 +2813,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                     pred_ghosts = (pred_both_valid_model[mask_disappearing] > 0.0)
                     metrics_buffer["dyn_ghost_rate"].append(pred_ghosts.float().mean().item())
                     metrics_buffer["dyn_recall_disappearing"].append((~pred_ghosts).float().mean().item())
-
+                """
                 # C. Dynamic IoU
                 if mask_dynamic.sum() > 0:
                     pred_dyn = (pred_both_valid_model[mask_appearing] > 0.0)
@@ -2794,6 +2821,25 @@ class VoxelUpdaterSystem(pl.LightningModule):
                     intersection = (pred_dyn & gt_dyn).sum()
                     union        = (pred_dyn | gt_dyn).sum()
                     metrics_buffer["dyn_iou"].append((intersection / (union + 1e-8)).item())
+                """
+
+
+                # C. Dynamic IoU
+                if mask_dynamic.sum() > 0:
+                    pred_dyn = (pred_both_valid_model[mask_dynamic] > 0.0)
+                    gt_dyn   = gt_curr[mask_dynamic]
+
+                    tp = (pred_dyn & gt_dyn).sum().float()
+                    fp = (pred_dyn & ~gt_dyn).sum().float() # Ghosts (model left it occupied, GT is free)
+                    fn = (~pred_dyn & gt_dyn).sum().float() # Misses (model left it free, GT is occupied)
+
+                    union = tp + fp + fn
+                    if union > 0:
+                        metrics_buffer["dyn_iou"].append((tp / union).item())
+                    else:
+                        metrics_buffer["dyn_iou"].append(1.0) # Perfect clearance of a disappeared object
+
+
 
 
 
@@ -2869,7 +2915,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
             metrics_buffer["baseline_occ_recall"].append(base_recall.item())
             metrics_buffer["baseline_occ_precision"].append(base_precision.item())
             metrics_buffer["baseline_occ_precision_inter"].append(base_precision_inter.item())
-           # ---------------------------------------------------------
+
+            # ---------------------------------------------------------
             # DYNAMIC METRICS (BASELINE)
             # ---------------------------------------------------------
             if t > 0 and gt_seq[t-1] is not None:
@@ -2925,6 +2972,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                     metrics_buffer["baseline_dyn_ghost_rate"].append(base_ghosts.float().mean().item())
                     metrics_buffer["baseline_dyn_recall_disappearing"].append((~base_ghosts).float().mean().item())
 
+                """
                 # 5. Baseline Dynamic IoU
                 if mask_dyn_base.sum() > 0:
                     base_dyn_pred = (base_both_valid[mask_app_base] > self.vox_baseline.p.occ_thresh)
@@ -2934,6 +2982,22 @@ class VoxelUpdaterSystem(pl.LightningModule):
                     uni_dyn_base = (base_dyn_pred | gt_dyn_base).sum()
                     metrics_buffer["baseline_dyn_iou"].append((int_dyn_base / (uni_dyn_base + 1e-8)).item())
 
+                """
+                # 5. Baseline Dynamic IoU
+                if mask_dyn_base.sum() > 0:
+                    base_dyn_pred = (base_both_valid[mask_dyn_base] > self.vox_baseline.p.occ_thresh)
+                    gt_dyn_base   = gt_curr_base[mask_dyn_base]
+                    
+                    tp = (base_dyn_pred & gt_dyn_base).sum().float()
+                    fp = (base_dyn_pred & ~gt_dyn_base).sum().float()
+                    fn = (~base_dyn_pred & gt_dyn_base).sum().float()
+                    
+                    union = tp + fp + fn
+                    if union > 0:
+                        metrics_buffer["baseline_dyn_iou"].append((tp / union).item())
+                    else:
+
+                        metrics_buffer["baseline_dyn_iou"].append(1.0)
 
 
 
@@ -3053,9 +3117,12 @@ class VoxelUpdaterSystem(pl.LightningModule):
                 both_valid_static = valid_mask & valid_prev_static
                 both_in_valid_static = both_valid_static[valid_mask]
 
+
+
                 # Define Masks
                 gt_curr = (tgt_intersect[both_in_valid_static] > 0.5)
                 gt_prev = (p_occ_prev_aligned[both_valid_static] > 0.5)
+
 
                 mask_appearing    = (~gt_prev & gt_curr)  # Empty -> Occupied
                 mask_disappearing = (gt_prev & ~gt_curr)  # Occupied -> Empty
@@ -3075,6 +3142,8 @@ class VoxelUpdaterSystem(pl.LightningModule):
                     metrics_buffer["static_dyn_ghost_rate"].append(pred_ghosts.float().mean().item())
                     metrics_buffer["static_dyn_recall_disappearing"].append((~pred_ghosts).float().mean().item())
 
+
+                """
                 # C. Dynamic IoU
                 if mask_dynamic.sum() > 0:
                     pred_dyn = (pred_both_valid_static[mask_appearing] > 0.0)
@@ -3082,6 +3151,21 @@ class VoxelUpdaterSystem(pl.LightningModule):
                     intersection = (pred_dyn & gt_dyn).sum()
                     union        = (pred_dyn | gt_dyn).sum()
                     metrics_buffer["static_dyn_iou"].append((intersection / (union + 1e-8)).item())
+                """
+                # C. Dynamic IoU
+                if mask_dynamic.sum() > 0:
+                    pred_dyn = (pred_both_valid_static[mask_dynamic] > 0.0)
+                    gt_dyn   = gt_curr[mask_dynamic]
+                    
+                    tp = (pred_dyn & gt_dyn).sum().float()
+                    fp = (pred_dyn & ~gt_dyn).sum().float()
+                    fn = (~pred_dyn & gt_dyn).sum().float()
+                    
+                    union = tp + fp + fn
+                    if union > 0:
+                        metrics_buffer["static_dyn_iou"].append((tp / union).item())
+                    else:
+                        metrics_buffer["static_dyn_iou"].append(1.0)
 
 
 
@@ -4296,16 +4380,16 @@ def main():
         num_workers=0,
         precision="bf16",
         skip=True,
-        weight_decay=0.05,
-        #weight_decay=0.00,
+        #weight_decay=0.05,
+        weight_decay=0.00,
         lambda_occ= 1.0,
-        lambda_temp = 0.05,      # temporal consistency weight
-        #lambda_temp = 0.0,      # temporal consistency weight
+        #lambda_temp = 0.05,      # temporal consistency weight
+        lambda_temp = 0.0,      # temporal consistency weight
 
-        lambda_ent = 5e-3,      # routing entropy reg
-        #lambda_ent = 0.0,      # routing entropy reg
-        lambda_tv = 5e-3 ,      # (optional) spatial TV on occupancy
-        #lambda_tv = 0.0,      # (optional) spatial TV on occupancy
+        #lambda_ent = 5e-3,      # routing entropy reg
+        lambda_ent = 0.0,      # routing entropy reg
+        #lambda_tv = 5e-3 ,      # (optional) spatial TV on occupancy
+        lambda_tv = 0.0,      # (optional) spatial TV on occupancy
     )
 
     dm = HabitatDataModule(
