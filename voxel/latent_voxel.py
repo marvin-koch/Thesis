@@ -240,6 +240,15 @@ class LatentVoxelGrid(nn.Module):
 
         self.gru_cell = nn.GRUCell(input_size=feature_dim, hidden_size=feature_dim)
 
+        #Ablation
+        """
+        self.update_mlp = nn.Sequential(
+            nn.Linear(feature_dim * 2, feature_dim), # Input is [current_z, new_features]
+            nn.LayerNorm(feature_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(feature_dim, feature_dim)
+        )
+        """
 
 
         """
@@ -685,6 +694,15 @@ class LatentVoxelGrid(nn.Module):
         if pts_world.numel() == 0 or self.keys.numel() == 0:
             return
 
+        # ---------------------------------------------------------
+        # 1. Expand the grid dynamically for new points
+        # ---------------------------------------------------------
+        """
+        ijk_new = self._world_to_ijk(pts_world)
+        keys_new = torch.unique(self._hash_ijk(ijk_new))
+        self._ensure_and_index(keys_new)
+        """
+
         dev, dtype = self.device, self.z_latent.dtype
         vox_sz = float(self.p.voxel_size)
 
@@ -730,13 +748,26 @@ class LatentVoxelGrid(nn.Module):
         u = torch.scatter_reduce(u, 0, comp[grid_idx].unsqueeze(-1).expand(-1, self.feature_dim),
                                  f_src[s_idx] * w, reduce="amax", include_self=True)
 
+        """
+        u = torch.scatter_reduce(u, 0, comp[grid_idx].unsqueeze(-1).expand(-1, self.feature_dim),
+                                 f_src[s_idx] * w, reduce="mean", include_self=True)
+        """
         # 4. UPDATE: GRU with Dtype fixes
         counts = torch.zeros((idx_upd.numel(),), device=dev)
         counts.scatter_add_(0, comp[grid_idx], torch.ones_like(grid_idx, dtype=torch.float32))
 
         z_sel = self.z_latent[idx_upd]
+
+        #OG
         gru_in = self.fusion_mlp(torch.cat([u.to(dtype), torch.log1p(counts).unsqueeze(-1).to(dtype)], dim=-1))
         z_new = self.gru_cell(gru_in, z_sel)
+
+        # Ablation  MLP logic:
+        """
+        new_input = self.fusion_mlp(torch.cat([u.to(dtype), torch.log1p(counts).unsqueeze(-1).to(dtype)], dim=-1))
+        mlp_in = torch.cat([z_sel, new_input], dim=-1)
+        z_new = self.update_mlp(mlp_in)
+        """
 
         self.z_latent.index_copy_(0, idx_upd, torch.nan_to_num(z_new).to(dtype))
 
@@ -1276,6 +1307,58 @@ class LatentVoxelGrid(nn.Module):
                 z[:min(z.shape[0], self.z_latent.shape[0])] = self.z_latent[:min(z.shape[0], self.z_latent.shape[0])]
             self.z_latent = z
 
+    def get_filtered_grid(self, z_min: float = -float('inf'), z_max: float = float('inf')):
+        """
+        Returns a NEW LatentVoxelGrid containing only the voxels
+        within the specified Z-range [z_min, z_max].
+        """
+        # 1. Initialize a new grid with the same origin and parameters
+        new_grid = LatentVoxelGrid(
+            origin_xyz=self.origin.clone(),
+            params=self.p,
+            device=self.device,
+            dtype=self.dtype,
+            feature_dim=self.feature_dim
+        )
+
+        # Copy the current epoch and neural network states
+        new_grid.epoch = self.epoch
+        new_grid.fusion_mlp.load_state_dict(self.fusion_mlp.state_dict())
+        new_grid.gru_cell.load_state_dict(self.gru_cell.state_dict())
+        new_grid.decoder.load_state_dict(self.decoder.state_dict())
+        new_grid.free_token.data = self.free_token.data.clone()
+
+        if self.keys.numel() == 0:
+            return new_grid
+
+        # 2. Identify voxels to keep based on Z-height
+        centers = self.voxel_centers()
+        z_vals = centers[:, 2]
+        keep_mask = (z_vals >= z_min) & (z_vals <= z_max)
+
+        if keep_mask.any():
+            # 3. Slice all buffers and assign to the new grid
+            new_grid.keys = self.keys[keep_mask].clone()
+            new_grid.vals_st = self.vals_st[keep_mask].clone()
+            new_grid.vals_lt = self.vals_lt[keep_mask].clone()
+            new_grid.vals = self.vals[keep_mask].clone()
+            new_grid.hit_count = self.hit_count[keep_mask].clone()
+            new_grid.pos_occ_count = self.pos_occ_count[keep_mask].clone()
+            new_grid.neg_free_count = self.neg_free_count[keep_mask].clone()
+            new_grid.last_occ_epoch = self.last_occ_epoch[keep_mask].clone()
+            new_grid.last_free_epoch = self.last_free_epoch[keep_mask].clone()
+            new_grid.view_bits = self.view_bits[keep_mask].clone()
+            new_grid.seen_occ_epoch = self.seen_occ_epoch[keep_mask].clone()
+            new_grid.seen_view_bits_e = self.seen_view_bits_e[keep_mask].clone()
+            new_grid.occ_epoch_count = self.occ_epoch_count[keep_mask].clone()
+            new_grid.view_bits_cum = self.view_bits_cum[keep_mask].clone()
+            new_grid.lt_promoted_flag = self.lt_promoted_flag[keep_mask].clone()
+
+            # 4. Filter the latent features
+            if self.z_latent.numel() > 0:
+                new_grid.z_latent = self.z_latent[keep_mask].clone()
+
+        return new_grid
     def initialize_latents_from_full_cloud(
                 self,
                 pts_world: torch.Tensor,   # (N,3) full scene points (aligned)
@@ -1426,9 +1509,13 @@ class LatentVoxelGrid(nn.Module):
                 # Get current state (will be 0.0 for new voxels, or existing if re-initializing)
                 z_prev = self.z_latent[unique_surf_idx]
 
-                # Apply GRU: z_new = GRU(input=u, hidden=z_prev)
+                #OG Apply GRU: z_new = GRU(input=u, hidden=z_prev)
                 z_new = self.gru_cell(u_surf, z_prev)
-                
+
+                # Ablation:
+                #mlp_in = torch.cat([z_prev, u_surf], dim=-1)
+                #z_new = self.update_mlp(mlp_in)
+                                
                 # Sanitize GRU output
                 if not torch.isfinite(z_new).all():
                     z_new = torch.nan_to_num(z_new, nan=0.0, posinf=0.0, neginf=0.0)
