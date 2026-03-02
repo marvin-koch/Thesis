@@ -60,6 +60,9 @@ class VoxelParams:
     lt_demote_floor: float = 0.0
     lt_reset_promotion_on_demote: bool = True
 
+    # ---------- Ablation: phantom free points ----------
+    ablate_phantom_free: bool = False
+
 
 
 class FeatureProjector(nn.Module):
@@ -550,6 +553,10 @@ class LatentVoxelGrid(nn.Module):
         return torch.empty((0, 3), device=self.device), torch.empty((0, self.feature_dim), device=self.device)
 
     def generate_phantom_points(self, origins, terminations, n_samples=16):
+        # Ablation: skip phantom free points entirely
+        if self.p.ablate_phantom_free:
+            return self.generate_phantom_points_none(origins, terminations, n_samples)
+
         # n_samples=16 is Safe for VRAM, but "Sparse" spatially.
 
         N = origins.shape[0]
@@ -599,6 +606,10 @@ class LatentVoxelGrid(nn.Module):
             terminations: (N, 3) The wall points found by depth
             n_samples: How many phantom points to generate per ray
             """
+            # Ablation: skip phantom free points entirely
+            if self.p.ablate_phantom_free:
+                return self.generate_phantom_points_none(origins, terminations, n_samples)
+
             N = origins.shape[0]
             
             # 1. Create random ratios between 0.0 (camera) and 0.90 (near wall)
@@ -1390,7 +1401,7 @@ class LatentVoxelGrid(nn.Module):
                 
                 # A. Initialize Free Space with Token
                 idx_free = torch.searchsorted(self.keys, keys_free)
-                if idx_free.numel() > 0:
+                if idx_free.numel() > 0 and not self.p.ablate_phantom_free:
                     token_expanded = self.free_token.expand(idx_free.shape[0], -1)
                     self.z_latent.index_copy_(0, idx_free, token_expanded)
 
@@ -1462,4 +1473,3 @@ class LatentVoxelGrid(nn.Module):
                     if self.seen_occ_epoch.shape[0] != self.keys.shape[0]:
                         self._ensure_and_index(torch.zeros(0, dtype=torch.int64, device=self.device))
                     self.seen_occ_epoch[unique_surf_idx] = now
-
