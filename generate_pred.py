@@ -22,9 +22,9 @@ import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 
 # Config
-SEQ_LIST = "/cluster/scratch/kochmar/renders3/seq_manifest.json"
-DATA_ROOT = "/cluster/scratch/kochmar/renders3/"
-SAVE_ROOT = "/cluster/scratch/kochmar/renders3/precomputed_cache_2/"
+SEQ_LIST = "/cluster/scratch/kochmar/hm3d_gt/seq_manifest.json"
+DATA_ROOT = "/cluster/scratch/kochmar/hm3d_gt/"
+SAVE_ROOT = "/cluster/scratch/kochmar/hm3d_gt/precomputed_cache/"
 WEIGHTS_PATH = "/cluster/home/kochmar/Thesis/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth"
 STEP = 1
 
@@ -259,6 +259,12 @@ def precompute():
     print(f"Starting precomputation for {len(seqs)} sequences...")
 
 
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    diff_start = torch.cuda.Event(enable_timing=True)
+    diff_end = torch.cuda.Event(enable_timing=True)
+
+
     for seq_idx in (range(len(seqs))):
     #for seq_idx in (range(len(seqs)-1, -1, -1)):
     #for seq_idx in (range(126, -1, -1)):
@@ -281,8 +287,10 @@ def precompute():
         for i in range(T):
             if i % STEP != 0:
                 continue
+
             if i > (120 * STEP):
                 break
+
 
             save_path = os.path.join(seq_dir, f"t{i:04d}.pt")
             if os.path.exists(save_path) and i != 0:
@@ -313,7 +321,14 @@ def precompute():
             if i < 1:
                 
 
-                predictions = get_reconstructed_scene_no_opt(i, ".", imgs, model, device, False, 512, "", "linear", 100, 1, True, False, True, False, 0.05, "oneref", 1, 0, projector=None)
+                start_event.record()
+
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    predictions = get_reconstructed_scene_no_opt(i, ".", imgs, model, device, False, 512, "", "linear", 100, 1, True, False, True, False, 0.05, "oneref", 1, 0, projector=None)
+
+                end_event.record()
+                torch.cuda.synchronize()
+                print(f"       -> Inference Time: {start_event.elapsed_time(end_event):.2f} ms")
 
                 keyrenders = image_tensors.clone()
                                     
@@ -321,7 +336,13 @@ def precompute():
             else:
             
 
+                diff_start.record()
                 changed_idx = changed_images(image_tensors, keyrenders, thresh=0.000005)
+                changed_idx = changed_images(image_tensors, keyrenders, thresh=0.000001)
+                #changed_idx = changed_images(image_tensors, keyrenders, thresh=0.0000001)
+                diff_end.record()
+                torch.cuda.synchronize()
+                diff_time = diff_start.elapsed_time(diff_end)
                 
                 print(changed_idx)
 
@@ -345,12 +366,19 @@ def precompute():
 
     
                 print("inference pred")
-                if not mst:
-                    mst = True
-                    predictions = get_reconstructed_scene_no_opt(1, ".", imgs, model, device, False, 512, "", "linear", 100, 1, True, False, True, False, 0.05, "oneref", 1, 0, changed_gids=changed_idx, projector=None)
-                        
-                else:
-                    predictions = get_reconstructed_scene_no_opt(i, ".", imgs, model, device, False, 512, "", "linear", 100, 1, True, False, True, False, 0.05, "oneref", 1, 0, changed_gids=changed_idx, projector=None)
+                start_event.record()
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    if not mst:
+                        mst = True
+                        predictions = get_reconstructed_scene_no_opt(1, ".", imgs, model, device, False, 512, "", "linear", 100, 1, True, False, True, False, 0.05, "oneref", 1, 0, changed_gids=changed_idx, projector=None)
+                            
+                    else:
+                        predictions = get_reconstructed_scene_no_opt(i, ".", imgs, model, device, False, 512, "", "linear", 100, 1, True, False, True, False, 0.05, "oneref", 1, 0, changed_gids=changed_idx, projector=None)
+
+                    end_event.record()
+                torch.cuda.synchronize()
+                infer_time = start_event.elapsed_time(end_event)
+                print(f"       -> Diff Time: {diff_time:.2f} ms | Inference Time: {infer_time:.2f} ms")
 
             # Filter out heavy unneeded data before saving if necessary
             # But keep "view_feats", "world_points", "world_points_conf", "extrinsic", "intrinsic_K"
@@ -376,4 +404,5 @@ def precompute():
             torch.save(cpu_pred, save_path)
 
 if __name__ == "__main__":
-    precompute()
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        precompute()

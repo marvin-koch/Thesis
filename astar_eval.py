@@ -51,7 +51,6 @@ from voxel.utils import to_torch, rotate_points, build_maps_from_points_and_cent
 from pytorch3d.ops import knn_points
 
 
-
 # ═══════════════════════════════════════════════════════════════════
 #  A* Path Planner on 2-D Occupancy Grid
 # ═══════════════════════════════════════════════════════════════════
@@ -201,6 +200,7 @@ def icp_sim3(src, dst, init_R, init_t, init_s, max_iters=20, tolerance=1e-5):
         prev_loss = mean_dist
 
     return R_acc, t_acc, s_acc
+
 # ═══════════════════════════════════════════════════════════════════
 #  Voxel Grid  →  2-D Occupancy Grid
 # ═══════════════════════════════════════════════════════════════════
@@ -212,12 +212,73 @@ def voxel_to_occ2d(
     bev_size: Tuple[float, float] = (50.0, 50.0),
     z_band: Tuple[float, float] = (-2.0, 5.0),
     occ_thresh: float = 0.0,
+    latent_thresh: float = 0.5,
     is_latent: bool = False,
 ) -> np.ndarray:
-    """
-    Project a 3-D voxel grid onto a 2-D binary occupancy grid.
-    Returns bool array (H, W) where True = occupied.
-    """
+    W_cells = int(round(bev_size[0] / voxel_size))
+    H_cells = int(round(bev_size[1] / voxel_size))
+
+    n = vox.keys.shape[0]
+    if n == 0:
+        return np.zeros((H_cells, W_cells), dtype=bool)
+
+    centers = vox.voxel_centers()
+    z = centers[:, 2]
+    z_mask = (z >= z_band[0]) & (z <= z_band[1])
+
+    if is_latent:
+        # --- NEW MAX AGGREGATION WAY (For Latents) ---
+        # 1. Get raw probabilities
+        logits = vox.decode_occupancy(with_xyz_cond=False)
+        probs = torch.sigmoid(logits)
+
+        # 2. Project to indices
+        cx = centers[:, 0]
+        cy = centers[:, 1]
+        col = ((cx - bev_origin[0]) / voxel_size).long()
+        row = ((cy - bev_origin[1]) / voxel_size).long()
+
+        # 3. Filter bounds and Z-band
+        valid = (row >= 0) & (row < H_cells) & (col >= 0) & (col < W_cells) & z_mask
+
+        # 4. Max Pool (the to_bev way)
+        prob_grid = torch.full((H_cells, W_cells), -1.0, device=logits.device)
+        idx = row[valid] * W_cells + col[valid]
+        prob_grid.view(-1).scatter_reduce_(0, idx, probs[valid], reduce="amax")
+
+        # 5. Threshold at the very end
+        return (prob_grid > latent_thresh).cpu().numpy()
+
+    else:
+        # --- OLD WAY (For Standard Voxels) ---
+        grid = np.zeros((H_cells, W_cells), dtype=bool)
+        vals = vox._display_vals().clamp(-10.0, 10.0)
+        occ_mask = (vals > occ_thresh)
+
+        active = occ_mask & z_mask
+        if not active.any():
+            return grid
+
+        cx = centers[active, 0].cpu().numpy()
+        cy = centers[active, 1].cpu().numpy()
+
+        col = ((cx - bev_origin[0]) / voxel_size).astype(int)
+        row = ((cy - bev_origin[1]) / voxel_size).astype(int)
+
+        valid = (row >= 0) & (row < H_cells) & (col >= 0) & (col < W_cells)
+        grid[row[valid], col[valid]] = True
+        return grid
+"""
+def voxel_to_occ2d(
+    vox,
+    voxel_size: float,
+    bev_origin: Tuple[float, float] = (-25.0, -25.0),
+    bev_size: Tuple[float, float] = (50.0, 50.0),
+    z_band: Tuple[float, float] = (-2.0, 5.0),
+    occ_thresh: float = 0.0,
+    is_latent: bool = False,
+) -> np.ndarray:
+
     W_cells = int(round(bev_size[0] / voxel_size))
     H_cells = int(round(bev_size[1] / voxel_size))
     grid = np.zeros((H_cells, W_cells), dtype=bool)
@@ -253,6 +314,7 @@ def voxel_to_occ2d(
     grid[row[valid], col[valid]] = True
     return grid
 
+"""
 
 # ═══════════════════════════════════════════════════════════════════
 #  Episode Sampling & Running
@@ -533,254 +595,6 @@ def visualize_episode(
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  Frontier-Based Exploration
-# ═══════════════════════════════════════════════════════════════════
-
-@dataclass
-class ExplorationResult:
-    coverage: float = 0.0          # fraction of GT-free cells visited
-    collisions: int = 0
-    steps: int = 0
-    distance_traveled: float = 0.0
-    frontiers_visited: int = 0
-
-    @property
-    def collision_rate(self) -> float:
-        return self.collisions / max(1, self.steps)
-
-    @property
-    def efficiency(self) -> float:
-        """Coverage per unit distance — higher is better."""
-        return self.coverage / max(self.distance_traveled, 1e-8)
-
-
-def _find_frontiers(occ_grid: np.ndarray, explored: np.ndarray) -> np.ndarray:
-    """
-    Frontier cells = explored FREE cells adjacent to at least one UNEXPLORED cell.
-    Returns boolean mask (H, W).
-    """
-    free_explored = explored & (~occ_grid)
-    unexplored = ~explored
-    unexplored_border = ndimage.binary_dilation(unexplored, iterations=1)
-    return free_explored & unexplored_border
-
-
-def _select_frontier_goal(
-    frontier_mask: np.ndarray, pos: Tuple[int, int]
-) -> Optional[Tuple[int, int]]:
-    """Pick the nearest frontier cell to navigate to."""
-    ys, xs = np.where(frontier_mask)
-    if len(ys) == 0:
-        return None
-    dists = (ys - pos[0]) ** 2 + (xs - pos[1]) ** 2
-    idx = np.argmin(dists)
-    return (int(ys[idx]), int(xs[idx]))
-
-
-def visualize_exploration_step(
-    occ_grid: np.ndarray,
-    gt_grid: np.ndarray,
-    explored: np.ndarray,
-    frontier: np.ndarray,
-    pos: Tuple[int, int],
-    plan_path: Optional[List[Tuple[int, int]]],
-    goal: Optional[Tuple[int, int]],
-    save_path: str,
-    title: str = "",
-):
-    """Save a top-down visualization of one exploration step."""
-    H, W = occ_grid.shape
-    img = np.ones((H, W, 3), dtype=np.uint8) * 40  # dark = unexplored
-
-    # Explored free space
-    explored_free = explored & (~occ_grid)
-    img[explored_free] = [180, 220, 255]  # light blue
-
-    # Walls from the map the robot sees
-    img[occ_grid & explored] = [80, 80, 80]
-
-    # GT-only obstacles (hidden from robot)
-    gt_only = gt_grid & ~occ_grid & explored
-    img[gt_only] = [255, 120, 120]  # light red
-
-    # Frontier cells
-    img[frontier] = [255, 220, 50]  # yellow
-
-    # Planned path
-    if plan_path:
-        for r, c in plan_path:
-            if 0 <= r < H and 0 <= c < W:
-                img[r, c] = [100, 180, 255]
-
-    # Current frontier goal
-    if goal is not None:
-        for dr in range(-1, 2):
-            for dc in range(-1, 2):
-                gr, gc = goal[0] + dr, goal[1] + dc
-                if 0 <= gr < H and 0 <= gc < W:
-                    img[gr, gc] = [200, 0, 0]
-
-    # Robot position
-    for dr in range(-2, 3):
-        for dc in range(-2, 3):
-            pr, pc = pos[0] + dr, pos[1] + dc
-            if 0 <= pr < H and 0 <= pc < W:
-                img[pr, pc] = [0, 255, 0]
-
-    fig, ax = plt.subplots(figsize=(8, 8))
-    ax.imshow(img, origin="lower")
-    ax.set_title(title, fontsize=11)
-
-    patches = [
-        mpatches.Patch(color=[c / 255 for c in [180, 220, 255]], label="Explored free"),
-        mpatches.Patch(color=[c / 255 for c in [40, 40, 40]], label="Unexplored"),
-        mpatches.Patch(color=[c / 255 for c in [80, 80, 80]], label="Map wall"),
-        mpatches.Patch(color=[c / 255 for c in [255, 120, 120]], label="Hidden (GT)"),
-        mpatches.Patch(color=[c / 255 for c in [255, 220, 50]], label="Frontier"),
-        mpatches.Patch(color=[c / 255 for c in [100, 180, 255]], label="Planned path"),
-        mpatches.Patch(color=[c / 255 for c in [0, 255, 0]], label="Robot"),
-        mpatches.Patch(color=[c / 255 for c in [200, 0, 0]], label="Frontier goal"),
-    ]
-    ax.legend(handles=patches, loc="upper right", fontsize=7)
-    ax.axis("off")
-    fig.tight_layout()
-    fig.savefig(save_path, dpi=100)
-    plt.close(fig)
-
-
-def run_exploration(
-    occ_grids_over_time: List[np.ndarray],
-    gt_grids_over_time: List[np.ndarray],
-    start: Tuple[int, int],
-    sensor_radius: int = 10,
-    max_steps: int = 300,
-    viz_dir: Optional[str] = None,
-) -> ExplorationResult:
-    """
-    Simulate frontier-based exploration.
-
-    The robot iteratively:
-      1. Marks cells within sensor_radius as explored
-      2. Finds frontiers (explored-free adjacent to unexplored)
-      3. Plans A* to the nearest frontier on the method's occ grid
-      4. Walks one step along that plan
-      5. Collisions checked against GT
-
-    If viz_dir is set, saves a per-step image to that directory.
-    """
-    T = len(occ_grids_over_time)
-    H, W = occ_grids_over_time[0].shape
-    res = ExplorationResult()
-
-    gt_free_t0 = ~gt_grids_over_time[0]
-    total_free = gt_free_t0.sum()
-    if total_free == 0:
-        return res
-
-    explored = np.zeros((H, W), dtype=bool)
-    pos = start
-    plan = None
-    plan_idx = 0
-    current_goal = None
-    frontier = np.zeros((H, W), dtype=bool)
-
-    # Pre-compute disc mask for sensor
-    yy, xx = np.ogrid[-sensor_radius:sensor_radius + 1, -sensor_radius:sensor_radius + 1]
-    disc = (yy ** 2 + xx ** 2) <= sensor_radius ** 2
-
-    if viz_dir is not None:
-        os.makedirs(viz_dir, exist_ok=True)
-
-    for step in range(max_steps):
-        t = min(step, T - 1)
-        occ = occ_grids_over_time[t]
-        gt = gt_grids_over_time[t]
-
-        # 1. Sense — mark cells within radius as explored
-        r0 = max(0, pos[0] - sensor_radius)
-        r1 = min(H, pos[0] + sensor_radius + 1)
-        c0 = max(0, pos[1] - sensor_radius)
-        c1 = min(W, pos[1] + sensor_radius + 1)
-
-        dr0 = r0 - (pos[0] - sensor_radius)
-        dr1 = disc.shape[0] - ((pos[0] + sensor_radius + 1) - r1)
-        dc0 = c0 - (pos[1] - sensor_radius)
-        dc1 = disc.shape[1] - ((pos[1] + sensor_radius + 1) - c1)
-
-        explored[r0:r1, c0:c1] |= disc[dr0:dr1, dc0:dc1]
-
-        # 2. Check if we need to replan
-        need_replan = False
-        if plan is None or plan_idx >= len(plan):
-            need_replan = True
-        elif plan_idx < len(plan):
-            for k in range(plan_idx, min(plan_idx + 5, len(plan))):
-                r, c = plan[k]
-                if occ[r, c]:
-                    need_replan = True
-                    break
-
-        if need_replan:
-            frontier = _find_frontiers(occ, explored)
-            current_goal = _select_frontier_goal(frontier, pos)
-
-            if current_goal is None:
-                # Save final frame before breaking
-                if viz_dir is not None:
-                    visualize_exploration_step(
-                        occ, gt, explored, frontier, pos, plan, current_goal,
-                        os.path.join(viz_dir, f"{step:04d}.png"),
-                        title=f"Step {step} — no frontiers left",
-                    )
-                break  # no more reachable frontiers
-
-            plan = astar(occ, pos, current_goal)
-            plan_idx = 1
-            if plan is None:
-                # Try another frontier
-                frontier[current_goal[0], current_goal[1]] = False
-                current_goal = _select_frontier_goal(frontier, pos)
-                if current_goal is not None:
-                    plan = astar(occ, pos, current_goal)
-                    plan_idx = 1
-                if plan is None:
-                    res.steps += 1
-                    continue
-
-            res.frontiers_visited += 1
-
-        # 3. Per-step visualization
-        if viz_dir is not None:
-            visualize_exploration_step(
-                occ, gt, explored, frontier, pos, plan, current_goal,
-                os.path.join(viz_dir, f"{step:04d}.png"),
-                title=f"Step {step}  cov={explored[gt_free_t0].sum()/total_free:.1%}",
-            )
-
-        # 4. Move one step
-        if plan is not None and plan_idx < len(plan):
-            next_pos = plan[plan_idx]
-            plan_idx += 1
-        else:
-            next_pos = pos
-
-        # 5. Collision check against GT
-        if gt[next_pos[0], next_pos[1]]:
-            res.collisions += 1
-
-        dy = next_pos[0] - pos[0]
-        dx = next_pos[1] - pos[1]
-        res.distance_traveled += (dy ** 2 + dx ** 2) ** 0.5
-        pos = next_pos
-        res.steps += 1
-
-    # Final coverage
-    explored_free = explored & gt_free_t0
-    res.coverage = float(explored_free.sum()) / float(total_free)
-    return res
-
-
-# ═══════════════════════════════════════════════════════════════════
 #  Main Evaluation Loop
 # ═══════════════════════════════════════════════════════════════════
 
@@ -825,12 +639,6 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num_viz", type=int, default=5,
                         help="Number of episodes to visualize per sequence")
-    parser.add_argument("--exploration_starts", type=int, default=10,
-                        help="Number of exploration episodes per sequence")
-    parser.add_argument("--exploration_steps", type=int, default=300,
-                        help="Max steps per exploration episode")
-    parser.add_argument("--sensor_radius", type=int, default=10,
-                        help="Exploration sensor radius in grid cells")
     args = parser.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -879,17 +687,15 @@ def main():
     dm.setup("predict")
 
     # ── Load model ──
-    ckpt_path = "/cluster/scratch/kochmar/checkpoints/full_ablation/voxup-epoch=03-val_loss_total=7.9336.ckpt"
+    #ckpt_path = "/cluster/scratch/kochmar/checkpoints/full_ablation/voxup-epoch=03-val_loss_total=7.9336.ckpt"
     ckpt_path = "/cluster/scratch/kochmar/checkpoints/full10/voxup-epoch=09-val_loss_total=7.6451.ckpt"
-    ckpt_path = "/cluster/scratch/kochmar/checkpoints/full_ablation/voxup-epoch=09-val_loss_total=7.0411.ckpt"
-
     model = VoxelUpdaterSystem.load_from_checkpoint(ckpt_path, strict=False, cfg=cfg)
     model = model.to(device)
     model.eval()
     # ── BEV parameters (same as predict_step) ──
     bev_size=(12.0, 12.0)
     bev_origin=(-7.0, -7.0)
-    z_band=(-2.1, 1.5)
+    z_band=(-2.0, 0.5)
     voxel_size = cfg.voxel_size
 
     # ── Paths ──
@@ -906,7 +712,6 @@ def main():
 
     # ── Aggregate results ──
     all_results = {m: [] for m in METHODS}  # method -> list of EpisodeResult
-    all_exploration = {m: [] for m in METHODS}  # method -> list of ExplorationResult
 
     val_loader = dm.val_dataloader()
     if val_loader is None:
@@ -1181,6 +986,60 @@ def main():
         for m in METHODS:
             method_grids[m] = [method_grids[m][i] for i in dynamic_idx]
 
+        # ── Sample navigation episodes (Randomizing start time) ──
+        episodes = []
+        attempts = 0
+        max_attempts = args.episodes_per_seq * 10
+
+        while len(episodes) < args.episodes_per_seq and attempts < max_attempts:
+            attempts += 1
+            # 1. Randomly pick a starting timestep
+            start_t = rng.integers(0, len(gt_grids))
+
+            # 2. Sample start/goal based on the occupancy at start_t
+            sampled = sample_free_positions(
+                gt_grids[start_t], 1,
+                min_dist_cells=args.min_dist_cells, rng=rng,
+            )
+            if sampled:
+                start, goal = sampled[0]
+                episodes.append((start_t, start, goal))
+
+        print(f"  Sampled {len(episodes)} episodes")
+
+        if not episodes:
+            print("  Could not sample episodes (too few free cells), skipping.")
+            continue
+
+        # ── Run episodes for each method ──
+        seq_out_dir = os.path.join(args.out, seq_id)
+        os.makedirs(seq_out_dir, exist_ok=True)
+
+        for method in METHODS:
+            grids = method_grids[method]
+            if not grids:
+                continue
+
+            for ep_idx, (start_t, start, goal) in enumerate(episodes):
+                # 3. Slice the grids so the episode timeline starts at start_t
+                sliced_grids = grids[start_t:]
+                sliced_gt = gt_grids[start_t:]
+
+                # Format the episode ID to include the start time
+                # so your saved visualization images are clearly labeled!
+                ep_id_str = f"ep{ep_idx:02d}_start{start_t:02d}"
+
+                result = run_episode(
+                    sliced_grids, sliced_gt, start, goal,
+                    max_steps=args.steps_per_episode,
+                    goal_radius=args.goal_radius,
+                    method=method,
+                    episode=ep_id_str, # Passed as a string for the filename
+                    seq=seq_out_dir,
+                )
+                all_results[method].append(result)
+
+        """
         # ── Sample navigation episodes ──
         # Use the first GT grid for sampling start/goal (ensures they're initially reachable)
         episodes = sample_free_positions(
@@ -1213,8 +1072,8 @@ def main():
                 )
                 all_results[method].append(result)
 
-                # Visualize a few
-                """
+        """
+        """
                 if ep_idx < args.num_viz and method in ["model", "gt", "baseline"]:
                     plan = astar(grids[0], start, goal)
                     visualize_episode(
@@ -1222,48 +1081,7 @@ def main():
                         os.path.join(seq_out_dir, f"ep{ep_idx}_{method}.png"),
                         title=f"{method.upper()} – ep {ep_idx}",
                     )
-                """
-
-        # ── Frontier-Based Exploration ──
-        explore_starts = sample_free_positions(
-            gt_grids[0], args.exploration_starts,
-            min_dist_cells=5, max_dist_cells=999, rng=rng,
-        )
-        explore_starts = [s for s, _ in explore_starts]  # only need start points
-
-        if explore_starts:
-            print(f"  Running {len(explore_starts)} exploration episodes...")
-            for method in METHODS:
-                grids = method_grids[method]
-                if not grids:
-                    continue
-                for exp_idx, start_pos in enumerate(explore_starts):
-                    # Visualize only the first episode per method
-                    if exp_idx == 0:
-                        viz_path = os.path.join(seq_out_dir, f"explore_{method}")
-                    else:
-                        viz_path = None
-
-                    exp_result = run_exploration(
-                        grids, gt_grids, start_pos,
-                        sensor_radius=args.sensor_radius,
-                        max_steps=args.exploration_steps,
-                        viz_dir=viz_path,
-                    )
-                    all_exploration[method].append(exp_result)
-
-            # Per-sequence exploration summary
-            print(f"  --- Exploration ---")
-            for method in METHODS:
-                results = all_exploration[method][-len(explore_starts):]
-                if not results:
-                    continue
-                cov = np.mean([r.coverage for r in results])
-                col = np.mean([r.collision_rate for r in results])
-                eff = np.mean([r.efficiency for r in results])
-                fv  = np.mean([r.frontiers_visited for r in results])
-                print(f"  {method:10s}  Coverage={cov:.3f}  ColRate={col:.4f}  "
-                      f"Efficiency={eff:.5f}  Frontiers={fv:.1f}")
+        """
 
         # Per-sequence summary
         for method in METHODS:
@@ -1310,52 +1128,14 @@ def main():
         json.dump(summary, f, indent=2)
     print(f"\nMetrics saved to {json_path}")
 
-    # ═══════════════════════════════════════════════════════════════
-    #  Dataset-Wide Exploration Summary
-    # ═══════════════════════════════════════════════════════════════
+    # ── Combined bar chart: Navigation ──
+    fig, axes = plt.subplots(1, 4, figsize=(18, 4))
 
-    print("\n" + "=" * 80)
-    print("DATASET-WIDE FRONTIER EXPLORATION RESULTS")
-    print("=" * 80)
-    exp_header = (f"{'Method':>12s} | {'Coverage':>8s} | {'ColRate':>8s} | "
-                  f"{'Efficien':>8s} | {'Frontiers':>9s} | {'Steps':>6s} | {'N':>5s}")
-    print(exp_header)
-    print("-" * len(exp_header))
-
-    exp_summary = {}
-    for method in METHODS:
-        results = all_exploration[method]
-        if not results:
-            continue
-        cov  = float(np.mean([r.coverage for r in results]))
-        cr   = float(np.mean([r.collision_rate for r in results]))
-        eff  = float(np.mean([r.efficiency for r in results]))
-        fv   = float(np.mean([r.frontiers_visited for r in results]))
-        st   = float(np.mean([r.steps for r in results]))
-        exp_summary[method] = {
-            "Coverage": cov, "CollisionRate": cr, "Efficiency": eff,
-            "Frontiers": fv, "AvgSteps": st, "N": len(results),
-        }
-        print(f"{method:>12s} | {cov:8.3f} | {cr:8.4f} | {eff:8.5f} | {fv:9.1f} | {st:6.0f} | {len(results):>5d}")
-
-    print("=" * 80)
-
-    # Save combined JSON
-    combined_json = {"navigation": summary, "exploration": exp_summary}
-    json_path = os.path.join(args.out, "all_metrics.json")
-    with open(json_path, "w") as f:
-        json.dump(combined_json, f, indent=2)
-    print(f"All metrics saved to {json_path}")
-
-    # ── Combined bar chart: Navigation + Exploration ──
-    fig, axes = plt.subplots(2, 4, figsize=(18, 8))
-
-    # Row 1: Navigation
     nav_metrics = [("SR", "Success Rate ↑"), ("SPL", "SPL ↑"),
                    ("CollisionRate", "Collision Rate ↓"), ("Replans", "Re-plans ↓")]
     colors = {"model": "#2196F3", "baseline": "#FF9800", "static": "#9E9E9E", "gt": "#4CAF50"}
 
-    for ax, (key, label) in zip(axes[0], nav_metrics):
+    for ax, (key, label) in zip(axes, nav_metrics):
         vals = [summary.get(m, {}).get(key, 0) for m in METHODS]
         bars = ax.bar(METHODS, vals, color=[colors.get(m, "#ccc") for m in METHODS])
         ax.set_ylabel(label)
@@ -1363,27 +1143,13 @@ def main():
         for bar, v in zip(bars, vals):
             ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
                     f"{v:.3f}", ha="center", va="bottom", fontsize=8)
-    axes[0][0].set_title("Point-Goal Navigation", fontsize=11, fontweight="bold", loc="left")
-
-    # Row 2: Exploration
-    exp_plot_metrics = [("Coverage", "Coverage ↑"), ("CollisionRate", "Collision Rate ↓"),
-                        ("Efficiency", "Efficiency ↑"), ("Frontiers", "Frontiers Reached")]
-
-    for ax, (key, label) in zip(axes[1], exp_plot_metrics):
-        vals = [exp_summary.get(m, {}).get(key, 0) for m in METHODS]
-        bars = ax.bar(METHODS, vals, color=[colors.get(m, "#ccc") for m in METHODS])
-        ax.set_ylabel(label)
-        ax.set_ylim(bottom=0)
-        for bar, v in zip(bars, vals):
-            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
-                    f"{v:.3f}", ha="center", va="bottom", fontsize=8)
-    axes[1][0].set_title("Frontier Exploration", fontsize=11, fontweight="bold", loc="left")
+    axes[0].set_title("Point-Goal Navigation", fontsize=11, fontweight="bold", loc="left")
 
     fig.suptitle("Downstream Evaluation – Dynamic Voxel Mapping", fontsize=14)
     fig.tight_layout()
-    fig.savefig(os.path.join(args.out, "combined_summary.png"), dpi=150)
+    fig.savefig(os.path.join(args.out, "nav_summary.png"), dpi=150)
     plt.close(fig)
-    print(f"Combined plot saved to {os.path.join(args.out, 'combined_summary.png')}")
+    print(f"Plot saved to {os.path.join(args.out, 'nav_summary.png')}")
 
 
 if __name__ == "__main__":

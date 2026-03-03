@@ -54,6 +54,9 @@ class VoxelParams:
     lt_demote_step: float = 0.5         # subtract from LT per qualifying epoch
     lt_demote_floor: float = 0.0        # clamp lower bound for LT during demotion
     lt_reset_promotion_on_demote: bool = True  # allow re-promotion after big demotion
+
+    # ---------- Ablation: phantom free points ----------
+    ablate_phantom_free: bool = False
     
 
     
@@ -101,10 +104,7 @@ class TorchSparseVoxelGrid:
         self.lt_promoted_flag = torch.empty(0, dtype=torch.uint8, device=self.device)  # 0/1: already promoted (for "once")
 
         self.epoch: int = 0  # advance once per integration round
-
-
     
-        
     # ---------- utilities ----------
     def _world_to_ijk(self, pts: torch.Tensor) -> torch.Tensor:
         rel = (pts - self.origin) / self.p.voxel_size
@@ -458,3 +458,50 @@ class TorchSparseVoxelGrid:
         return self.origin + (ijk + 0.5) * self.p.voxel_size
 
 
+    def get_filtered_grid(self, z_min: float = -float('inf'), z_max: float = float('inf')):
+        """
+        Returns a NEW TorchSparseVoxelGrid containing only the voxels
+        within the specified Z-range [z_min, z_max].
+        """
+        # 1. Initialize a new grid with the same origin and parameters
+        new_grid = TorchSparseVoxelGrid(
+            origin_xyz=self.origin.clone(),
+            params=self.p,
+            device=self.device,
+            dtype=self.dtype
+        )
+
+        # Copy the current epoch index
+        new_grid.epoch = self.epoch
+
+        if self.keys.numel() == 0:
+            return new_grid
+
+        # 2. Identify voxels to keep based on Z-height
+        centers = self.voxel_centers() # Uses (M,3) world centers
+        z_vals = centers[:, 2]
+        keep_mask = (z_vals >= z_min) & (z_vals <= z_max)
+
+        if keep_mask.any():
+            # 3. Clone all internal buffers for the selected voxels
+            new_grid.keys = self.keys[keep_mask].clone()
+            new_grid.vals_st = self.vals_st[keep_mask].clone()
+            new_grid.vals_lt = self.vals_lt[keep_mask].clone()
+            new_grid.vals = self.vals[keep_mask].clone()
+
+            # Performance/Temporal Counters
+            new_grid.hit_count = self.hit_count[keep_mask].clone()
+            new_grid.pos_occ_count = self.pos_occ_count[keep_mask].clone()
+            new_grid.neg_free_count = self.neg_free_count[keep_mask].clone()
+            new_grid.last_occ_epoch = self.last_occ_epoch[keep_mask].clone()
+            new_grid.last_free_epoch = self.last_free_epoch[keep_mask].clone()
+            new_grid.view_bits = self.view_bits[keep_mask].clone()
+
+            # Epoch-based promotion/demotion state
+            new_grid.seen_occ_epoch = self.seen_occ_epoch[keep_mask].clone()
+            new_grid.seen_view_bits_e = self.seen_view_bits_e[keep_mask].clone()
+            new_grid.occ_epoch_count = self.occ_epoch_count[keep_mask].clone()
+            new_grid.view_bits_cum = self.view_bits_cum[keep_mask].clone()
+            new_grid.lt_promoted_flag = self.lt_promoted_flag[keep_mask].clone()
+
+        return new_grid

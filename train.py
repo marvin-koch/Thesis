@@ -183,10 +183,10 @@ class VoxelUpdaterSystem(pl.LightningModule):
         # ---- core components (replace with your actual imports) ----
         #self.voxel_size = 0.01
         self.voxel_size = self.cfg.voxel_size
-        """
+
         self.vox = LatentVoxelGrid(
             origin_xyz=np.zeros(3, dtype=np.float32),
-            params=VoxelParams(voxel_size=self.voxel_size, promote_hits=2),
+            params=VoxelParams(voxel_size=self.voxel_size, promote_hits=2, ablate_phantom_free=False),
             device=self.device, feature_dim=self.feature_dim
         )
         """
@@ -197,6 +197,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
             params=VoxelParams(voxel_size=self.voxel_size, promote_hits=2),
             device=self.device, feature_dim=self.feature_dim
         )
+        """
         
         self.vox = self.vox.to(self.device)
         
@@ -205,6 +206,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
             params=VoxelParams(voxel_size=self.voxel_size, promote_hits=2),
             device=self.device 
         )
+
         
         weights_path = "naver/" + "DUSt3R_ViTLarge_BaseDecoder_512_dpt"
         weights_path = "/cluster/home/kochmar/Thesis/" + "DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth"
@@ -2618,7 +2620,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                             torch.sigmoid(vox_gt_prev.vals_st * 10.0),
                             self.vox_gt,
                             default=0.0, 
-                            r_vox=1
+                            r_vox=0
                         )
 
                     # BUG FIX: Only evaluate dynamics where BOTH timesteps have valid coverage.
@@ -2769,7 +2771,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                         torch.sigmoid(vox_gt_prev.vals_st * 10.0),
                         self.vox,
                         default=0.0, 
-                        r_vox=1
+                        r_vox=0
                     )
                 else:
                     vox_gt_prev = gt_seq[t-1]
@@ -2780,7 +2782,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                         torch.sigmoid(vox_gt_prev.vals_st * 10.0),
                         self.vox,
                         default=0.0, 
-                        r_vox=1
+                        r_vox=0
                     )
 
                 # BUG FIX: Only evaluate dynamics where BOTH timesteps have valid coverage.
@@ -2932,7 +2934,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                         torch.sigmoid(vox_gt_prev.vals_st * 10.0),
                         self.vox_baseline,
                         default=0.0, 
-                        r_vox=1
+                        r_vox=0
                     )
                 else:
                     vox_gt_prev = gt_seq[t-1]
@@ -2943,7 +2945,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                         torch.sigmoid(vox_gt_prev.vals_st * 10.0),
                         self.vox_baseline,
                         default=0.0, 
-                        r_vox=1
+                        r_vox=0
                     )
 
                 # BUG FIX: Only evaluate dynamics where BOTH timesteps have valid coverage.
@@ -3099,7 +3101,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                         torch.sigmoid(vox_gt_prev.vals_st * 10.0),
                         static_baseline_vox,
                         default=0.0,
-                        r_vox=1
+                        r_vox=0
                     )
                 else:
                     vox_gt_prev = gt_seq[t-1]
@@ -3110,7 +3112,7 @@ class VoxelUpdaterSystem(pl.LightningModule):
                         torch.sigmoid(vox_gt_prev.vals_st * 10.0),
                         static_baseline_vox,
                         default=0.0,
-                        r_vox=1
+                        r_vox=0
                     )
 
                 # BUG FIX: Only evaluate dynamics where BOTH timesteps have valid coverage.

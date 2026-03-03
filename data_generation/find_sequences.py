@@ -32,7 +32,7 @@ def build_manifest(dataset_root, check_gt=False):
         { "seq_id": ..., "seq_path": ..., "has_gt": bool }
     """
     dataset_root = os.path.normpath(dataset_root)
-    gt_root = os.path.join(dataset_root, "gt_voxels_per_timestep_01_v2")
+    gt_root = os.path.join(dataset_root, "gt_voxels_per_timestep_new")
     manifest = {}
     count = 0
 

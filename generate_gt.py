@@ -1055,8 +1055,8 @@ def build_gt_voxel_for_timestep(
     POINTS = "world_points"
     CONF   = "world_points_conf"
 
-    threshold = 1.0
-    threshold = 60.0
+    #threshold = 1.0
+    threshold = 25.0
 
     z_clip_map = (-3.0, 3.0)
     #z_clip_map = (-0.1, 0.3)
@@ -1064,7 +1064,7 @@ def build_gt_voxel_for_timestep(
 
     # rotation to map world->metric frame (same as in your code)
     R_w2m_np = np.array([[0, 0, -1],
-                         [-1, 0, 0],
+                         [1, 0, 0],
                          [0, -1, 0]], dtype=np.float32)
     t_w2m_np = np.zeros(3, dtype=np.float32)
     R_w2m = torch.from_numpy(R_w2m_np).to(device=device, dtype=torch.float32)
@@ -1212,7 +1212,7 @@ def build_gt_voxel_for_timestep(
 
 
 def main():
-    dataset_root = "/cluster/scratch/kochmar/eval/"   # same as in your TrainConfig
+    dataset_root = "/cluster/scratch/kochmar/hm3d_gt/"   # same as in your TrainConfig
     voxel_size = 0.2
     #voxel_size = 0.01
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1235,8 +1235,8 @@ def main():
     seqs = dataset.seq_paths
     print(f"[GT] Found {len(seqs)} sequences.")
 
-    out_root = os.path.join(dataset_root, "gt_voxels_per_timestep_new_60")
-    out_root_pose = os.path.join(dataset_root, "gt_poses_new_60")
+    out_root = os.path.join(dataset_root, "gt_voxels_per_timestep_new_timer")
+    out_root_pose = os.path.join(dataset_root, "gt_poses_new_timer")
     os.makedirs(out_root, exist_ok=True)
 
     for seq_idx in range(0, len(seqs)):
@@ -1261,12 +1261,10 @@ def main():
             if (t % step) != 0:
                 continue
 
-            """
             if t > (120 * step):
                 break
 
 
-            """
             out_path = os.path.join(out_root, f"{seq_id}_t{t:04d}_gt.npz")
             if os.path.exists(out_path) and t != 0 and t!= step:
                 print(f"[GT]   skip t={t} (exists)")

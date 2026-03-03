@@ -509,9 +509,9 @@ def compute_extra_baseline_metrics(
 
         tp     = (pred_bin &  tgt_bin).sum()
         fp_int = (pred_bin & ~tgt_bin).sum()
-        fn     = (~pred_bin & tgt_bin).sum() + fn_uncovered
+        fn     = (~pred_bin & tgt_bin).sum() #+ fn_uncovered
         fp_h   = (pred_fp > bobj.p.occ_thresh).sum()
-        total_fp = fp_int + fp_h
+        total_fp = fp_int #+ fp_h
 
         metrics_buffer[f"{bname}_occ_iou"].append(
             (tp / (tp + total_fp + fn + 1e-8)).item())
@@ -520,7 +520,6 @@ def compute_extra_baseline_metrics(
         metrics_buffer[f"{bname}_occ_precision"].append(
             (tp / (tp + total_fp + 1e-8)).item())
 
-        # dynamic metrics
         if t > 0:
             prev_ref = (prev_vox_real_gt
                         if (use_real_gt and prev_vox_real_gt is not None)
@@ -529,7 +528,7 @@ def compute_extra_baseline_metrics(
                 p_prev_al, vp = system.align_probs_to_keys_soft(
                     prev_ref,
                     torch.sigmoid(prev_ref.vals_st.clamp(-10, 10) * 10),
-                    bobj, default=0.0, r_vox=1)
+                    bobj, default=0.0, r_vox=0)
                 both = valid & vp
                 bi   = both[valid]
                 if bi.any():
@@ -550,11 +549,27 @@ def compute_extra_baseline_metrics(
                             ghosts.float().mean().item())
                         metrics_buffer[f"{bname}_dyn_recall_disappearing"].append(
                             (~ghosts).float().mean().item())
+                    """
+                    if m_dyn.sum() > 0:
+                        pd = pb[m_app] > bobj.p.occ_thresh
+                        gd = gc[m_app]
+                        metrics_buffer[f"{bname}_dyn_iou"].append(
+                            ((pd & gd).sum() / ((pd | gd).sum() + 1e-8)).item())
+
+                     """
                     if m_dyn.sum() > 0:
                         pd = pb[m_dyn] > bobj.p.occ_thresh
                         gd = gc[m_dyn]
-                        metrics_buffer[f"{bname}_dyn_iou"].append(
-                            ((pd & gd).sum() / ((pd | gd).sum() + 1e-8)).item())
+
+                        tp = (pd & gd).sum().float()
+                        fp = (pd & ~gd).sum().float()
+                        fn = (~pd & gd).sum().float()
+
+                        union = tp + fp + fn
+                        if union > 0:
+                            metrics_buffer[f"{bname}_dyn_iou"].append((tp / union).item())
+                        else:
+                            metrics_buffer[f"{bname}_dyn_iou"].append(1.0) # Perfect clearance of a disappeared object
 
         # TFS
         curr_keys   = bobj.keys.clone()

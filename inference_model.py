@@ -125,10 +125,20 @@ def main():
 
     #ablation
     #Mean-Pooling
-    ckpt_path = "/cluster/scratch/kochmar/checkpoints/full_ablation/voxup-epoch=03-val_loss_total=9.0795.ckpt"
+    #ckpt_path = "/cluster/scratch/kochmar/checkpoints/full_ablation/voxup-epoch=03-val_loss_total=9.0795.ckpt"
 
     #Simple Loss
-    ckpt_path = "/cluster/scratch/kochmar/checkpoints/full_ablation/voxup-epoch=09-val_loss_total=7.0411.ckpt"
+    #ckpt_path = "/cluster/scratch/kochmar/checkpoints/full_ablation/voxup-epoch=09-val_loss_total=7.0411.ckpt"
+
+
+    #NeuralRecon
+    #ckpt_path = "/cluster/scratch/kochmar/checkpoints/full_ablation/voxup-epoch=03-val_loss_total=7.7411.ckpt"
+
+    #MLP instead of GRU
+    #ckpt_path = "/cluster/scratch/kochmar/checkpoints/full_ablation/voxup-epoch=11-val_loss_total=8.8934.ckpt"
+
+    #Wihtout phantom
+    #ckpt_path = "/cluster/scratch/kochmar/checkpoints/full_ablation/voxup-epoch=09-val_loss_total=7.7171.ckpt"
 
 
     out_dir = "/cluster/scratch/kochmar/predict_outputs_eval/"
@@ -147,17 +157,23 @@ def main():
         #gt_voxels_file="gt_voxels_per_timestep_new_3",
 
         #gt_voxels_file="gt_voxels_per_timestep_new_2",
+
         gt_voxels_file="gt_voxels_per_timestep_new",
 
         #gt_voxels_file="gt_voxels_per_timestep_new_25",
 
 
         precomputed_cache_file="precomputed_cache",
+        #precomputed_cache_file="precomputed_cache_0000001",
+        #precomputed_cache_file="precomputed_cache_000001",
+
         #precomputed_cache_file="precomputed_cache_2",
 
         #pose_file="gt_poses_new_3",
         #pose_file="gt_poses_new_2",
+
         pose_file="gt_poses_new",
+
         #pose_file="gt_poses_new_25",
 
 
